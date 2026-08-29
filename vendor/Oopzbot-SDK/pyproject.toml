@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oopz-sdk"
+version = "0.15.0"
+description = "Oopz 平台 Python SDK，提供 HTTP API、文件上传与 WebSocket 事件能力。"
+readme = "README.md"
+requires-python = ">=3.10"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Oopzbot Contributors" },
+]
+keywords = ["oopz", "sdk", "bot", "websocket"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+  "aiohttp>=3.11,<4",
+  "cryptography>=42,<48",
+  "pillow>=10,<13",
+  "pydantic>=2,<3",
+  "playwright>=1.58.0",
+  "requests>=2.28,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/tangqingfeng7/Oopzbot-SDK"
+Repository = "https://github.com/tangqingfeng7/Oopzbot-SDK"
+Issues = "https://github.com/tangqingfeng7/Oopzbot-SDK/issues"
+
+[project.scripts]
+oopz-login = "oopz_sdk.cli.password_login:main"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8,<9",
+  "tomli>=2,<3; python_version < '3.11'",
+  "twine>=6.2,<8",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["oopz_sdk", "oopz_sdk.*"]
+
+[tool.setuptools.package-data]
+oopz_sdk = ["py.typed", "assets/voice/agora_player.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,15 @@
+# Oopz QQ 群机器人 —— Python 运行时依赖（Windows + Python 3.12）
+#
+# 安装：
+#   pip install -r requirements.txt
+#   pip install ./vendor/Oopzbot-SDK        # oopz_sdk 不在 PyPI，从本地 vendor 装
+#
+# 说明：oopz_sdk 通过其 pyproject.toml 自动拉取自身依赖（aiohttp / cryptography /
+#       pillow / pydantic / playwright / requests），本文件只列应用直连依赖。
+#       完整部署步骤见 DEPLOY.md。
+
+nonebot2==2.5.0
+nonebot-adapter-onebot==2.4.6   # NapCat / OneBot v11 入口（bot_napcat.py，推荐）
+nonebot-adapter-qq==1.7.2       # QQ 官方版入口（bot.py）
+python-dotenv==1.2.3
+aiohttp==3.14.3                 # DRIVER=~aiohttp
