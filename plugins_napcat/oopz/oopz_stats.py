@@ -1,7 +1,7 @@
-"""@oopz 插件（NapCat / OneBot v11 版）：群成员 @机器人发含「oopz」的消息 → 实时拉取 Oopz 语音频道在线成员 → 回复。
+"""@oopz 插件（NapCat / OneBot v11 版）：群成员 @机器人发含「oopz」的消息 → 实时拉取 oopz 语音频道在线成员 → 回复。
 
-Oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责查询与回复文案。
-走个人 QQ 号协议端（NapCat），可主动推送；Oopz 侧只用 REST 查询。
+oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责查询与回复文案。
+走个人 QQ 号协议端（NapCat），可主动推送；oopz 侧只用 REST 查询。
 """
 import asyncio
 import os
@@ -31,22 +31,22 @@ stat = on_message(priority=1, block=False)
 
 
 async def _build_stats_message() -> str:
-    """查询 Oopz 并生成统计文本。失败/无人时返回适合直接回复的字符串。"""
+    """查询 oopz 并生成统计文本。失败/无人时返回适合直接回复的字符串。"""
     bot = await _get_client()
     if bot is None:
-        return "Oopz 凭据未配置：请先在终端运行 tools/oopz_login.py，然后重启机器人。"
+        return "oopz 凭据未配置：请先在终端运行 tools/oopz_login.py，然后重启机器人。"
 
     try:
         async with asyncio.timeout(_QUERY_TIMEOUT):
             joined = await bot.areas.get_joined_areas()
     except Exception as exc:
         _reset_client()
-        logger.error("查询 Oopz 域列表失败: {}", exc)
-        return "Oopz 查询失败，请稍后再试。"
+        logger.error("查询 oopz 域列表失败: {}", exc)
+        return "oopz 查询失败，请稍后再试。"
 
     areas = _filter_areas(joined)
     if not areas:
-        return "当前 Oopz 频道暂无在线成员。"
+        return "当前 oopz 频道暂无在线成员。"
 
     # area 名 -> [(频道名, [成员uid])]；只保留有真人(非bot)的频道
     online_by_area: dict[str, list[tuple[str, list[str]]]] = {}
@@ -76,11 +76,11 @@ async def _build_stats_message() -> str:
             online_by_area[a.name] = channel_rows
 
     if not online_by_area:
-        return "当前 Oopz 频道暂无在线成员。"
+        return "当前 oopz 频道暂无在线成员。"
 
     uid_name = await _fetch_uid_names(bot, all_uids)
 
-    lines = [f"📊 Oopz 语音频道在线：{total_online} 人"]
+    lines = [f"📊 oopz 语音频道在线：{total_online} 人"]
     for area_name, channel_rows in online_by_area.items():
         lines.append(f"\n【{area_name}】")
         for ch_name, uids in channel_rows:

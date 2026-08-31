@@ -1,4 +1,4 @@
-r"""验证 Oopz 凭据：列出加入的域，以及各域语音频道的在线成员。
+r"""验证 oopz 凭据：列出加入的域，以及各域语音频道的在线成员。
 
 用法：
     .venv\Scripts\python.exe tools\oopz_check.py

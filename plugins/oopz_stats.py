@@ -1,7 +1,7 @@
-"""@统计 插件：群成员 @机器人发「统计」→ 实时拉取 Oopz 语音频道在线成员 → 被动回复。
+"""@统计 插件：群成员 @机器人发「统计」→ 实时拉取 oopz 语音频道在线成员 → 被动回复。
 
 纯被动响应模式：只在被 @ 时查询并回复，不主动向群推送任何消息。
-Oopz 侧只用 REST 查询（不需要 WebSocket 长连接），见 _get_client()。
+oopz 侧只用 REST 查询（不需要 WebSocket 长连接），见 _get_client()。
 """
 import asyncio
 import os
@@ -29,12 +29,12 @@ _ALLOWED_GROUPS = {
 
 # 每条消息最大长度（QQ 群文本消息上限约 2000，留余量）
 _MAX_LEN = 1800
-# 单次 Oopz 查询整体超时（秒），避免把被动回复拖过时限
+# 单次 oopz 查询整体超时（秒），避免把被动回复拖过时限
 _QUERY_TIMEOUT = 20
 
 stat = on_message(priority=1, block=False)
 
-# Oopz REST 客户端单例（懒加载，复用连接；失败自动重建）
+# oopz REST 客户端单例（懒加载，复用连接；失败自动重建）
 _oopz_bot: OopzBot | None = None
 _oopz_lock: asyncio.Lock | None = None
 
@@ -57,7 +57,7 @@ def _config_from_env() -> "OopzConfig":
 
 
 async def _get_client() -> OopzBot | None:
-    """取 Oopz 客户端（懒初始化）。缺少凭据返回 None。"""
+    """取 oopz 客户端（懒初始化）。缺少凭据返回 None。"""
     global _oopz_bot, _oopz_lock
     if _oopz_bot is not None:
         return _oopz_bot
@@ -74,7 +74,7 @@ async def _get_client() -> OopzBot | None:
             await bot.rest.start()
             _oopz_bot = bot
         except Exception as exc:
-            logger.error("Oopz 客户端初始化失败: {}", exc)
+            logger.error("oopz 客户端初始化失败: {}", exc)
             _oopz_bot = None
     return _oopz_bot
 
@@ -102,25 +102,25 @@ async def _channel_name_map(bot: OopzBot, area_id: str) -> dict[str, str]:
 
 
 async def _build_stats_message() -> str:
-    """查询 Oopz 并生成统计文本。失败/无人时返回适合直接回复的字符串。"""
+    """查询 oopz 并生成统计文本。失败/无人时返回适合直接回复的字符串。"""
     bot = await _get_client()
     if bot is None:
-        return "Oopz 凭据未配置：请先在终端运行 tools/oopz_login.py，然后重启机器人。"
+        return "oopz 凭据未配置：请先在终端运行 tools/oopz_login.py，然后重启机器人。"
 
     try:
         async with asyncio.timeout(_QUERY_TIMEOUT):
             joined = await bot.areas.get_joined_areas()
     except Exception as exc:
         _reset_client()
-        logger.error("查询 Oopz 域列表失败: {}", exc)
-        return "Oopz 查询失败，请稍后再试。"
+        logger.error("查询 oopz 域列表失败: {}", exc)
+        return "oopz 查询失败，请稍后再试。"
 
     areas = list(joined or [])
     if _TARGET_AREAS:
         wanted = set(_TARGET_AREAS)
         areas = [a for a in areas if a.area_id in wanted or a.name in wanted]
     if not areas:
-        return "当前 Oopz 频道暂无在线成员。"
+        return "当前 oopz 频道暂无在线成员。"
 
     # area 名 -> [(频道名, [成员uid])]；只保留有真人(非bot)的频道
     online_by_area: dict[str, list[tuple[str, list[str]]]] = {}
@@ -150,7 +150,7 @@ async def _build_stats_message() -> str:
             online_by_area[a.name] = channel_rows
 
     if not online_by_area:
-        return "当前 Oopz 频道暂无在线成员。"
+        return "当前 oopz 频道暂无在线成员。"
 
     # 批量解析昵称（一次请求，最多 30 人/批，带缓存）
     uid_name: dict[str, str] = {}
@@ -164,7 +164,7 @@ async def _build_stats_message() -> str:
     except Exception as exc:
         logger.warning("批量查询昵称失败: {}", exc)
 
-    lines = [f"📊 Oopz 语音频道在线：{total_online} 人"]
+    lines = [f"📊 oopz 语音频道在线：{total_online} 人"]
     for area_name, channel_rows in online_by_area.items():
         lines.append(f"\n【{area_name}】")
         for ch_name, uids in channel_rows:

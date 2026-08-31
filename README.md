@@ -1,6 +1,6 @@
-# Oopz 群统计机器人
+# oopz 群统计机器人
 
-QQ 群机器人：群成员 @ 机器人发「**统计**」，实时查询 Oopz 语音频道在线成员并回复。
+QQ 群机器人：群成员 @ 机器人发「**统计**」，实时查询 oopz 语音频道在线成员并回复。
 
 提供**两套接入**：
 
@@ -14,17 +14,17 @@ QQ 群机器人：群成员 @ 机器人发「**统计**」，实时查询 Oopz �
 | 群内 @ | 回复 |
 |--------|------|
 | `@机器人 你好` | 「收到！被动回复链路已打通 🎉」——链路自检 |
-| `@机器人 统计` | 📊 Oopz 语音频道在线成员报告（分域/频道 + 昵称） |
+| `@机器人 统计` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
 
 **自动功能（NapCat 版，配置见 `.env`）**
 
-- ⏰ **定时播报**：整点对齐推送（间隔 30 分钟则在 :00/:30，间隔 60 则每小时整点），向 `NAPCAT_REPORT_GROUP` 推送独立格式的「📣 Oopz 语音频道播报」——**仅当 Oopz 有人在线时**，无人则静默跳过
+- ⏰ **定时播报**：整点对齐推送（间隔 30 分钟则在 :00/:30，间隔 60 则每小时整点），向 `NAPCAT_REPORT_GROUP` 推送独立格式的「📣 oopz 语音频道播报」——**仅当 oopz 有人在线时**，无人则静默跳过
 - 👋 **进频道欢迎**：每 `NAPCAT_WELCOME_INTERVAL_SEC` 秒轮询，检测到有人进入目标域语音频道时推送趣味欢迎语（随机文案）
 
 示例回复：
 
 ```
-📊 Oopz 语音频道在线：4 人
+📊 oopz 语音频道在线：4 人
 
 【奇妙小房间】
   🔊 游戏开黑（4人）
@@ -46,7 +46,7 @@ oopz-bot/
 ├── vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
 ├── tools/
 │   ├── oopz_login.py         # 手机号+密码 → 写入 OOPZ_* 凭据
-│   └── oopz_check.py         # 独立验证 Oopz 查询链路
+│   └── oopz_check.py         # 独立验证 oopz 查询链路
 ├── plugins/                  # QQ 官方版插件（bot.py 加载）
 │   ├── hello.py              # @你好 → 链路自检
 │   └── oopz_stats.py         # @统计 → 实时成员报告
@@ -78,17 +78,17 @@ copy .env.example .env
 
 复制后按注释逐项填写（`.env` 含密钥，勿提交到公开仓库）；每个键的含义见 [DEPLOY.md 第 4 节](DEPLOY.md#4-配置-env)。
 
-**3. 首次登录 Oopz**（交互式，终端里输入，密码不进聊天记录）
+**3. 首次登录 oopz**（交互式，终端里输入，密码不进聊天记录）
 
 ```powershell
-$env:OOPZ_LOGIN_PHONE = "你的Oopz手机号"
-$env:OOPZ_LOGIN_PASSWORD = "你的Oopz密码"
+$env:OOPZ_LOGIN_PHONE = "你的oopz手机号"
+$env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 .venv\Scripts\python.exe tools\oopz_login.py
 ```
 
 > 脚本会把 OOPZ_* 四要素自动写进 `.env`。Linux 用 `OOPZ_LOGIN_PHONE=xxx OOPZ_LOGIN_PASSWORD=xxx python tools/oopz_login.py`。
 
-**4. 验证 Oopz 查询**（不启动机器人，直接查一次）
+**4. 验证 oopz 查询**（不启动机器人，直接查一次）
 
 ```powershell
 .venv\Scripts\python.exe tools\oopz_check.py
@@ -125,7 +125,7 @@ $env:OOPZ_LOGIN_PASSWORD = "你的Oopz密码"
 **1. 回复文案 / 排版**（[plugins/oopz_stats.py:160-167](plugins/oopz_stats.py#L160-L167)）
 
 ```python
-lines = [f"📊 Oopz 语音频道在线：{total_online} 人"]   # 第一行：总人数
+lines = [f"📊 oopz 语音频道在线：{total_online} 人"]   # 第一行：总人数
 for area_name, channel_rows in online_by_area.items():
     lines.append(f"\n【{area_name}】")                  # 域（房间）名
     for ch_name, uids in channel_rows:
@@ -159,4 +159,4 @@ msg = "\n".join(lines)
 
 ## 详细文档
 
-技术方案、Oopz API 对照、SDK 三个已知坑 → 见 [docs/chat.md](docs/chat.md)。
+技术方案、oopz API 对照、SDK 三个已知坑 → 见 [docs/chat.md](docs/chat.md)。

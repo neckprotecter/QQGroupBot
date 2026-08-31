@@ -1,8 +1,8 @@
-r"""Oopz 纯 API 登录：手机号 + 密码 -> 写入 .env
+r"""oopz 纯 API 登录：手机号 + 密码 -> 写入 .env
 
 用法（在你的终端里运行，密码不会出现在聊天记录里）：
-    $env:OOPZ_LOGIN_PHONE = "你的Oopz手机号"
-    $env:OOPZ_LOGIN_PASSWORD = "你的Oopz密码"
+    $env:OOPZ_LOGIN_PHONE = "你的oopz手机号"
+    $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
     .venv\Scripts\python.exe tools\oopz_login.py
 
 登录成功后会把 OOPZ_DEVICE_ID / OOPZ_PERSON_UID / OOPZ_JWT_TOKEN /
@@ -26,8 +26,8 @@ def main() -> int:
     if not phone or not password:
         print("缺少环境变量 OOPZ_LOGIN_PHONE / OOPZ_LOGIN_PASSWORD")
         print("请先设置：")
-        print('    $env:OOPZ_LOGIN_PHONE = "你的Oopz手机号"')
-        print('    $env:OOPZ_LOGIN_PASSWORD = "你的Oopz密码"')
+        print('    $env:OOPZ_LOGIN_PHONE = "你的oopz手机号"')
+        print('    $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"')
         return 1
 
     from oopz_sdk.auth.password_login import login_with_password_sync
@@ -35,7 +35,7 @@ def main() -> int:
     try:
         cred = login_with_password_sync(phone, password, timeout=20)
     except Exception as exc:
-        print(f"[x] Oopz 登录失败: {exc!r}")
+        print(f"[x] oopz 登录失败: {exc!r}")
         return 1
 
     env_map = cred.to_env()
@@ -57,7 +57,7 @@ def main() -> int:
 
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    print("✅ Oopz 登录成功，凭据已写入 .env")
+    print("✅ oopz 登录成功，凭据已写入 .env")
     print(f"   device_id   = {cred.device_id[:10]}...")
     print(f"   person_uid  = {cred.person_uid[:10]}...")
     print(f"   jwt_token   = {cred.jwt_token[:24]}...")

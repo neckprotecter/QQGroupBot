@@ -1,11 +1,11 @@
 """定时播报 + 进频道欢迎（NapCat / OneBot v11 版）。
 
-Oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责播报/欢迎逻辑与推送，
+oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责播报/欢迎逻辑与推送，
 走 NapCat 主动推送（send_group_msg），不受官方主动推送停用限制。
 
 .env 配置：
   NAPCAT_REPORT_GROUP=<群号>          定时播报目标群（逗号分隔多群，留空 = 不启用）
-  NAPCAT_REPORT_INTERVAL_MIN=30       播报间隔（分钟）；整点对齐（落在 :00 / :N / :2N… 时刻），仅在 Oopz 有人在线时推送，无人时静默跳过
+  NAPCAT_REPORT_INTERVAL_MIN=30       播报间隔（分钟）；整点对齐（落在 :00 / :N / :2N… 时刻），仅在 oopz 有人在线时推送，无人时静默跳过
   NAPCAT_WELCOME_GROUP=<群号>         欢迎消息目标群（逗号分隔多群，留空 = 不启用）
   NAPCAT_WELCOME_INTERVAL_SEC=15      进频道轮询间隔（秒）
   NAPCAT_WELCOME_CHANNELS=频道名,...   可选：只欢迎这些频道（逗号分隔），留空 = 统计范围内全部
@@ -50,10 +50,10 @@ _WELCOME_CHANNELS = {
 
 # 进频道欢迎文案
 _WELCOME_TEMPLATES = [
-    "🎮 {name} 加入 OOPZ「{channel}」频道，来开黑吗？",
-    "🕹️ {name} 已经在 OOPZ「{channel}」就位。",
-    "🎧 {name} 戴上耳机钻进了 OOPZ「{channel}」。",
-    "🚀 {name} 空降到 OOPZ「{channel}」频道。",
+    "🎮 {name} 加入 oopz「{channel}」频道，来开黑吗？",
+    "🕹️ {name} 已经在 oopz「{channel}」就位。",
+    "🎧 {name} 戴上耳机钻进了 oopz「{channel}」。",
+    "🚀 {name} 空降到 oopz「{channel}」频道。",
 ]
 
 
@@ -81,15 +81,15 @@ async def _build_broadcast_message() -> str | None:
     """
     bot = await _get_client()
     if bot is None:
-        return "📣 Oopz 语音频道播报：凭据未配置，请先运行 tools/oopz_login.py 然后重启机器人。"
+        return "📣 oopz 语音频道播报：凭据未配置，请先运行 tools/oopz_login.py 然后重启机器人。"
 
     try:
         async with asyncio.timeout(_QUERY_TIMEOUT):
             joined = await bot.areas.get_joined_areas()
     except Exception as exc:
         _reset_client()
-        logger.error("Oopz 语音频道播报：查询域列表失败: {}", exc)
-        return "📣 Oopz 语音频道播报：Oopz 查询失败，请稍后再试。"
+        logger.error("oopz 语音频道播报：查询域列表失败: {}", exc)
+        return "📣 oopz 语音频道播报：oopz 查询失败，请稍后再试。"
 
     areas = _filter_areas(joined)
 
@@ -103,7 +103,7 @@ async def _build_broadcast_message() -> str | None:
                 result = await bot.channels.get_voice_channel_members(area=a.area_id)
             name_map = await _channel_name_map(bot, a.area_id)
         except Exception as exc:
-            logger.warning("Oopz 语音频道播报：拉取域 {} 成员失败: {}", a.name, exc)
+            logger.warning("oopz 语音频道播报：拉取域 {} 成员失败: {}", a.name, exc)
             continue
 
         for ch_id, members in (result.channel_members or {}).items():
@@ -122,7 +122,7 @@ async def _build_broadcast_message() -> str | None:
         return None  # 无人在线：不推送
 
     now = datetime.now().strftime("%H:%M")
-    lines = [f"📣 Oopz 语音频道播报 · {now}", "━━━━━━━━━━", f"现在有 {total_online} 位小伙伴在 Oopz 挂着"]
+    lines = [f"📣 oopz 语音频道播报 · {now}", "━━━━━━━━━━", f"现在有 {total_online} 位小伙伴在 oopz 挂着"]
     for area_name, channel_rows in online_by_area.items():
         lines.append(f"\n【{area_name}】")
         for ch_name, uids in channel_rows:
@@ -156,7 +156,7 @@ async def _report_loop() -> None:
     if not _REPORT_GROUPS:
         logger.info("未配置 NAPCAT_REPORT_GROUP，定时播报未启用")
         return
-    # 等 bot 连上 NapCat、Oopz 客户端就绪
+    # 等 bot 连上 NapCat、oopz 客户端就绪
     await asyncio.sleep(15)
     while True:
         try:
@@ -166,7 +166,7 @@ async def _report_loop() -> None:
                 await asyncio.sleep(delay)
             msg = await _build_broadcast_message()
             if msg is None:
-                logger.info("定时播报：当前 Oopz 无人在线，本次跳过")
+                logger.info("定时播报：当前 oopz 无人在线，本次跳过")
             else:
                 for g in _REPORT_GROUPS:
                     await _send(g, msg)

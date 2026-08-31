@@ -1,4 +1,4 @@
-# Oopz QQ 群机器人 —— Python 运行时依赖（Windows + Python 3.12）
+# oopz QQ 群机器人 —— Python 运行时依赖（Windows + Python 3.12）
 #
 # 安装：
 #   pip install -r requirements.txt

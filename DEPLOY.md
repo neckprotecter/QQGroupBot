@@ -1,6 +1,6 @@
 # 从零部署指南（Windows 11）
 
-本项目是 **QQ 群机器人 + Oopz 语音频道在线统计**。QQ 侧有两条入口，推荐使用 **NapCat 版**（可主动推送定时播报 / 进频道欢迎）；QQ 官方版（`bot.py`）仅被动回复，且官方已停用主动推送。
+本项目是 **QQ 群机器人 + oopz 语音频道在线统计**。QQ 侧有两条入口，推荐使用 **NapCat 版**（可主动推送定时播报 / 进频道欢迎）；QQ 官方版（`bot.py`）仅被动回复，且官方已停用主动推送。
 
 本文档按"干净环境从 0 部署"编写。当前工程目录已经过清理，只保留运行所需 + 部署所需文件。
 
@@ -15,7 +15,7 @@ oopz-bot/
 ├─ plugins/                  # QQ 官方版插件（@统计 等）
 ├─ plugins_napcat/           # NapCat 版插件：oopz_stats(@统计) / auto_reporter(播报+欢迎)
 ├─ tools/
-│  ├─ oopz_login.py          # 生成 Oopz 平台登录凭据（device_id / jwt / 私钥）
+│  ├─ oopz_login.py          # 生成 oopz 平台登录凭据（device_id / jwt / 私钥）
 │  └─ oopz_check.py          # 诊断脚本
 ├─ requirements.txt          # Python 依赖清单
 ├─ vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
@@ -30,7 +30,7 @@ oopz-bot/
 └─ .venv/                    # Python 虚拟环境
 ```
 
-> 注意：`.env` 含 QQ AppSecret、Oopz JWT 等密钥，切勿提交到公开仓库。
+> 注意：`.env` 含 QQ AppSecret、oopz JWT 等密钥，切勿提交到公开仓库。
 
 ---
 
@@ -40,7 +40,7 @@ oopz-bot/
 - [Python 3.12](https://www.python.org/downloads/)（64 位，安装时勾选 Add to PATH）
 - 一个 **普通 QQ 号**（用作机器人本体，会登录到 NapCat）
 - 一个目标 QQ 群（机器人要加入的群，群号后面用到）
-- Oopz 账号（已有加入的语音域）
+- oopz 账号（已有加入的语音域）
 
 ---
 
@@ -99,7 +99,7 @@ copy .env.example .env
 | `QQ_BOTS` | （仅 QQ 官方版 bot.py 需要）QQ 开放平台应用 AppID/AppSecret |
 | `ONEBOT_V11_ACCESS_TOKEN` | 第 2.1 节 NapCat WebUI 生成的 token |
 | `OOPZ_DEVICE_ID` / `OOPZ_PERSON_UID` / `OOPZ_JWT_TOKEN` / `OOPZ_PRIVATE_KEY` / `OOPZ_APP_VERSION` | 先跑第 5 节 `tools/oopz_login.py` 生成后回填 |
-| `OOPZ_TARGET_AREAS` | 要统计/播报/欢迎的 Oopz 域名（如 `奇妙小房间`），逗号分隔 |
+| `OOPZ_TARGET_AREAS` | 要统计/播报/欢迎的 oopz 域名（如 `奇妙小房间`），逗号分隔 |
 | `NAPCAT_REPORT_GROUP` | 定时播报推送的 QQ 群号（**逗号分隔多群**，留空=不启用）；播报**仅在有人在线时**推送，无人静默 |
 | `NAPCAT_REPORT_INTERVAL_MIN` | 播报间隔（分钟，默认 30），**整点对齐**（:00 / :N / :2N… 时刻，如 30→:00/:30） |
 | `NAPCAT_WELCOME_GROUP` | 进频道欢迎推送的 QQ 群号（**逗号分隔多群**，留空=不启用） |
@@ -108,15 +108,15 @@ copy .env.example .env
 
 ---
 
-## 5. 生成 Oopz 登录凭据
+## 5. 生成 oopz 登录凭据
 
 ```powershell
 .\.venv\Scripts\python.exe tools/oopz_login.py
 ```
 
-按提示用 Oopz 应用扫码/登录，脚本会输出 `device_id`、`person_uid`、`jwt_token`、`private_key` 等，**回填到 `.env` 对应项**（`OOPZ_PRIVATE_KEY` 的 PEM 多行要转成字面 `\n` 写在一行里）。
+按提示用 oopz 应用扫码/登录，脚本会输出 `device_id`、`person_uid`、`jwt_token`、`private_key` 等，**回填到 `.env` 对应项**（`OOPZ_PRIVATE_KEY` 的 PEM 多行要转成字面 `\n` 写在一行里）。
 
-> ⚠️ **`OOPZ_JWT_TOKEN` 约 31 天过期，不会自动续**。过期后 Oopz 查询**全部失败**（群里 @统计 无回复、定时播报提示「查询失败」），但机器人与 QQ 的连接不受影响，表面上一切正常，只能靠日志发现。**到期就重跑本步**：`tools/oopz_login.py` 重新生成 JWT → 回填 `.env` → 重启 bot。建议每月固定一天做续期（比如直接在 `.env` 里记下签发日期，或手机日历提醒）。
+> ⚠️ **`OOPZ_JWT_TOKEN` 约 31 天过期，不会自动续**。过期后 oopz 查询**全部失败**（群里 @统计 无回复、定时播报提示「查询失败」），但机器人与 QQ 的连接不受影响，表面上一切正常，只能靠日志发现。**到期就重跑本步**：`tools/oopz_login.py` 重新生成 JWT → 回填 `.env` → 重启 bot。建议每月固定一天做续期（比如直接在 `.env` 里记下签发日期，或手机日历提醒）。
 
 ---
 
@@ -137,8 +137,8 @@ copy .env.example .env
 
 ## 7. 验证
 
-- 群里 `@机器人 统计` → 回复 Oopz 语音频道在线明细
-- 定时播报：到整点槽位（间隔 30 分钟则为 :00/:30），若 Oopz 有人在线则推送「📣 Oopz 语音频道播报…」（无人在线时静默跳过，属正常）
+- 群里 `@机器人 统计` → 回复 oopz 语音频道在线明细
+- 定时播报：到整点槽位（间隔 30 分钟则为 :00/:30），若 oopz 有人在线则推送「📣 oopz 语音频道播报…」（无人在线时静默跳过，属正常）
 - 进频道欢迎：有人进入目标域语音频道后，约 1 个轮询周期内推送趣味欢迎语
 - 查看日志确认无报错：
 
@@ -173,7 +173,7 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 
 ### F5 定时播报不触发
 - 检查：`.env` 的 `NAPCAT_REPORT_GROUP` 已填群号、bot 在该群里、`OOPZ_TARGET_AREAS` 拼写与域名一致。
-- **注意：Oopz 无人在线时本就不推送**（定时播报只在有人时生效），别把「无人静默」当成故障。
+- **注意：oopz 无人在线时本就不推送**（定时播报只在有人时生效），别把「无人静默」当成故障。
 
 ### F6 进频道欢迎不触发
 - 首次启动只建基线（当时已在频道的人不欢迎），之后**新进入**才触发。
@@ -189,7 +189,7 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 ## 9. 日常维护
 
 - **改文案**：播报格式在 `plugins_napcat/auto_reporter.py` 的 `_build_broadcast_message()`；欢迎语在文件顶部的 `_WELCOME_TEMPLATES` 列表。
-- **续期 Oopz JWT（每月一次）**：`OOPZ_JWT_TOKEN` 约 31 天过期。症状：@统计 无回复、播报显示「查询失败」。重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
+- **续期 oopz JWT（每月一次）**：`OOPZ_JWT_TOKEN` 约 31 天过期。症状：@统计 无回复、播报显示「查询失败」。重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
 - **改间隔/目标群**：改 `.env` 后重启 bot。
 - **看日志**：`logs/napcat_bot.log`（注意 PowerShell 用 `-Encoding UTF8` 读）。
 - **NapCat 升级/重装**：三个启动坑（F1/F2/F3）会复发，按第 8 节处理。

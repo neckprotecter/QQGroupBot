@@ -1,6 +1,6 @@
 # ============================================================
 # 敏感配置（含全部密钥，绝不推送）
-#   - QQ AppSecret、NapCat WS token、Oopz JWT + RSA 私钥、device_id/person_uid
+#   - QQ AppSecret、NapCat WS token、oopz JWT + RSA 私钥、device_id/person_uid
 #   - 部署请复制 .env.example 为 .env 再填写
 # ============================================================
 .env
@@ -24,7 +24,7 @@ dist/
 # 运行时产物（不推送）
 #   - NapCat/：完整协议端运行时（node + QQ NT 原生库 + QQ 登录会话 +
 #     onebot11 config 里的 WS 鉴权 token），部署时单独下载安装
-#   - logs/：运行日志（含群消息内容、群号、Oopz 昵称等）
+#   - logs/：运行日志（含群消息内容、群号、oopz 昵称等）
 # ============================================================
 NapCat/
 logs/

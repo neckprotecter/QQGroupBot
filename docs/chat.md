@@ -1,4 +1,4 @@
-# 项目文档：QQ群机器人 + Oopz 语音频道在线统计
+# 项目文档：QQ群机器人 + oopz 语音频道在线统计
 
 > 技术方案与实现说明。项目为**双入口**：`bot_napcat.py`（NapCat/OneBot v11，个人 QQ 号，**可主动推送**，推荐）+ `bot.py`（QQ 官方版，仅被动响应，作回退）。本文档主体以 QQ 官方版为准，NapCat 版差异见 [§8](#8-napcat-版bot_napcatpy)。
 >
@@ -8,13 +8,13 @@
 
 ## 1. 核心需求与背景决策
 
-在 QQ 群部署机器人，群成员 @ 机器人发「统计」，机器人实时查询 Oopz 语音频道在线成员并回复。
+在 QQ 群部署机器人，群成员 @ 机器人发「统计」，机器人实时查询 oopz 语音频道在线成员并回复。
 
 **关键背景（务必先读）**：QQ 官方机器人的**主动推送**（定时播报、进频道欢迎通知）已于 **2025-04-21 官方停止支持**——主动向群发送消息的接口不再可用，发起即报错 `40034105 主动消息失败`。
 
 因此针对 **QQ 官方版**（`bot.py`）：
 
-- ✅ **保留**：@机器人「统计」→ 实时 Oopz 成员报告 → 被动回复（响应 @ 消息携带 `msg_id`，不受主动消息限制）
+- ✅ **保留**：@机器人「统计」→ 实时 oopz 成员报告 → 被动回复（响应 @ 消息携带 `msg_id`，不受主动消息限制）
 - ❌ **移除**：进频道自动欢迎、定时播报（均为主动推送，已不可行）
 
 > **若改用 NapCat 版**（`bot_napcat.py`，走个人 QQ 号 + OneBot v11），**主动推送恢复可用**，上述 ❌ 项可重新加回（见 [§8](#8-napcat-版bot_napcatpy)）。
@@ -67,7 +67,7 @@ await bot.post_group_messages(
 )
 ```
 
-### 5.2 Oopz 查询：只启 REST，别用 bot.start()
+### 5.2 oopz 查询：只启 REST，别用 bot.start()
 
 `OopzBot(config)` 构造后**不要** `await bot.start()`——它会去连 `wss://ws.oopz.cn` WebSocket 并启动适配器服务器，纯查询场景会挂住。只需：
 
@@ -94,7 +94,7 @@ OopzConfig(
 )
 ```
 
-### 5.4 Oopz 关键 API（以安装版为准，已核对）
+### 5.4 oopz 关键 API（以安装版为准，已核对）
 
 | 用途 | 调用 |
 |------|------|
@@ -150,7 +150,7 @@ QQ 官方机器人的主动推送（定时播报、进频道欢迎等）2025-04-
 
 **正向 WS 的选择**：NoneBot 的 `~aiohttp` 驱动是 `class Driver(Mixin, NoneDriver)`——**纯客户端、无 Web 服务器**，无法做反向 WS（nonebot 当服务端）。因此 NapCat 版用**正向 WS**：NapCat 起服务（默认 3001），NoneBot 连过去。若要反向 WS，需换成带 Web 服务器的驱动（如 `~fastapi`）。
 
-代码几乎与 QQ 版同构，仅适配器 import 与发送方式不同；Oopz 查询逻辑（`_config_from_env` / `bot.rest.start()` / 频道名映射 / 消息拼装）完全复用，见 [plugins_napcat/oopz_stats.py](plugins_napcat/oopz_stats.py)。
+代码几乎与 QQ 版同构，仅适配器 import 与发送方式不同；oopz 查询逻辑（`_config_from_env` / `bot.rest.start()` / 频道名映射 / 消息拼装）完全复用，见 [plugins_napcat/oopz_stats.py](plugins_napcat/oopz_stats.py)。
 
 ### 8.3 配置与运行
 

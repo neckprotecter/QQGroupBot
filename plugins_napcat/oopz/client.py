@@ -1,8 +1,8 @@
-"""Oopz REST 客户端单例与共享工具（NapCat / OneBot v11 版）。
+"""oopz REST 客户端单例与共享工具（NapCat / OneBot v11 版）。
 
 从原 plugins_napcat/oopz_stats.py 抽出，供 @oopz 查询（oopz_stats）与
 定时播报 / 进频道欢迎（auto_reporter）共用，避免两处各写一份：
-- Oopz REST 客户端单例（懒加载、复用连接；失败自动重建）
+- oopz REST 客户端单例（懒加载、复用连接；失败自动重建）
 - 域过滤、频道名映射、批量昵称解析
 - 公共常量
 """
@@ -23,10 +23,10 @@ _TARGET_AREAS = [
 
 # 每条消息最大长度（QQ 群文本消息上限约 2000，留余量）
 _MAX_LEN = 1800
-# 单次 Oopz 查询整体超时（秒），避免把回复/播报拖过时限
+# 单次 oopz 查询整体超时（秒），避免把回复/播报拖过时限
 _QUERY_TIMEOUT = 20
 
-# Oopz REST 客户端单例（懒加载，复用连接；失败自动重建）
+# oopz REST 客户端单例（懒加载，复用连接；失败自动重建）
 _oopz_bot: OopzBot | None = None
 _oopz_lock: asyncio.Lock | None = None
 
@@ -49,7 +49,7 @@ def _config_from_env() -> "OopzConfig":
 
 
 async def _get_client() -> OopzBot | None:
-    """取 Oopz 客户端（懒初始化）。缺少凭据返回 None。"""
+    """取 oopz 客户端（懒初始化）。缺少凭据返回 None。"""
     global _oopz_bot, _oopz_lock
     if _oopz_bot is not None:
         return _oopz_bot
@@ -66,7 +66,7 @@ async def _get_client() -> OopzBot | None:
             await bot.rest.start()
             _oopz_bot = bot
         except Exception as exc:
-            logger.error("Oopz 客户端初始化失败: {}", exc)
+            logger.error("oopz 客户端初始化失败: {}", exc)
             _oopz_bot = None
     return _oopz_bot
 
