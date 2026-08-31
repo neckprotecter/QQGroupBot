@@ -186,10 +186,12 @@ async def handle_stat(bot: Bot, event: MessageEvent):
     text = event.get_plaintext().strip()
     if not group_id:
         return  # 只响应群内 @，私聊不管
+    if not event.to_me:
+        return  # 必须 @ 机器人才触发
     if _ALLOWED_GROUPS and str(group_id) not in _ALLOWED_GROUPS:
         return  # 群白名单：不在名单内的群不响应查询
-    if text != "oopz":
-        return
+    if "oopz" not in text.lower():
+        return  # 文本包含 oopz（不区分大小写）即触发
     logger.info("收到@oopz，来自群 {}", group_id)
     msg = await _build_stats_message()
     try:

@@ -2,20 +2,20 @@ from nonebot import on_message
 from nonebot.log import logger
 from nonebot.adapters.qq import Bot, MessageEvent
 
-# 链路自检插件：打印收到的消息，对群内 @「你好」回复「收到！」，验证被动回复链路
+# 链路自检 + 群消息摘要（QQ 官方版，备用入口）：
+# - 每条群消息打一行摘要；官方版无群名/昵称 API，用 openid 短号显示
+# - 群内 @「你好」回复「收到！」，验证被动回复链路
 hello = on_message(priority=1, block=False)
 
 
 @hello.handle()
 async def handle(bot: Bot, event: MessageEvent):
     group_id = getattr(event, "group_openid", None)
-    text = event.get_plaintext().strip()
-    logger.info(
-        f"收到{'群' if group_id else '私聊'}消息: {text!r} "
-        f"| group_openid={group_id} | 用户={event.get_user_id()}"
-    )
     if not group_id:
-        return  # 私聊不回复，先只测群
+        return  # 私聊不记录、不回复
+    text = event.get_plaintext().strip()
+    user = event.get_user_id()
+    logger.info("【{}】 {}: {}", group_id[:10], user[:10], text or "(非文本消息)")
     if text == "你好":
         # 带 msg_id = 被动回复（响应@消息），不需要主动消息权限
         await bot.post_group_messages(
