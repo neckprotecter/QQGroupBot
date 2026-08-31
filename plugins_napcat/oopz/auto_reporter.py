@@ -1,6 +1,6 @@
 """定时播报 + 进频道欢迎（NapCat / OneBot v11 版）。
 
-复用 plugins_napcat/oopz_stats.py 的 Oopz REST 客户端单例与查询函数，
+Oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责播报/欢迎逻辑与推送，
 走 NapCat 主动推送（send_group_msg），不受官方主动推送停用限制。
 
 .env 配置：
@@ -18,10 +18,12 @@ from datetime import datetime, timedelta
 from nonebot import get_bots, get_driver
 from nonebot.log import logger
 
-from .oopz_stats import (
+from .client import (
     _MAX_LEN,
-    _TARGET_AREAS,
+    _QUERY_TIMEOUT,
     _channel_name_map,
+    _fetch_uid_names,
+    _filter_areas,
     _get_client,
     _reset_client,
 )
@@ -46,10 +48,7 @@ _WELCOME_CHANNELS = {
     if s.strip()
 }
 
-# 每次查询整体超时（秒），与 oopz_stats 保持一致
-_QUERY_TIMEOUT = 20
-
-# 进频道欢迎文案（随机挑一条，避免每次都一个样；少用感叹号）
+# 进频道欢迎文案
 _WELCOME_TEMPLATES = [
     "🎮 {name} 加入 OOPZ「{channel}」频道，来开黑吗？",
     "🕹️ {name} 已经在 OOPZ「{channel}」就位。",
@@ -75,7 +74,7 @@ async def _send(group_id: str, text: str) -> bool:
 # ---------------------------------------------------------------- 定时播报
 
 async def _build_broadcast_message() -> str | None:
-    """生成定时播报的独立文案（与 @统计 的回复格式区分开）。
+    """生成定时播报的独立文案（与 @oopz 的回复格式区分开）。
 
     带时间头、每频道一行紧凑列出成员名，结尾一句俏皮话；
     无人在线时返回 None（定时播报只在有人时推送，无人静默跳过）。
@@ -92,10 +91,7 @@ async def _build_broadcast_message() -> str | None:
         logger.error("Oopz 语音频道播报：查询域列表失败: {}", exc)
         return "📣 Oopz 语音频道播报：Oopz 查询失败，请稍后再试。"
 
-    areas = list(joined or [])
-    if _TARGET_AREAS:
-        wanted = set(_TARGET_AREAS)
-        areas = [a for a in areas if a.area_id in wanted or a.name in wanted]
+    areas = _filter_areas(joined)
 
     online_by_area: dict[str, list[tuple[str, list[str]]]] = {}
     total_online = 0
@@ -120,20 +116,10 @@ async def _build_broadcast_message() -> str | None:
             total_online += len(uids)
             all_uids.extend(uids)
 
-    uid_name: dict[str, str] = {}
-    if all_uids:
-        try:
-            async with asyncio.timeout(_QUERY_TIMEOUT):
-                users = await bot.person.get_person_infos_batch(all_uids)
-            for u in users or []:
-                name = getattr(u, "name", "")
-                if name:
-                    uid_name[getattr(u, "uid", "")] = name
-        except Exception as exc:
-            logger.warning("Oopz 语音频道播报：批量查询昵称失败: {}", exc)
+    uid_name = await _fetch_uid_names(bot, all_uids)
 
     if total_online == 0:
-        return None  # 无人在线：不推送（定时播报只在有人时有意义）
+        return None  # 无人在线：不推送
 
     now = datetime.now().strftime("%H:%M")
     lines = [f"📣 Oopz 语音频道播报 · {now}", "━━━━━━━━━━", f"现在有 {total_online} 位小伙伴在 Oopz 挂着"]
@@ -229,10 +215,7 @@ async def _check_joins() -> None:
         logger.error("进频道检测：查询域列表失败: {}", exc)
         return
 
-    areas = list(joined or [])
-    if _TARGET_AREAS:
-        wanted = set(_TARGET_AREAS)
-        areas = [a for a in areas if a.area_id in wanted or a.name in wanted]
+    areas = _filter_areas(joined)
 
     for a in areas:
         try:
@@ -264,16 +247,7 @@ async def _check_joins() -> None:
         return
 
     # 批量解析昵称
-    uid_name: dict[str, str] = {}
-    try:
-        async with asyncio.timeout(_QUERY_TIMEOUT):
-            users = await bot.person.get_person_infos_batch([uid for uid, _ in new_entries])
-        for u in users or []:
-            name = getattr(u, "name", "")
-            if name:
-                uid_name[getattr(u, "uid", "")] = name
-    except Exception as exc:
-        logger.warning("进频道检测：批量查询昵称失败: {}", exc)
+    uid_name = await _fetch_uid_names(bot, [uid for uid, _ in new_entries])
 
     for uid, ch_name in new_entries:
         display = uid_name.get(uid) or uid[:8]
