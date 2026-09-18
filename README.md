@@ -16,8 +16,9 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 | `@机器人 你好` | 「收到！被动回复链路已打通 🎉」——链路自检 |
 | `@机器人 oopz` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
 | `@机器人 mc` | 🗺️ Minecraft 服务器在线人数 + 玩家名单 |
+| `@机器人 whitelist add/remove <玩家名>`<br>`@机器人 whitelist list` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且需要 `MC_RCON_PASSWORD`） |
 
-> 触发词可改：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER`（逗号分隔，不区分大小写）。一条消息只会被一个插件响应。
+> 触发词可改：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（逗号分隔，不区分大小写）。一条消息只会被一个插件响应。
 
 **自动功能（NapCat 版，配置见 `.env`）**
 
@@ -63,12 +64,15 @@ oopz-bot/
 │   │   ├── client.py         #   客户端单例 + 共享查询工具
 │   │   ├── oopz_stats.py     #   @oopz
 │   │   └── auto_reporter.py  #   定时播报 + 进频道欢迎
-│   ├── mcs/                  # Minecraft：@查询 / 进服提醒 / 定时播报
+│   ├── mcs/                  # Minecraft：@查询 / 进服提醒 / 定时播报 / 白名单管理
 │   │   ├── client.py         #   带 TTL 的快照缓存
 │   │   ├── mc_stats.py       #   @mc
+│   │   ├── mc_admin.py       #   @whitelist（管理 MC 玩家白名单）
 │   │   └── mc_reporter.py    #   进服提醒 + 定时播报
 │   └── _shared/              # 跨插件共享工具（下划线前缀 → 不会被当插件加载）
-│       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + list 输出解析
+│       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + list/白名单输出解析
+│       ├── mcadmin.py        #   MC 玩家白名单命令层（解析 / 执行 / 独立验证）
+│       ├── admin.py          #   管理员名单（用户级鉴权，留空 = 拒绝一切）
 │       ├── push.py           #   群消息推送 + 长度上限
 │       ├── schedule.py       #   整点对齐时间槽
 │       ├── triggers.py       #   触发词归属（决定消息归哪个插件响应）
@@ -150,6 +154,25 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 > NapCat 版默认**所有群**都能触发查询；想限定群，在 `.env` 设 `NAPCAT_ALLOWED_GROUPS`（逗号分隔群号，留空 = 不限制）。MC 查询用 `MC_ALLOWED_GROUPS`，留空时回退到 `NAPCAT_ALLOWED_GROUPS`。
 > 官方版对应 `QQ_ALLOWED_GROUPS`（group_openid 列表），且**不支持 MC 功能**（无主动推送能力，自动功能都做不了）。
 
+### 管理 MC 玩家白名单
+
+管理员在群里发 `@机器人 whitelist add <玩家名>` 即可把玩家加进服务端白名单，不用登控制台。另有 `whitelist remove <玩家名>`、`whitelist list`。
+
+```powershell
+# .env：只有列在这里的 QQ 号能用管理命令
+MC_ADMIN_QQ=123456789,987654321
+```
+
+> ⚠️ `MC_ADMIN_QQ` **留空 = 该功能对所有人关闭**——与其他「留空 = 不限制」的配置相反，这是刻意的：配错的后果是任何人都能改服务端白名单。
+>
+> 别把两个「白名单」搞混：**群白名单**（`MC_ALLOWED_GROUPS`）限制的是**哪个群**能 @查询；**MC 玩家白名单**（`whitelist.json`）是服务端的玩家准入表，由本功能管理。两者毫无关系，可以同时生效。
+>
+> 本功能走 RCON，需要 `MC_RCON_PASSWORD`；且只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`。
+>
+> 名字打什么大小写都行：bot 先读一遍白名单，下发命令时改用服务端记录的那条拼写（`add vul` 服务端存的是 `Vul`，回复里会注明），判定同样忽略大小写。**重复添加和重复移除都会如实回「无需改动」，不会虚报成功。**
+>
+> ⚠️ 若你从正版模式切到 `online-mode=false`，**原有白名单会整体失效**（在线 UUID 与离线 UUID 对不上），得挨个重新加一遍。详见 [DEPLOY.md](DEPLOY.md) 的 F11。
+
 ## 自定义回复格式
 
 回复文本由 `_build_stats_message()` / `_build_message()` 拼装。注意 oopz 查询有两个镜像副本：QQ 版在 [plugins/oopz_stats.py](plugins/oopz_stats.py)、NapCat 版在 [plugins_napcat/oopz/oopz_stats.py](plugins_napcat/oopz/oopz_stats.py)，**改格式需同步两份**（下方代码以 QQ 版行号为准）。
@@ -173,7 +196,8 @@ msg = "\n".join(lines)
 - 当前成员**一行一个**；想改回横排逗号分隔，把内层 `for name in names:` 换成一行 `lines.append(f"    {', '.join(names)}")`。
 - 昵称解析失败时回退显示 uid 前 8 位（`uid[:8]`），可在 `names` 那行调整。
 
-**2. 触发词**：改 `.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER`，**不用改代码**。归属逻辑统一在 [plugins_napcat/_shared/triggers.py](plugins_napcat/_shared/triggers.py) 的 `detect()`——一条消息只会被一个插件响应，各插件都只问它，所以不存在「加个新插件就要回头改所有插件互斥条件」的问题。
+**2. 触发词**：改 `.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`，**不用改代码**。归属逻辑统一在 [plugins_napcat/_shared/triggers.py](plugins_napcat/_shared/triggers.py) 的 `detect()`——一条消息只会被一个插件响应，各插件都只问它，所以不存在「加个新插件就要回头改所有插件互斥条件」的问题。
+> 注意触发词是**子串**匹配：把 `MC_ADMIN_TRIGGER` 改成 `白名单` 这类常用词，会让所有含该词的消息都被管理插件认领（查询插件不再应答）。管理插件认领后会回一条用法提示，不会真的静默，但仍建议选一个有辨识度的词，且别填 `add` / `remove` / `list`。
 
 **3. 消息长度上限**（[plugins_napcat/_shared/push.py](plugins_napcat/_shared/push.py)）：`MAX_LEN = 1800`，QQ 群文本约 2000 上限，超长由 `truncate()` 截断加 `…`。oopz 与 MC 两侧共用这一处。
 
@@ -183,9 +207,10 @@ msg = "\n".join(lines)
 
 ## 维护与常见问题
 
-完整排查清单见 [DEPLOY.md 常见问题](DEPLOY.md#8-常见问题已知坑)（F1~F10）与 [日常维护](DEPLOY.md#9-日常维护)。高频五条：
+完整排查清单见 [DEPLOY.md 常见问题](DEPLOY.md#8-常见问题已知坑)（F1~F11）与 [日常维护](DEPLOY.md#9-日常维护)。高频六条：
 
 - **@机器人 毫无反应**：先看日志有没有「不在白名单内」的 warning——群白名单拦下时群里的表现和「机器人掉线」完全一样，见 DEPLOY.md 第 8 节 F10。
+- **管理命令没权限 / 说未配置 RCON**：见 DEPLOY.md 第 8 节 F11。最常见的是 `MC_ADMIN_QQ` 留空（= 功能整体关闭）或漏加自己的 QQ 号。
 - **统计 / 播报突然失效**：多半是 `OOPZ_JWT_TOKEN` 过期（约 31 天），重跑 `tools/oopz_login.py` → 回填 `.env` → 重启，见 DEPLOY.md 第 8 节 F7。
 - **MC 进服提醒不触发**：先跑 `tools/mc_check.py`——**名单不完整时提醒会静默暂停**（刻意设计，避免基于残缺名单误报）。脚本会打印 RCON `list` 原文与判定原因，见 DEPLOY.md 第 8 节 F8。
 - **部分域不出现在统计里**：如「Voxel Passion 像素乐园」频道接口返回 `channels: null`，SDK 解析失败被跳过，不影响其他域（原因见 docs/chat.md §5.5）。

@@ -12,7 +12,9 @@ _KEYWORDS 里加一项，不用回头改其它插件的互斥条件。
 import os
 
 # 插件响应优先级：一条消息命中多个插件的触发词时，靠前的那个独占。
-_ORDER = ("oopz", "mc")
+# mcadmin 排首位：管理命令是显式指令，绝不能被查询插件吞掉——被吞掉时用户只会
+# 收到一份在线列表，看起来就像命令根本没生效。
+_ORDER = ("mcadmin", "oopz", "mc")
 
 
 def _env_keywords(var: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -23,6 +25,7 @@ def _env_keywords(var: str, default: tuple[str, ...]) -> tuple[str, ...]:
 
 
 _KEYWORDS: dict[str, tuple[str, ...]] = {
+    "mcadmin": _env_keywords("MC_ADMIN_TRIGGER", ("whitelist",)),
     "oopz": _env_keywords("OOPZ_TRIGGER", ("oopz",)),
     "mc": _env_keywords("MC_TRIGGER", ("mc", "我的世界", "服务器")),
 }

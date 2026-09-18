@@ -14,6 +14,8 @@ _FEATURE_LIST = (
     "🤖 我是塔萨小助手，可用指令：\n"
     "· “@我 oopz” —— 查看 oopz 在线列表\n"
     "· “@我 mc” —— 查看 Minecraft 服务器在线列表\n"
+    "· “@我 whitelist add|remove <玩家名>” / “@我 whitelist list”\n"
+    "  —— 管理 MC 玩家白名单（仅管理员）\n"
     "🔧 更多功能开发中，敬请期待"
 )
 
