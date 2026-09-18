@@ -4,14 +4,15 @@ oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责查询
 走个人 QQ 号协议端（NapCat），可主动推送；oopz 侧只用 REST 查询。
 """
 import asyncio
-import os
 
 from nonebot import on_message
 from nonebot.log import logger
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 
+from .._shared import whitelist
+from .._shared.push import truncate
+from .._shared.triggers import detect
 from .client import (
-    _MAX_LEN,
     _QUERY_TIMEOUT,
     _channel_name_map,
     _fetch_uid_names,
@@ -19,13 +20,6 @@ from .client import (
     _get_client,
     _reset_client,
 )
-
-# 可选：只允许这些群触发查询（逗号分隔群号）；留空 = 所有群都可触发
-_ALLOWED_GROUPS = {
-    s.strip()
-    for s in os.environ.get("NAPCAT_ALLOWED_GROUPS", "").split(",")
-    if s.strip()
-}
 
 stat = on_message(priority=1, block=False)
 
@@ -89,10 +83,7 @@ async def _build_stats_message() -> str:
             for name in names:
                 lines.append(f"    • {name}")
 
-    msg = "\n".join(lines)
-    if len(msg) > _MAX_LEN:
-        msg = msg[:_MAX_LEN - 1] + "…"
-    return msg
+    return truncate("\n".join(lines))
 
 
 @stat.handle()
@@ -103,10 +94,11 @@ async def handle_stat(bot: Bot, event: MessageEvent):
         return  # 只响应群内 @，私聊不管
     if not event.to_me:
         return  # 必须 @ 机器人才触发
-    if _ALLOWED_GROUPS and str(group_id) not in _ALLOWED_GROUPS:
-        return  # 群白名单：不在名单内的群不响应查询
-    if "oopz" not in text.lower():
-        return  # 文本包含 oopz（不区分大小写）即触发
+    # 群白名单：不在名单内的群不响应查询（被拦下时会打一条 warning，便于排查）
+    if not whitelist.allowed(group_id, "oopz", "NAPCAT_ALLOWED_GROUPS"):
+        return
+    if detect(text) != "oopz":
+        return  # 触发词归属见 _shared/triggers.py（避免与其它插件同时抢答）
     logger.info("收到@bot oopz查询，来自群 {}", group_id)
     msg = await _build_stats_message()
     try:

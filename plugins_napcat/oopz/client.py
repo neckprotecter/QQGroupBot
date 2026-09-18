@@ -4,7 +4,7 @@
 定时播报 / 进频道欢迎（auto_reporter）共用，避免两处各写一份：
 - oopz REST 客户端单例（懒加载、复用连接；失败自动重建）
 - 域过滤、频道名映射、批量昵称解析
-- 公共常量
+- 公共常量（消息长度上限 / 群推送在 plugins_napcat/_shared/）
 """
 import asyncio
 import os
@@ -21,8 +21,6 @@ _TARGET_AREAS = [
     if s.strip()
 ]
 
-# 每条消息最大长度（QQ 群文本消息上限约 2000，留余量）
-_MAX_LEN = 1800
 # 单次 oopz 查询整体超时（秒），避免把回复/播报拖过时限
 _QUERY_TIMEOUT = 20
 

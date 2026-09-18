@@ -13,3 +13,11 @@ nonebot-adapter-onebot==2.4.6   # NapCat / OneBot v11 入口（bot_napcat.py，�
 nonebot-adapter-qq==1.7.2       # QQ 官方版入口（bot.py）
 python-dotenv==1.2.3
 aiohttp==3.14.3                 # DRIVER=~aiohttp
+mcstatus==14.2.0                # Minecraft 服务器状态查询（SLP）；RCON 是自实现的，不依赖第三方库
+
+# 下面两条由 mcstatus 传递引入（它声明的是范围约束而非精确 pin）。
+# 不用精确固定，跟随 mcstatus 的兼容范围即可：
+#   dnspython      —— SRV 记录解析；我们用 JavaServer(host, port) 直连，实际不触发
+#   asyncio-dgram  —— Query(UDP) 协议用；mcstatus 的 connection.py 顶层硬导入，删不掉。
+#                     我们只用 async_status，不碰 async_query（Windows 默认
+#                     ProactorEventLoop 不支持 create_datagram_endpoint）

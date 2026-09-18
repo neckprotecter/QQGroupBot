@@ -12,11 +12,16 @@
 oopz-bot/
 ├─ bot.py                    # QQ 官方版入口（被动，可选）
 ├─ bot_napcat.py             # NapCat / OneBot v11 入口（推荐，含主动推送功能）
-├─ plugins/                  # QQ 官方版插件（@统计 等）
-├─ plugins_napcat/           # NapCat 版插件：oopz_stats(@统计) / auto_reporter(播报+欢迎)
+├─ plugins/                  # QQ 官方版插件（被动回复，@oopz）
+├─ plugins_napcat/           # NapCat 版插件根目录
+│  ├─ hello/                 # 群消息摘要 + 功能引导
+│  ├─ oopz/                  # oopz 语音频道：@查询 / 定时播报 / 进频道欢迎
+│  ├─ mcs/                   # Minecraft：@查询 / 进服提醒 / 定时播报
+│  └─ _shared/               # 跨插件共享工具（下划线前缀，不会被当插件加载）
 ├─ tools/
 │  ├─ oopz_login.py          # 生成 oopz 平台登录凭据（device_id / jwt / 私钥）
-│  └─ oopz_check.py          # 诊断脚本
+│  ├─ oopz_check.py          # oopz 诊断脚本
+│  └─ mc_check.py            # Minecraft 诊断脚本（SLP + RCON + 白名单，含解析自测）
 ├─ requirements.txt          # Python 依赖清单
 ├─ vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
 ├─ .env.example              # 配置模板 → 复制为 .env 填写
@@ -41,6 +46,7 @@ oopz-bot/
 - 一个 **普通 QQ 号**（用作机器人本体，会登录到 NapCat）
 - 一个目标 QQ 群（机器人要加入的群，群号后面用到）
 - oopz 账号（已有加入的语音域）
+- （可选，MC 功能用）一个 **Java 版** Minecraft 服务端，能改 `server.properties` 并重启
 
 ---
 
@@ -105,6 +111,38 @@ copy .env.example .env
 | `NAPCAT_WELCOME_GROUP` | 进频道欢迎推送的 QQ 群号（**逗号分隔多群**，留空=不启用） |
 | `NAPCAT_WELCOME_INTERVAL_SEC` | 进频道检测轮询间隔（秒，默认 15） |
 | `NAPCAT_WELCOME_CHANNELS` | 可选，只欢迎这些频道，逗号分隔；留空=统计范围内全部 |
+| `OOPZ_TRIGGER` / `MC_TRIGGER` | @机器人 触发对应查询的关键词（逗号分隔，不区分大小写）；留空用默认值（`oopz` / `mc,我的世界,服务器`） |
+| `MC_HOST` / `MC_PORT` | MC 服务端地址。bot 与 MC 同机时填 `127.0.0.1` |
+| `MC_RCON_PASSWORD` | 见 4.1 节。**留空 = 不启用 RCON**，此时名单降级用 SLP 样本（在线 ≤12 人时仍是完整名单） |
+| `MC_WATCH_GROUP` | 进服提醒推送的 QQ 群号（逗号分隔多群，留空=不启用）。**只推进服，不推退服** |
+| `MC_WATCH_INTERVAL_SEC` | 进服检测轮询间隔（秒，默认 10）。进服到被发现的延迟 = 0～本值 |
+| `MC_JOIN_MIN_INTERVAL_SEC` | 进服推送最小间隔（秒，默认 15），窗口内的进服合并成一条，防刷屏。**设 0 = 进服立刻推**。最大额外延迟 ≈ 本值 + 一个轮询间隔 |
+| `MC_REPORT_GROUP` / `MC_REPORT_INTERVAL_MIN` | MC 定时播报目标群 / 间隔（分钟，默认 60，整点对齐）。**无人在线时静默跳过**，与 oopz 播报一致 |
+
+### 4.1 Minecraft 服务端准备（RCON）
+
+MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SLP 的玩家样本默认最多 12 个随机玩家，`hide-online-players=true` 时还直接为空）。改服务端 `server.properties`：
+
+| 配置项 | 值 | 说明 |
+|---|---|---|
+| `enable-rcon` | `true` | 不开则只能用 SLP 降级路径 |
+| `rcon.port` | `25575` | 与游戏端口独立，填进 `.env` 的 `MC_RCON_PORT` |
+| `rcon.password` | 强密码 | 填进 `.env` 的 `MC_RCON_PASSWORD` |
+| `broadcast-rcon-to-ops` | **`false`** | **默认是 `true`**！不改的话，bot 每 20 秒一次的 `list` 会把玩家名单广播给所有在线 OP，聊天框持续刷屏 |
+
+改完**重启 MC 服务端**，然后跑诊断脚本确认：
+
+```powershell
+.\.venv\Scripts\python.exe tools\mc_check.py
+```
+
+看到 `名单完整 True` 即成功。若为 `False`，脚本会打印 RCON `list` 的**原始输出**和判定原因，照着排查。
+
+> ⚠️ **RCON 是明文协议，密码可被重放**。`rcon.port` 只绑内网/本机，**绝对不要暴露公网**。
+
+**关于服务端控制台的 RCON 日志**：MC 对**每条** RCON 连接都会打两行 INFO（`Thread RCON Client /… started` / `… shutting down`）。bot 复用一条长连接，所以正常情况下只有 bot 启动时那一组；如果控制台又开始每 10 秒刷一组，说明连接在反复重连——先查服务端是否在重启、`rcon.port` 是否被别的程序占用。
+
+> `broadcast-rcon-to-ops=false` 管的是**命令输出**会不会广播给在线 OP 的聊天框，跟上面这两行监听日志是两套机制，管不到它。
 
 ---
 
@@ -137,9 +175,12 @@ copy .env.example .env
 
 ## 7. 验证
 
-- 群里 `@机器人 统计` → 回复 oopz 语音频道在线明细
+- 群里 `@机器人 oopz` → 回复 oopz 语音频道在线明细
 - 定时播报：到整点槽位（间隔 30 分钟则为 :00/:30），若 oopz 有人在线则推送「📣 oopz 语音频道播报…」（无人在线时静默跳过，属正常）
 - 进频道欢迎：有人进入目标域语音频道后，约 1 个轮询周期内推送趣味欢迎语
+- **MC 查询**：群里 `@机器人 mc` → 回复 MC 服务器在线人数与名单
+- **MC 进服提醒**：自己进服，最慢 `MC_WATCH_INTERVAL_SEC` + `MC_JOIN_MIN_INTERVAL_SEC` 秒内推送「🎮 X 加入了…」（默认 10+15，即 25 秒内；两人紧挨着进服会合并成一条）
+  - ⚠️ **首次启动只建基线**（当时已在线的玩家不算「新进服」），所以重启后不会刷屏。若重启后立刻推出一堆存量玩家，说明基线门控有 bug。
 - 查看日志确认无报错：
 
 ```powershell
@@ -184,11 +225,48 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 - 验证：手动跑 `tools\oopz_check.py`，看查询是否报 token 相关错误；或看日志里 oopz 请求的报错。
 - 修复：重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
 
+### F8 MC 进服提醒不触发
+**先跑诊断脚本**，它会把每一环都摊开打出来：
+
+```powershell
+.\.venv\Scripts\python.exe tools\mc_check.py
+```
+
+- **名单完整 False** → 进服提醒会**静默暂停**（不误报，但也不推消息）。这是刻意的设计：名单残缺时（比如只拿到 12 条随机样本）推「进服」全是假的。
+  - 没配 `MC_RCON_PASSWORD`：在线人数 ≤12 时 SLP 样本本身就是完整名单；超过就必须开 RCON（见 4.1）。
+  - 配了 RCON 仍不完整：看脚本打印的 `list` **原始输出**——可能是插件改写了 `list` 格式，或 `enable-rcon` 没生效。
+- **名单完整 True 但仍不推** → 查 `.env` 的 `MC_WATCH_GROUP` 是否填了、bot 是否在该群。
+- **日志噪音**：RCON 出问题时**只在状态跃迁时打一条告警**，不是每轮一条。所以日志里只有一条 warning 是正常的，别以为没报错就没问题——以 `mc_check.py` 的输出为准。
+
+### F9 MC 名单对不上 / 频繁假进服
+- 玩家显示名带队伍前缀（`§a[VIP] Alice`）时，前缀本身被保留为名字的一部分。前缀变更会被算成一次进服。
+- 若确实频繁误报，可在服务端试 `list uuids`（输出形如 `Alice (uuid)`），改用 UUID 作身份基准即可。先用 `mc_check.py` 确认你那台服务端支持再改。
+
+### F10 @机器人 查询毫无反应（群里一条回复都没有）
+**先看日志有没有这条 warning**：
+
+```
+群 123456789 @mc 查询被忽略：不在白名单内。NAPCAT_ALLOWED_GROUPS=...（逗号分隔；留空 = 所有群都可查）
+```
+
+有 → 该群不在白名单里。把群号加进 `NAPCAT_ALLOWED_GROUPS`（MC 另有 `MC_ALLOWED_GROUPS`，留空时回退到前者），重启 bot。
+
+没有这条 warning → 说明消息根本没被判定成「@机器人」，检查是不是 @ 到了别的号 / 只是打了触发词没 @。
+
+> 这里拦人的是**群白名单**（限制哪些 QQ 群能 @查询），跟「MC 玩家白名单」（服务端 `whitelist.json`）是两回事。
+>
+> 为什么容易踩：**白名单拦截时群里的表现和「机器人掉线」一模一样**——oopz / MC 两边都不吭声，
+> 连 hello 的功能引导也不会出现（因为它被触发词互斥挡掉了）。所以务必以日志为准，别靠群里的表现猜。
+
 ---
 
 ## 9. 日常维护
 
-- **改文案**：播报格式在 `plugins_napcat/auto_reporter.py` 的 `_build_broadcast_message()`；欢迎语在文件顶部的 `_WELCOME_TEMPLATES` 列表。
+- **改文案**：
+  - oopz 播报格式在 `plugins_napcat/oopz/auto_reporter.py` 的 `_build_broadcast_message()`；进频道欢迎语在同文件顶部的 `_WELCOME_TEMPLATES`。
+  - MC 播报格式在 `plugins_napcat/mcs/mc_reporter.py` 的 `_build_report_message()`；进服提醒语在同文件顶部的 `_JOIN_TEMPLATES`；`@mc` 回复格式在 `plugins_napcat/mcs/mc_stats.py` 的 `_build_message()`。
+- **改触发词**：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER`（不用改代码）。归属逻辑在 `plugins_napcat/_shared/triggers.py`。
+- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`（加 `--self-test` 只跑解析自测，不联网；加 `--whitelist` 只看服务端白名单，只读不改）。
 - **续期 oopz JWT（每月一次）**：`OOPZ_JWT_TOKEN` 约 31 天过期。症状：@统计 无回复、播报显示「查询失败」。重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
 - **改间隔/目标群**：改 `.env` 后重启 bot。
 - **看日志**：`logs/napcat_bot.log`（注意 PowerShell 用 `-Encoding UTF8` 读）。

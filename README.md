@@ -1,6 +1,6 @@
 # oopz 群统计机器人
 
-QQ 群机器人：群成员 @ 机器人发「**统计**」，实时查询 oopz 语音频道在线成员并回复。
+QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时查询 oopz 语音频道在线成员 / Minecraft 服务器在线玩家并回复。
 
 提供**两套接入**：
 
@@ -14,12 +14,18 @@ QQ 群机器人：群成员 @ 机器人发「**统计**」，实时查询 oopz �
 | 群内 @ | 回复 |
 |--------|------|
 | `@机器人 你好` | 「收到！被动回复链路已打通 🎉」——链路自检 |
-| `@机器人 统计` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
+| `@机器人 oopz` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
+| `@机器人 mc` | 🗺️ Minecraft 服务器在线人数 + 玩家名单 |
+
+> 触发词可改：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER`（逗号分隔，不区分大小写）。一条消息只会被一个插件响应。
 
 **自动功能（NapCat 版，配置见 `.env`）**
 
-- ⏰ **定时播报**：整点对齐推送（间隔 30 分钟则在 :00/:30，间隔 60 则每小时整点），向 `NAPCAT_REPORT_GROUP` 推送独立格式的「📣 oopz 语音频道播报」——**仅当 oopz 有人在线时**，无人则静默跳过
+- ⏰ **oopz 定时播报**：整点对齐推送（间隔 30 分钟则在 :00/:30，间隔 60 则每小时整点），向 `NAPCAT_REPORT_GROUP` 推送独立格式的「📣 oopz 语音频道播报」——**仅当 oopz 有人在线时**，无人则静默跳过
 - 👋 **进频道欢迎**：每 `NAPCAT_WELCOME_INTERVAL_SEC` 秒轮询，检测到有人进入目标域语音频道时推送趣味欢迎语（随机文案）
+- 🎮 **MC 进服提醒**：每 `MC_WATCH_INTERVAL_SEC` 秒轮询 MC 服务器，有人进服时推送提醒（**只推进服，不推退服**；最小推送间隔 `MC_JOIN_MIN_INTERVAL_SEC` 秒，窗口内的进服合并成一条）
+- ⏰ **MC 定时播报**：整点对齐推送「📣 在线播报」+ 玩家名单——**无人在线时静默跳过**
+- ⚠️ **MC 掉线提醒**：连续两轮探测失败才判定离线（单轮网络抖动不报），恢复时也会推一条；`MC_NOTIFY_SERVER_STATE=false` 可关
 
 示例回复：
 
@@ -46,14 +52,27 @@ oopz-bot/
 ├── vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
 ├── tools/
 │   ├── oopz_login.py         # 手机号+密码 → 写入 OOPZ_* 凭据
-│   └── oopz_check.py         # 独立验证 oopz 查询链路
+│   ├── oopz_check.py         # 独立验证 oopz 查询链路
+│   └── mc_check.py           # 独立验证 Minecraft 取数链路（`--self-test` 跑解析自测）
 ├── plugins/                  # QQ 官方版插件（bot.py 加载）
 │   ├── hello.py              # @你好 → 链路自检
-│   └── oopz_stats.py         # @统计 → 实时成员报告
-├── plugins_napcat/           # NapCat 版插件（bot_napcat.py 加载，逻辑与上面镜像）
-│   ├── hello.py
-│   ├── oopz_stats.py         # @统计
-│   └── auto_reporter.py      # 定时播报 + 进频道欢迎
+│   └── oopz_stats.py         # @oopz → 实时成员报告
+├── plugins_napcat/           # NapCat 版插件（bot_napcat.py 加载）
+│   ├── hello/                # 群消息摘要 + @我 功能引导
+│   ├── oopz/                 # oopz：@查询 / 定时播报 / 进频道欢迎
+│   │   ├── client.py         #   客户端单例 + 共享查询工具
+│   │   ├── oopz_stats.py     #   @oopz
+│   │   └── auto_reporter.py  #   定时播报 + 进频道欢迎
+│   ├── mcs/                  # Minecraft：@查询 / 进服提醒 / 定时播报
+│   │   ├── client.py         #   带 TTL 的快照缓存
+│   │   ├── mc_stats.py       #   @mc
+│   │   └── mc_reporter.py    #   进服提醒 + 定时播报
+│   └── _shared/              # 跨插件共享工具（下划线前缀 → 不会被当插件加载）
+│       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + list 输出解析
+│       ├── push.py           #   群消息推送 + 长度上限
+│       ├── schedule.py       #   整点对齐时间槽
+│       ├── triggers.py       #   触发词归属（决定消息归哪个插件响应）
+│       └── whitelist.py      #   群白名单（被拦下时打 warning，避免静默失效）
 ├── DEPLOY.md                 # 从零部署指南
 └── docs/
     └── chat.md               # 完整技术文档与踩坑记录
@@ -94,7 +113,19 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 .venv\Scripts\python.exe tools\oopz_check.py
 ```
 
-**5. 启动机器人（QQ 官方版）**
+**5. 验证 Minecraft 取数**（可选，用 MC 功能才需要）
+
+先按 [DEPLOY.md 第 4.1 节](DEPLOY.md#41-minecraft-服务端准备rcon) 在 MC 服务端打开 RCON（**别漏 `broadcast-rcon-to-ops=false`**），再跑：
+
+```powershell
+.venv\Scripts\python.exe tools\mc_check.py                     # 实测 SLP + RCON
+.venv\Scripts\python.exe tools\mc_check.py --self-test         # 只跑解析自测，不联网
+.venv\Scripts\python.exe tools\mc_check.py --whitelist         # 只读地看一眼服务端白名单
+```
+
+看到 `[OK] 名单完整` 即成功。不完整时脚本会打印 RCON `list` 的**原始输出**和判定原因。
+
+**6. 启动机器人（QQ 官方版）**
 
 ```powershell
 .venv\Scripts\python.exe bot.py
@@ -102,7 +133,7 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 
 看到 `Bot <机器人AppID> connected` 即成功。
 
-**6. 改用 NapCat 版（可选，可主动推送）**
+**7. 改用 NapCat 版（可选，可主动推送）**
 
 安装 [NapCat](https://github.com/NapNeko/NapCatQQ) / 登录 / 开正向 WebSocket / 配 token 的完整步骤见 [DEPLOY.md 第 2 节](DEPLOY.md#2-安装-napcat协议端)。`ONEBOT_V11_WS_URLS` / `ONEBOT_V11_ACCESS_TOKEN` 配好后启动：
 
@@ -114,13 +145,14 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 
 ## 群内使用
 
-在 QQ 群 @ 机器人发送 `统计` 或 `你好` 即可。仅响应群内 @，私聊不回复。
+在 QQ 群 @ 机器人发送 `oopz`、`mc` 或 `你好` 即可。仅响应群内 @，私聊不回复。
 
-> NapCat 版默认**所有群**都能触发查询；想限定群，在 `.env` 设 `NAPCAT_ALLOWED_GROUPS`（逗号分隔群号，留空 = 不限制）。官方版对应 `QQ_ALLOWED_GROUPS`（group_openid 列表）。
+> NapCat 版默认**所有群**都能触发查询；想限定群，在 `.env` 设 `NAPCAT_ALLOWED_GROUPS`（逗号分隔群号，留空 = 不限制）。MC 查询用 `MC_ALLOWED_GROUPS`，留空时回退到 `NAPCAT_ALLOWED_GROUPS`。
+> 官方版对应 `QQ_ALLOWED_GROUPS`（group_openid 列表），且**不支持 MC 功能**（无主动推送能力，自动功能都做不了）。
 
 ## 自定义回复格式
 
-回复文本由 `_build_stats_message()` 拼装。注意有两个镜像副本：QQ 版在 [plugins/oopz_stats.py](plugins/oopz_stats.py)、NapCat 版在 [plugins_napcat/oopz_stats.py](plugins_napcat/oopz_stats.py)，**改格式需同步两份**（下方代码以 QQ 版行号为准）。
+回复文本由 `_build_stats_message()` / `_build_message()` 拼装。注意 oopz 查询有两个镜像副本：QQ 版在 [plugins/oopz_stats.py](plugins/oopz_stats.py)、NapCat 版在 [plugins_napcat/oopz/oopz_stats.py](plugins_napcat/oopz/oopz_stats.py)，**改格式需同步两份**（下方代码以 QQ 版行号为准）。
 
 **1. 回复文案 / 排版**（[plugins/oopz_stats.py:160-167](plugins/oopz_stats.py#L160-L167)）
 
@@ -141,9 +173,9 @@ msg = "\n".join(lines)
 - 当前成员**一行一个**；想改回横排逗号分隔，把内层 `for name in names:` 换成一行 `lines.append(f"    {', '.join(names)}")`。
 - 昵称解析失败时回退显示 uid 前 8 位（`uid[:8]`），可在 `names` 那行调整。
 
-**2. 触发词**（[plugins/oopz_stats.py:181](plugins/oopz_stats.py#L181)）：`if text != "统计":` 改成你想要的词，如 `if text != "在线":`。
+**2. 触发词**：改 `.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER`，**不用改代码**。归属逻辑统一在 [plugins_napcat/_shared/triggers.py](plugins_napcat/_shared/triggers.py) 的 `detect()`——一条消息只会被一个插件响应，各插件都只问它，所以不存在「加个新插件就要回头改所有插件互斥条件」的问题。
 
-**3. 消息长度上限**（[plugins/oopz_stats.py:24](plugins/oopz_stats.py#L24)）：`_MAX_LEN = 1800`，QQ 群文本约 2000 上限，超长自动截断加 `…`。
+**3. 消息长度上限**（[plugins_napcat/_shared/push.py](plugins_napcat/_shared/push.py)）：`MAX_LEN = 1800`，QQ 群文本约 2000 上限，超长由 `truncate()` 截断加 `…`。oopz 与 MC 两侧共用这一处。
 
 **4. 统计范围**（[.env](.env)）：`OOPZ_TARGET_AREAS=<你的域名>`——逗号分隔可加多个域（area_id 或域名），删除该行则统计全部已加入的域。
 
@@ -151,11 +183,13 @@ msg = "\n".join(lines)
 
 ## 维护与常见问题
 
-完整排查清单见 [DEPLOY.md 常见问题](DEPLOY.md#8-常见问题已知坑)（F1~F7）与 [日常维护](DEPLOY.md#9-日常维护)。高频三条：
+完整排查清单见 [DEPLOY.md 常见问题](DEPLOY.md#8-常见问题已知坑)（F1~F10）与 [日常维护](DEPLOY.md#9-日常维护)。高频五条：
 
+- **@机器人 毫无反应**：先看日志有没有「不在白名单内」的 warning——群白名单拦下时群里的表现和「机器人掉线」完全一样，见 DEPLOY.md 第 8 节 F10。
 - **统计 / 播报突然失效**：多半是 `OOPZ_JWT_TOKEN` 过期（约 31 天），重跑 `tools/oopz_login.py` → 回填 `.env` → 重启，见 DEPLOY.md 第 8 节 F7。
+- **MC 进服提醒不触发**：先跑 `tools/mc_check.py`——**名单不完整时提醒会静默暂停**（刻意设计，避免基于残缺名单误报）。脚本会打印 RCON `list` 原文与判定原因，见 DEPLOY.md 第 8 节 F8。
 - **部分域不出现在统计里**：如「Voxel Passion 像素乐园」频道接口返回 `channels: null`，SDK 解析失败被跳过，不影响其他域（原因见 docs/chat.md §5.5）。
-- **主动推送（仅 NapCat 版）**：官方版无主动推送能力；定时播报 / 进频道欢迎只在 NapCat 版生效，文案在 `plugins_napcat/auto_reporter.py`（顶部 `_WELCOME_TEMPLATES` 与 `_build_broadcast_message()`）。
+- **主动推送（仅 NapCat 版）**：官方版无主动推送能力；定时播报 / 进频道欢迎 / MC 全部自动功能只在 NapCat 版生效。文案位置见 [DEPLOY.md 第 9 节](DEPLOY.md#9-日常维护)。
 
 ## 详细文档
 

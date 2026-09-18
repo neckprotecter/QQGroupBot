@@ -10,21 +10,15 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# 加载 .env（nonebot 启动时会自己加载，这里手动载入以便独立运行）
-def _load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value.strip()
+# 加载 .env：直接用 python-dotenv（bot 用的也是它），别手写解析。
+# 手写版不认行尾注释，`OOPZ_APP_VERSION=73817  # 版本号` 会被原样当成值。
+# 诊断脚本必须和 bot 用同一套解析语义，否则量出来的配置不是 bot 看到的那份。
+load_dotenv(ROOT / ".env")
 
 
 def _pem_from_env() -> str:
@@ -48,7 +42,6 @@ def _config_from_env():
 
 
 async def main() -> int:
-    _load_dotenv(ROOT / ".env")
     from oopz_sdk import OopzBot
 
     if not all(os.environ.get(k) for k in ("OOPZ_DEVICE_ID", "OOPZ_PERSON_UID", "OOPZ_JWT_TOKEN")):

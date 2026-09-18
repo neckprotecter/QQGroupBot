@@ -13,13 +13,14 @@ oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责播报
 import asyncio
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from nonebot import get_bots, get_driver
+from nonebot import get_driver
 from nonebot.log import logger
 
+from .._shared.push import send_to_groups, truncate
+from .._shared.schedule import seconds_until_slot
 from .client import (
-    _MAX_LEN,
     _QUERY_TIMEOUT,
     _channel_name_map,
     _fetch_uid_names,
@@ -55,20 +56,6 @@ _WELCOME_TEMPLATES = [
     "🎧 {name} 戴上耳机钻进了 oopz「{channel}」。",
     "🚀 {name} 空降到 oopz「{channel}」频道。",
 ]
-
-
-async def _send(group_id: str, text: str) -> bool:
-    """向指定群推送文本。bot 未连接或发送失败返回 False（不抛异常）。"""
-    bots = get_bots()
-    if not bots or not group_id:
-        return False
-    bot = next(iter(bots.values()))
-    try:
-        await bot.send_group_msg(group_id=int(group_id), message=text)
-        return True
-    except Exception as exc:
-        logger.error("推送群 {} 消息失败: {}", group_id, exc)
-        return False
 
 
 # ---------------------------------------------------------------- 定时播报
@@ -131,25 +118,7 @@ async def _build_broadcast_message() -> str | None:
                 lines.append(f"  • {uid_name.get(uid) or uid[:8]}")
     lines.append("\n想一起玩的，直接进频道找他们～")
 
-    msg = "\n".join(lines)
-    if len(msg) > _MAX_LEN:
-        msg = msg[:_MAX_LEN - 1] + "…"
-    return msg
-
-
-def _seconds_until_broadcast_slot() -> float:
-    """距下一个整点槽位的秒数：以当天 00:00 为起点，落在分钟数能被 N 整除的时刻。
-
-    N=30 → :00 与 :30；N=60 → 每小时整点；N=15 → :00/:15/:30/:45。
-    用它替代固定 sleep，避免启动时间不同导致播报时刻漂移、永远对不齐整点。
-    """
-    now = datetime.now()
-    minutes = _REPORT_INTERVAL_MIN
-    next_slot = ((now.hour * 60 + now.minute) // minutes + 1) * minutes
-    target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
-        minutes=next_slot
-    )
-    return max((target - now).total_seconds(), 0.0)
+    return truncate("\n".join(lines))
 
 
 async def _report_loop() -> None:
@@ -161,16 +130,14 @@ async def _report_loop() -> None:
     while True:
         try:
             # 睡到下一个整点槽位；每次从当前时刻重新对齐，不累积漂移
-            delay = _seconds_until_broadcast_slot()
+            delay = seconds_until_slot(_REPORT_INTERVAL_MIN)
             if delay:
                 await asyncio.sleep(delay)
             msg = await _build_broadcast_message()
             if msg is None:
                 logger.info("定时播报：当前 oopz 无人在线，本次跳过")
             else:
-                for g in _REPORT_GROUPS:
-                    await _send(g, msg)
-                    await asyncio.sleep(0.5)  # 多群连续推送间隔，避免被吞/风控
+                await send_to_groups(_REPORT_GROUPS, msg)
                 logger.info("定时播报已推送到 {} 个群", len(_REPORT_GROUPS))
         except Exception as exc:
             logger.error("定时播报异常: {}", exc)
@@ -254,9 +221,7 @@ async def _check_joins() -> None:
         template = random.choice(_WELCOME_TEMPLATES)
         text = template.format(name=display, channel=ch_name)
         logger.info("{} 进入「{}」，已推送", display, ch_name)
-        for g in _WELCOME_GROUPS:
-            await _send(g, text)
-            await asyncio.sleep(0.5)  # 多群/多条连续推送间隔，避免被吞/风控
+        await send_to_groups(_WELCOME_GROUPS, text)
 
 
 @driver.on_startup
