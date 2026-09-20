@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from nonebot.log import logger
 
 from .mc import parse_whitelist_names, rcon_command
+from .mcservers import ServerTarget
 
 VERBS: tuple[str, ...] = ("add", "remove", "list")
 
@@ -166,8 +167,8 @@ def settle(
     return ok, player
 
 
-async def run_whitelist_command(cmd: AdminCommand) -> AdminResult:
-    """执行命令并独立验证。
+async def run_whitelist_command(cmd: AdminCommand, target: ServerTarget) -> AdminResult:
+    """对指定目标执行命令并独立验证。
 
     RCON 故障（RconError 子类）照常抛出，由调用方转成用户文案——在这里塞进字符串
     字段反而会丢掉类型，没法给出「密码错」和「连不上」不同的提示。
@@ -179,12 +180,15 @@ async def run_whitelist_command(cmd: AdminCommand) -> AdminResult:
     2. 「本来就在 / 本来就不在」要能报准。名单里没有的名字，`remove` 照样返回成功但
        什么也没删；不做前置判断就会把「没发生的事」报成「已移出」。
 
-    代价是每次变更最多 3 个 RCON 往返（前置读 + 执行 + 反查），最坏 3×MC_RCON_TIMEOUT；
-    已经是目标状态时只花 1 个。这是管理员手动触发的低频操作，不在 20 秒轮询里，值得。
-    并发仍然安全：mc.rcon_command 在 _lock() 上串行，两个管理员不会把响应串在一起。
+    代价是每次变更最多 3 个 RCON 往返（前置读 + 执行 + 反查），最坏 3×rcon_timeout；
+    已经是目标状态时只花 1 个。这是管理员手动触发的低频操作，不在轮询里，值得。
+    并发仍然安全：mc.rcon_command 在该目标的锁上串行，两个管理员不会把响应串在一起。
+
+    白名单只发往**一个**目标（mcs_servers.toml 的 [whitelist].target）——代理层白名单是
+    网络级的一份，逐子服各改一遍只会让几份名单漂移。
     """
     if cmd.verb == "list":
-        names = parse_whitelist_names(await rcon_command("whitelist list"))
+        names = parse_whitelist_names(await rcon_command(target, "whitelist list"))
         return AdminResult(
             verb="list",
             player="",
@@ -193,12 +197,12 @@ async def run_whitelist_command(cmd: AdminCommand) -> AdminResult:
             detail="" if names is not None else "whitelist list 输出无法解析",
         )
 
-    matches = whitelist_matches(await rcon_command("whitelist list"), cmd.player)
+    matches = whitelist_matches(await rcon_command(target, "whitelist list"), cmd.player)
     if matches is None:
         return AdminResult(
             verb=cmd.verb, player=cmd.player, ok=None, detail="whitelist list 输出无法解析"
         )
-    noop, targets = plan_mutation(cmd.verb, cmd.player, matches)
+    noop, spellings = plan_mutation(cmd.verb, cmd.player, matches)
     if noop:
         return AdminResult(
             verb=cmd.verb,
@@ -210,22 +214,24 @@ async def run_whitelist_command(cmd: AdminCommand) -> AdminResult:
         )
 
     raw = ""
-    for target in targets:
-        raw = await rcon_command(f"whitelist {cmd.verb} {target}")
+    # 循环变量叫 spelling 不叫 target：本函数的形参 target 是服务器目标，
+    # 而这里遍历的是**玩家名的拼写**（同一玩家在服务端可能有不止一条记录）。
+    for spelling in spellings:
+        raw = await rcon_command(target, f"whitelist {cmd.verb} {spelling}")
         # 回执只记 debug：它的文案是本地化的，不足以判定成败（见 docstring 第 3 条）
-        logger.debug("RCON whitelist {} {} 回执: {}", cmd.verb, target, raw)
+        logger.debug("RCON whitelist {} {} 回执: {}", cmd.verb, spelling, raw)
 
-    after = whitelist_matches(await rcon_command("whitelist list"), cmd.player)
+    after = whitelist_matches(await rcon_command(target, "whitelist list"), cmd.player)
     if after is None:
         return AdminResult(
             verb=cmd.verb, player=cmd.player, ok=None, detail="whitelist list 输出无法解析"
         )
-    ok, server_name = settle(cmd.verb, cmd.player, targets, after)
+    ok, server_name = settle(cmd.verb, cmd.player, spellings, after)
     return AdminResult(
         verb=cmd.verb,
         player=cmd.player,
         ok=ok,
         detail="" if ok else f"回执: {raw[:200]!r}",
         server_name=server_name,
-        targets=targets,
+        targets=spellings,
     )

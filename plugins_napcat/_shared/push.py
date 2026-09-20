@@ -7,12 +7,28 @@ import asyncio
 
 from nonebot import get_bots
 from nonebot.log import logger
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
-# 每条消息最大长度（QQ 群文本消息上限约 2000，留余量）
-MAX_LEN = 1800
+# 长度上限与截断在 textlen.py（零依赖），这里再导出一次：
+# 渲染层要 import truncate，但不能因此把 nonebot 拖进去。调用方照旧写
+# `from .._shared.push import truncate`，不必知道它住在哪。
+from .textlen import MAX_LEN, truncate  # noqa: F401
 
 # 多群/多条连续推送之间的间隔（秒），避免被吞或被风控
 _PUSH_GAP = 0.5
+
+
+def text_message(text: str) -> Message:
+    """把纯文本包成单个 text 段。
+
+    **不要直接传 str 给 send_group_msg**：传 str 时整条消息在协议层被当作 CQ 码
+    文本解析，内容里万一出现 `[CQ:at,qq=all]` 这类串就会被执行。包成 text 段后
+    NoneBot 序列化时会做 CQ 转义（`[` → `&#91;`），从结构上杜绝。
+
+    本模块推的内容大多来自外部（MC 玩家显示名、oopz 昵称），第三方插件能往显示名里
+    塞任意字符，所以这层不能省。理由与 mcs/mc_admin.py 的 _reply 完全一致。
+    """
+    return Message([MessageSegment.text(text)])
 
 
 async def send_group(group_id: str, text: str) -> bool:
@@ -22,7 +38,7 @@ async def send_group(group_id: str, text: str) -> bool:
         return False
     bot = next(iter(bots.values()))
     try:
-        await bot.send_group_msg(group_id=int(group_id), message=text)
+        await bot.send_group_msg(group_id=int(group_id), message=text_message(text))
         return True
     except Exception as exc:
         logger.error("推送群 {} 消息失败: {}", group_id, exc)
@@ -38,10 +54,3 @@ async def send_to_groups(group_ids: list[str], text: str) -> int:
         if await send_group(group_id, text):
             sent += 1
     return sent
-
-
-def truncate(text: str, limit: int = MAX_LEN) -> str:
-    """超长文本截断加省略号（QQ 群消息超限会被整条拒收）。"""
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"

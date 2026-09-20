@@ -150,7 +150,7 @@ QQ 官方机器人的主动推送（定时播报、进频道欢迎等）2025-04-
 
 **正向 WS 的选择**：NoneBot 的 `~aiohttp` 驱动是 `class Driver(Mixin, NoneDriver)`——**纯客户端、无 Web 服务器**，无法做反向 WS（nonebot 当服务端）。因此 NapCat 版用**正向 WS**：NapCat 起服务（默认 3001），NoneBot 连过去。若要反向 WS，需换成带 Web 服务器的驱动（如 `~fastapi`）。
 
-代码几乎与 QQ 版同构，仅适配器 import 与发送方式不同；oopz 查询逻辑（`_config_from_env` / `bot.rest.start()` / 频道名映射 / 消息拼装）完全复用，见 [plugins_napcat/oopz_stats.py](plugins_napcat/oopz_stats.py)。
+代码几乎与 QQ 版同构，仅适配器 import 与发送方式不同；oopz 查询逻辑（`_config_from_env` / `bot.rest.start()` / 频道名映射 / 消息拼装）完全复用，见 [plugins_napcat/oopz/oopz_stats.py](../plugins_napcat/oopz/oopz_stats.py)。
 
 ### 8.3 配置与运行
 

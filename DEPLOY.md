@@ -24,8 +24,10 @@ oopz-bot/
 │  └─ mc_check.py            # Minecraft 诊断脚本（SLP + RCON + 白名单，含解析自测）
 ├─ requirements.txt          # Python 依赖清单
 ├─ vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
-├─ .env.example              # 配置模板 → 复制为 .env 填写
+├─ .env.example              # 行为类配置模板 → 复制为 .env 填写
 ├─ .env                      # 实际配置（含密钥，勿外泄/勿提交）
+├─ mcs_servers.toml.example  # MC 服务器清单模板 → 复制为 mcs_servers.toml 填写
+├─ mcs_servers.toml          # 实际清单（含各服 RCON 密码，勿外泄/勿提交）
 ├─ DEPLOY.md                 # 本文档
 ├─ README.md                 # 项目简介
 ├─ docs/chat.md              # 维护记录（含 NapCat 踩坑细节）
@@ -114,32 +116,84 @@ copy .env.example .env
 | `OOPZ_TRIGGER` / `MC_TRIGGER` | @机器人 触发对应查询的关键词（逗号分隔，不区分大小写）；留空用默认值（`oopz` / `mc,我的世界,服务器`） |
 | `MC_ADMIN_QQ` | 能用 `whitelist` 管理命令的 QQ 号（逗号分隔）。**留空 = 该功能对所有人关闭**——与其他「留空 = 不限制」相反，是刻意的 |
 | `MC_ADMIN_TRIGGER` | 触发管理命令的关键词（默认 `whitelist`）。别填 `add`/`remove`/`list`，也别跟 `MC_TRIGGER` 撞词 |
-| `MC_HOST` / `MC_PORT` | MC 服务端地址。bot 与 MC 同机时填 `127.0.0.1` |
-| `MC_RCON_PASSWORD` | 见 4.1 节。**留空 = 不启用 RCON**，此时名单降级用 SLP 样本（在线 ≤12 人时仍是完整名单） |
 | `MC_WATCH_GROUP` | 进服提醒推送的 QQ 群号（逗号分隔多群，留空=不启用）。**只推进服，不推退服** |
 | `MC_WATCH_INTERVAL_SEC` | 进服检测轮询间隔（秒，默认 10）。进服到被发现的延迟 = 0～本值 |
 | `MC_JOIN_MIN_INTERVAL_SEC` | 进服推送最小间隔（秒，默认 15），窗口内的进服合并成一条，防刷屏。**设 0 = 进服立刻推**。最大额外延迟 ≈ 本值 + 一个轮询间隔 |
 | `MC_REPORT_GROUP` / `MC_REPORT_INTERVAL_MIN` | MC 定时播报目标群 / 间隔（分钟，默认 60，整点对齐）。**无人在线时静默跳过**，与 oopz 播报一致 |
 
-### 4.1 Minecraft 服务端准备（RCON）
+> ⚠️ **MC 服务器的地址 / 显示名 / 超时 / RCON 密码都不在 `.env` 里。**
+> 它们在同目录的 **`mcs_servers.toml`**（一台服一段 `[[targets]]`），见 4.1 节。
+> 复制 `mcs_servers.toml.example` 为 `mcs_servers.toml` 再填。改完要**重启 bot**。
 
-MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SLP 的玩家样本默认最多 12 个随机玩家，`hide-online-players=true` 时还直接为空）。改服务端 `server.properties`：
+### 4.1 服务器清单 mcs_servers.toml
+
+机器人现在能同时看多台服（一个代理 + 若干子服，外加不在代理后面的独立模组服），
+所以「服务器在哪」这件事从 `.env` 搬到了 `mcs_servers.toml`：
+
+```powershell
+Copy-Item mcs_servers.toml.example mcs_servers.toml
+```
+
+`mcs_servers.toml` 已在 `.gitignore` 里（含各服 RCON 密码明文，别提交）。三件事要填：
+
+1. **每台服一段 `[[targets]]`**：`id`（也是 `@查询` 里打的服名）、`name`、`kind`
+   （`proxy` / `backend` / `standalone`）、`host` / `port`、`rcon = { port, password }`。
+2. **`[whitelist]`**：白名单命令发给哪台服、**命令前缀是什么**（见下）。
+3. **`[defaults] primary`**：不带服名的 `@查询`、进服提醒、定时播报默认看哪台服。
+
+改完**重启 bot**。首选诊断手段是 `--list-targets` —— 它**只读配置、不联网**，
+会把「读的是哪个文件、每个目标的名字、白名单指向谁、有哪些配置冲突」全打出来，
+是排查「新加的服为什么没生效」最快的入口：
+
+```powershell
+.\.venv\Scripts\python.exe tools\mc_check.py --list-targets
+```
+
+#### 每台服务端的准备（`server.properties`，改完要重启该服务端）
+
+MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SLP 的玩家样本默认最多
+12 个随机玩家，`hide-online-players=true` 时还直接为空）。**每一台**出名单的服都要配：
 
 | 配置项 | 值 | 说明 |
 |---|---|---|
-| `enable-rcon` | `true` | 不开则只能用 SLP 降级路径 |
-| `rcon.port` | `25575` | 与游戏端口独立，填进 `.env` 的 `MC_RCON_PORT` |
-| `rcon.password` | 强密码 | 填进 `.env` 的 `MC_RCON_PASSWORD` |
-| `broadcast-rcon-to-ops` | **`false`** | **默认是 `true`**！不改的话，bot 每 20 秒一次的 `list` 会把玩家名单广播给所有在线 OP，聊天框持续刷屏 |
+| `enable-rcon` | `true` | 不开则只能用 SLP 降级路径（只剩人数） |
+| `rcon.port` | **每台一个，别撞** | 与游戏端口独立，填进 `mcs_servers.toml` 对应 target 的 `rcon.port` |
+| `rcon.password` | 强密码 | 填进 `mcs_servers.toml` 对应 target 的 `rcon.password` |
+| `broadcast-rcon-to-ops` | **`false`** | **默认是 `true`**！不改的话，bot 每 `MC_WATCH_INTERVAL_SEC` 秒（默认 10）一次的 `list` 会把输出广播给所有在线 OP，聊天框持续刷屏 |
 | `white-list` | `true` | 想用**白名单管理**才需要。不打开时 `whitelist add` 照样能执行、也写进 `whitelist.json`，但服务端不拦人——**bot 看不出来**，只会如实报「已添加」。DEPLOY 无法替你判断，请自行确认 |
+
+> ⚠️ **两台服的 `host:port` 不能相同。** 这不只是「不能同时跑」：探测层面无从分辨，
+> 查 A 会把正在跑的 B 的数据当成 A 报出去，界面上看起来完全正常。`--list-targets`
+> 会警告，但它不是错误，所以警告要认真看。
+
+> ⚠️ **命令前缀必须和插件注册的命令一字不差。** `[whitelist].command` 决定 RCON 里
+> 实际发什么：vanilla 是 `whitelist`，Global Whitelist 是 `globalwhitelist`，
+> ProxyWhitelist 是 `pwl`。写错的表现是每次白名单操作都回 `Unknown command`、
+> 群里报「未生效」，而且不报错。
+>
+> 注意**触发词和命令前缀是两个不同的轴**：群友在群里打的词由 `.env` 的
+> `MC_ADMIN_TRIGGER` 决定（默认 `whitelist`），机器人发给服务端的词由这个字段决定。
+> 今天两者恰好同名，代理上线后必然分叉。
 
 改完**重启 MC 服务端**，然后跑诊断脚本确认：
 
 ```powershell
-.\.venv\Scripts\python.exe tools\mc_check.py
+.\.venv\Scripts\python.exe tools\mc_check.py              # 并发探测全部目标
+.\.venv\Scripts\python.exe tools\mc_check.py --target bingo   # 只看一台
 ```
 
-看到 `名单完整 True` 即成功。若为 `False`，脚本会打印 RCON `list` 的**原始输出**和判定原因，照着排查。
+每个目标打一个块，块头就是结论（`[OK]` / `[!!]`），末尾汇总 `N/M 个目标正常`；
+**只要有目标不正常，退出码就是 1**，可以直接在脚本里判断。`--target` 后面写的服名
+走**和群里同一套解析**（id / 名字 / 别名 / 唯一前缀，忽略大小写与全角），所以脚本里
+跑得通的写法，群友打出来也一定跑得通；认不出来或前缀有歧义都会**明确报错**，不会
+悄悄退化成「探测全部」。
+
+看到块头是 `[OK] … 名单完整` 即成功。若是 `[!!] … 名单不完整`，脚本会打印 RCON
+`list` 的**原始输出**和判定原因，照着排查。
+
+> `kind = "proxy"` 的目标例外：代理**本来就不出分服名单**（Velocity 没有可用的 `list`
+> 命令），它的 `名单完整` 恒为 `False` —— 这不是故障。脚本对代理只看可达性，
+> 报的是全群组总人数，结论是 `[OK] 代理可达`。分服名单要逐个子服查。
 
 > ⚠️ **RCON 是明文协议，密码可被重放**。`rcon.port` 只绑内网/本机，**绝对不要暴露公网**。
 
@@ -207,7 +261,7 @@ MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SL
   3. `@机器人 whitelist list` → 列表里能看到 `CodexTest`。
   4. `@机器人 whitelist remove CodexTest` → 「✅ 已将 CodexTest 移出白名单。」再 `list` 确认已消失。
   - ⚠️ **务必用一次性假名字**，别拿真实玩家的名字试——这条链路会真的改服务端 `whitelist.json`。走完第 3、4 步就回到原样。
-  - bot 是「先读名单 → 再下命令 → 再读名单确认」。读第一次是为了照抄服务端记录的拼写、并判断「本来就在 / 本来就不在」，读第二次是因为 `whitelist add` 的回执是本地化文案、不足为凭。所以回复慢一点是正常的：每次变更最多 3 个 RCON 往返（已经是目标状态时只花 1 个），最坏 3×`MC_RCON_TIMEOUT` 秒。
+  - bot 是「先读名单 → 再下命令 → 再读名单确认」。读第一次是为了照抄服务端记录的拼写、并判断「本来就在 / 本来就不在」，读第二次是因为 `whitelist add` 的回执是本地化文案、不足为凭。所以回复慢一点是正常的：每次变更最多 3 个 RCON 往返（已经是目标状态时只花 1 个），最坏 3×`[defaults].rcon_timeout` 秒。
 - 查看日志确认无报错：
 
 ```powershell
@@ -260,7 +314,7 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 ```
 
 - **名单完整 False** → 进服提醒会**静默暂停**（不误报，但也不推消息）。这是刻意的设计：名单残缺时（比如只拿到 12 条随机样本）推「进服」全是假的。
-  - 没配 `MC_RCON_PASSWORD`：在线人数 ≤12 时 SLP 样本本身就是完整名单；超过就必须开 RCON（见 4.1）。
+  - 该目标没配 `rcon.password`（`mcs_servers.toml`）：在线人数 ≤12 时 SLP 样本本身就是完整名单；超过就必须开 RCON（见 4.1）。
   - 配了 RCON 仍不完整：看脚本打印的 `list` **原始输出**——可能是插件改写了 `list` 格式，或 `enable-rcon` 没生效。
 - **名单完整 True 但仍不推** → 查 `.env` 的 `MC_WATCH_GROUP` 是否填了、bot 是否在该群。
 - **日志噪音**：RCON 出问题时**只在状态跃迁时打一条告警**，不是每轮一条。所以日志里只有一条 warning 是正常的，别以为没报错就没问题——以 `mc_check.py` 的输出为准。
@@ -293,7 +347,8 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 |---|---|---|
 | 「🚫 你没有 MC 管理权限」 | 你的号不在 `MC_ADMIN_QQ` 里；或该项**留空**（留空 = 功能对所有人关闭） | 把自己的 QQ 号加进去，重启 bot。日志里能区分「未配置」和「不在名单内」两种 |
 | 「🚫 本群未启用 MC 管理命令」 | 该群不在 `MC_ALLOWED_GROUPS` / `NAPCAT_ALLOWED_GROUPS` 里（与 @查询 共用同一条链） | 加群号或清空该配置 |
-| 「⚠️ 未配置 MC_RCON_PASSWORD…」 | 管理命令必须走 RCON，没有降级路径 | 按 4.1 节配好 RCON |
+| 「⚠️ MC 玩家白名单管理不可用：mcs_servers.toml 里没有可用的白名单目标…」 | 管理命令必须走 RCON，没有降级路径 | 按 4.1 节配好 `[whitelist].target` 和该目标的 `rcon.password` |
+| 「⚠️ 服务器配置读不了：…」 | `mcs_servers.toml` 不存在或有语法/校验错误 | 报错里带原始原因，照着改；先跑 `--list-targets` 看详细 |
 | 「❌ 未生效：名单里仍没有 X」 | 命令发出去了，但服务端没执行 | 看日志里那行 warning 的 **RCON 回执原文**——常见是服务端根本没启用 `whitelist` 命令，或被权限插件接管 |
 | 「⚠️ 命令已发送（未能验证）」 | 服务端 `whitelist list` 的输出格式解析不了（没有冒号，多半被插件改写过） | **命令很可能已经生效**，去服务端 `whitelist list` 确认。想根治先跑 `tools\mc_check.py --whitelist` 看原文 |
 | 完全没有任何回复 | 消息没被 @ 到 / 不在群里 | 同 F10 |
@@ -316,11 +371,12 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 
 - **改文案**：
   - oopz 播报格式在 `plugins_napcat/oopz/auto_reporter.py` 的 `_build_broadcast_message()`；进频道欢迎语在同文件顶部的 `_WELCOME_TEMPLATES`。
-  - MC 播报格式在 `plugins_napcat/mcs/mc_reporter.py` 的 `_build_report_message()`；进服提醒语在同文件顶部的 `_JOIN_TEMPLATES`；`@mc` 回复格式在 `plugins_napcat/mcs/mc_stats.py` 的 `_build_message()`。
+  - MC 播报格式在 `plugins_napcat/mcs/mc_reporter.py` 的 `_build_report_message()`；进服提醒语在同文件顶部的 `_JOIN_TEMPLATES`。
+  - `@mc` 的回复格式在 `plugins_napcat/_shared/mcrender.py`：`render_detail()`（`@mc <服名>` 单服明细）、`render_summary()`（`@mc` 总览）。**查询与播报共用这一份**，改这里两边一起变，不会出现同一个服在两个地方显示成两样。
   - 白名单命令的回复文案与用法提示在 `plugins_napcat/mcs/mc_admin.py` 的 `_build_message()` / `_usage()`；命令解析与执行在 `plugins_napcat/_shared/mcadmin.py`。
-- **改触发词**：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（不用改代码）。归属逻辑在 `plugins_napcat/_shared/triggers.py`。
+- **改触发词**：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（不用改代码）。归属逻辑在 `plugins_napcat/_shared/triggers.py`：`locate()` 定归属并带回位置，`detect()` 是它的薄包装，`strip_keyword()` 把触发词剥掉取载荷（`@bot 服务器 mc bingo` → `bingo`）——它剥的是该插件的**全部**触发词，所以多写几个触发词也能解析对。
 - **改管理员**：`.env` 的 `MC_ADMIN_QQ`（逗号分隔 QQ 号，**留空 = 关闭该功能**）。鉴权在 `plugins_napcat/_shared/admin.py`。
-- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`（加 `--self-test` 只跑解析自测，不联网；加 `--whitelist` 只看服务端白名单，只读不改）。
+- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`。不带参数 = 并发探测**全部**目标，逐台给结论；加 `--target <服名>` 只看一台；加 `--list-targets` 只读配置、不联网（新加的子服没生效先跑这个）；加 `--self-test` 只跑解析自测、不联网；加 `--whitelist` 只看服务端白名单，只读不改。退出码 0 正常 / 1 有目标不正常 / 2 用法错误。
 - **续期 oopz JWT（每月一次）**：`OOPZ_JWT_TOKEN` 约 31 天过期。症状：@统计 无回复、播报显示「查询失败」。重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
 - **改间隔/目标群**：改 `.env` 后重启 bot。
 - **看日志**：`logs/napcat_bot.log`（注意 PowerShell 用 `-Encoding UTF8` 读）。

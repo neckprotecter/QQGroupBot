@@ -4,7 +4,8 @@
 
   1. 群白名单（_shared/whitelist.py，本文件里别名 group_whitelist）
   2. 管理员 QQ 号（_shared/admin.py，MC_ADMIN_QQ）—— **留空 = 谁都不许用**
-  3. RCON 可用性（MC_RCON_PASSWORD）—— 没配就没有命令通道，如实告知
+  3. RCON 可用性（mcs_servers.toml 的 [whitelist].target + 该目标的 rcon.password）
+     —— 没配就没有命令通道，如实告知
   4. 命令解析（动词白名单 + 玩家名正则）—— 解析不了就回用法
 
 触发词一旦归本插件，**这条消息就已被独占**（归属逻辑见 _shared/triggers.py）——hello 的
@@ -24,7 +25,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegme
 
 from .._shared import admin
 from .._shared import whitelist as group_whitelist  # 群白名单，别名防与玩家白名单混淆
-from .._shared.mc import RconAuthError, RconConnectError, RconError, _cfg
+from .._shared.mc import RconAuthError, RconConnectError, RconError
 from .._shared.mcadmin import (
     ERR_LIST_ARGS,
     ERR_NAME,
@@ -32,6 +33,7 @@ from .._shared.mcadmin import (
     parse_command,
     run_whitelist_command,
 )
+from .._shared.mcservers import ServerConfigError, default_book
 from .._shared.push import truncate
 from .._shared.triggers import detect, primary_keyword
 from .client import _MAX_NAMES
@@ -48,7 +50,10 @@ mc_admin = on_message(priority=1, block=False)
 
 _DENIED = "🚫 你没有 MC 管理权限，这条命令只有管理员能用。"
 _GROUP_DENIED = "🚫 本群未启用 MC 管理命令。"
-_NO_RCON = "⚠️ 未配置 MC_RCON_PASSWORD，MC 玩家白名单管理不可用。"
+_NO_RCON = (
+    "⚠️ MC 玩家白名单管理不可用：mcs_servers.toml 里没有可用的白名单目标。\n"
+    "需要在 [whitelist] 段指定 target，并给该目标配好 rcon.password。"
+)
 
 
 def _usage(err: str) -> str:
@@ -148,7 +153,13 @@ async def handle_admin(bot: Bot, event: MessageEvent):
     if not admin.allowed_user(event.get_user_id(), "mcadmin", *_ADMIN_QQ_VARS):
         await _reply(bot, group_id, _DENIED)
         return
-    if not _cfg().rcon_enabled:
+    try:
+        owner = default_book().whitelist_owner
+    except ServerConfigError as exc:
+        logger.error("读取 mcs_servers.toml 失败：{}", exc)
+        await _reply(bot, group_id, f"⚠️ 服务器配置读不了，白名单管理不可用：{exc}")
+        return
+    if owner is None or not owner.rcon_enabled:
         await _reply(bot, group_id, _NO_RCON)
         return
 
@@ -165,7 +176,7 @@ async def handle_admin(bot: Bot, event: MessageEvent):
         event.get_user_id(),
     )
     try:
-        result = await run_whitelist_command(cmd)
+        result = await run_whitelist_command(cmd, owner)
     except RconAuthError as exc:  # 是 RconError 子类，必须先接
         logger.warning("MC 白名单命令 RCON 认证失败: {}", exc)
         await _reply(bot, group_id, f"😵 RCON 认证失败：{exc}")

@@ -23,9 +23,10 @@ from datetime import datetime
 from nonebot import get_driver
 from nonebot.log import logger
 
-from .._shared.mc import McSnapshot, _cfg
+from .._shared.mc import SLP_UNPARSEABLE, McSnapshot
 from .._shared.push import send_to_groups, truncate
 from .._shared.schedule import seconds_until_slot
+from .._shared.mcservers import ServerConfigError, ServerTarget, default_book
 from .client import _MAX_NAMES, get_snapshot
 
 driver = get_driver()
@@ -98,7 +99,20 @@ def _log_state_transition(snap: McSnapshot) -> None:
         logger.warning("MC 服务器探测失败：{}", snap.error or "原因未知")
 
 
-def _format_joins(names: list[str], count: int) -> str:
+def _primary() -> ServerTarget | None:
+    """进服提醒与定时播报当前看的目标。
+
+    **当前阶段只看「主服」**（mcs_servers.toml 的 [defaults].primary，不写就是列表
+    第一个）。改成逐目标对账、多目标播报是下一步的事，届时这个函数会被替换掉。
+    """
+    try:
+        return default_book().primary_target
+    except ServerConfigError as exc:
+        logger.error("读取 mcs_servers.toml 失败：{}", exc)
+        return None
+
+
+def _format_joins(names: list[str], count: int, server_name: str) -> str:
     if len(names) == 1:
         who = names[0]
     elif len(names) <= _BURST:
@@ -106,7 +120,7 @@ def _format_joins(names: list[str], count: int) -> str:
     else:
         who = f"{names[0]}、{names[1]} 等 {len(names)} 人"
     return random.choice(_JOIN_TEMPLATES).format(
-        who=who, server=_cfg().name, count=count
+        who=who, server=server_name, count=count
     )
 
 
@@ -115,7 +129,11 @@ def _format_joins(names: list[str], count: int) -> str:
 async def _tick() -> None:
     global _known, _initialized, _fail_streak, _server_down, _pending, _last_push
 
-    snap = await get_snapshot(max_age=0)
+    target = _primary()
+    if target is None:
+        return  # 配置读不了，_primary 已经打过日志；下一轮再试
+
+    snap = await get_snapshot(target, max_age=0)
     _log_state_transition(snap)
 
     if not snap.reachable:
@@ -123,23 +141,26 @@ async def _tick() -> None:
         if _fail_streak >= _OFFLINE_THRESHOLD and _server_down is not True:
             _server_down = True
             logger.warning(
-                "{} 连续 {} 轮探测失败", _cfg().name, _fail_streak
+                "{} 连续 {} 轮探测失败", target.name, _fail_streak
             )
             if _NOTIFY_SERVER_STATE:
+                # 「答了但答不对」（多半是刚启动还在加载）和「连不上」要分开说：
+                # 一律叫「连不上了」会让人去开服，而它其实正开着。
+                why = "应答异常" if snap.error_kind == SLP_UNPARSEABLE else "连不上了"
                 await send_to_groups(
                     _WATCH_GROUPS,
-                    f"⚠️ {_cfg().name} 连不上了（已连续 {_fail_streak} 轮探测失败）",
+                    f"⚠️ {target.name} {why}（已连续 {_fail_streak} 轮探测失败）",
                 )
         return  # 探测失败时绝不动基线，否则恢复时整服的人会被当成新进服
 
     _fail_streak = 0
     if _server_down is True:
         _server_down = False
-        logger.info("{} 已恢复", _cfg().name)
+        logger.info("{} 已恢复", target.name)
         if _NOTIFY_SERVER_STATE:
             await send_to_groups(
                 _WATCH_GROUPS,
-                f"✅ {_cfg().name} 已恢复，当前 {snap.count} 人在线",
+                f"✅ {target.name} 已恢复，当前 {snap.count} 人在线",
             )
 
     if not snap.names_complete:
@@ -178,7 +199,7 @@ async def _tick() -> None:
 
     names, _pending = _pending, []
     _last_push = now
-    await send_to_groups(_WATCH_GROUPS, _format_joins(names, snap.count))
+    await send_to_groups(_WATCH_GROUPS, _format_joins(names, snap.count, target.name))
 
 
 async def _watch_loop() -> None:
@@ -203,9 +224,13 @@ async def _watch_loop() -> None:
 
 async def _build_report_message() -> str | None:
     """生成播报文案。服务器不可达或无人在线时返回 None（静默跳过，与 oopz 一致）。"""
-    snap = await get_snapshot(max_age=0)
+    target = _primary()
+    if target is None:
+        return None
+
+    snap = await get_snapshot(target, max_age=0)
     if not snap.reachable:
-        logger.info("MC 定时播报：服务器不可达，本次跳过")
+        logger.info("MC 定时播报：{} 不可达，本次跳过", target.name)
         return None
     if snap.count == 0:
         return None
@@ -214,7 +239,7 @@ async def _build_report_message() -> str | None:
     if snap.max_players:
         head += f"（上限 {snap.max_players}）"
 
-    lines = [f"📣 {_cfg().name} 播报 · {datetime.now():%H:%M}", "━━━━━━━━━━", head]
+    lines = [f"📣 {target.name} 播报 · {datetime.now():%H:%M}", "━━━━━━━━━━", head]
     if snap.names_complete:
         shown = snap.names[:_MAX_NAMES]
         lines.extend(f"  • {n}" for n in shown)

@@ -1,4 +1,8 @@
-"""Minecraft 服务器取数层（不依赖 NoneBot；除了缓存一条 RCON 长连接外无状态）。
+"""Minecraft 服务器取数层（不依赖 NoneBot；除了逐目标缓存 RCON 长连接外无状态）。
+
+**逐目标**：本模块不再有任何「当前服务器」的隐式状态。目标（地址、端口、超时、
+RCON 端点）由 _shared/mcservers.py 从 mcs_servers.toml 解析，每个取数函数都显式收一个
+ServerTarget。RCON 长连接与命令锁按目标 id 分开存放，一台服的操作不会挡住另一台。
 
 放在 _shared 而不是 mcs/ 的原因：mcs/__init__.py 会 import 持有 matcher 的
 mc_reporter，而 mc_reporter 顶层有 get_driver()，在 nonebot.init() 之前 import
@@ -20,49 +24,60 @@ hide-online-players=true 时直接为空、插件还能往里塞广告，绝不�
 """
 import asyncio
 import contextlib
-import os
 import random
 import re
+import socket
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
 
 from mcstatus import JavaServer
 
-# ---------------------------------------------------------------- 配置
+from .mcservers import ServerTarget
 
-@dataclass(frozen=True)
-class McConfig:
-    host: str
-    port: int
-    name: str
-    timeout: float
-    rcon_port: int
-    rcon_password: str
-    rcon_timeout: float
+# SLP 失败的两种性质完全不同的原因，分开是为了**文案不把人指错方向**：
+#   unreachable = 真没连上（服务器没开、端口不对、防火墙丢包）→ 该去查网络
+#   unparseable = 连上了、服务端也答了，但回的不是合法状态响应。
+#                 mcstatus 拿到合法 JSON 却缺 players/version 等必需字段时抛的
+#                 `OSError("Received invalid status response")` 属于这一类
+#                 （见 mcstatus/_protocol/java_client.py 的 _handle_status_response）。
+#                 GTNH 这类大整合包**启动期间**就会这样：端口已 bind、能应答，
+#                 但玩家列表还没就绪。报「不可达」会让人去查防火墙，方向全错。
+SLP_UNREACHABLE = "unreachable"
+SLP_UNPARSEABLE = "unparseable"
 
-    @property
-    def rcon_enabled(self) -> bool:
-        """没填密码就完全不尝试 RCON，免得每轮都发一次注定失败的认证。"""
-        return bool(self.rcon_password)
+# 判据是「异常类型」而不是文案：文案是库的实现细节，会随版本变。
+_CONN_ERRORS = (
+    ConnectionRefusedError,  # 没开 / 端口不对
+    ConnectionResetError,  # 被对端重置
+    ConnectionAbortedError,
+    TimeoutError,  # 防火墙丢包（握手挂住）；3.11+ 与 asyncio.TimeoutError 是同一个
+    socket.gaierror,  # 域名解析不了
+    EOFError,  # 连上就被关（常见于端口被非 MC 服务占用）
+)
 
 
-@lru_cache(maxsize=1)
-def _cfg() -> McConfig:
-    """惰性读环境变量。
+def _describe_slp_failure(exc: BaseException) -> str:
+    """把 SLP 异常连同 cause 链写成一行。
 
-    刻意不在 import 期读：tools/mc_check.py 得先把 .env 灌进 os.environ 再
-    调用，import 期读会踩时序坑。改完环境变量可调 _cfg.cache_clear() 重置。
+    只取 `str(exc)` 会丢掉 mcstatus 特意链上的底层异常：它抛的
+    `OSError("Received invalid status response")` **本身不说缺了哪个字段**，
+    而 `from ValueError/KeyError` 链上的那句才说得清。排查时这行往往就是全部线索，
+    丢掉它等于把「缺 players 字段」降级成「不可达」。
     """
-    return McConfig(
-        host=os.environ.get("MC_HOST", "127.0.0.1").strip() or "127.0.0.1",
-        port=int(os.environ.get("MC_PORT", "25565")),
-        name=os.environ.get("MC_NAME", "Minecraft 服务器").strip() or "Minecraft 服务器",
-        timeout=float(os.environ.get("MC_TIMEOUT", "5")),
-        rcon_port=int(os.environ.get("MC_RCON_PORT", "25575")),
-        rcon_password=os.environ.get("MC_RCON_PASSWORD", "").strip(),
-        rcon_timeout=float(os.environ.get("MC_RCON_TIMEOUT", "5")),
-    )
+    parts = [f"{type(exc).__name__}: {exc}"]
+    cause, depth = exc.__cause__, 0
+    while cause is not None and depth < 3:  # 限深：异常链理论上可以成环
+        parts.append(f"{type(cause).__name__}: {cause}")
+        cause = cause.__cause__
+        depth += 1
+    return " ← ".join(parts)
+
+# ---------------------------------------------------------------- 目标
+
+# 目标（host / port / 超时 / RCON 端点）来自 mcs_servers.toml，由 _shared/mcservers.py 解析。
+# 本模块**不再读任何 MC_* 环境变量** —— 那些变量在配置载体切换后已失效。
+# 所有取数函数都要显式收一个 ServerTarget，不再有「当前服务器」这个隐式状态。
 
 
 # ---------------------------------------------------------------- 快照
@@ -76,6 +91,9 @@ class McSnapshot:
     """
 
     reachable: bool
+    # 这份快照属于哪个目标（mcs_servers.toml 的 id）。逐目标缓存靠它归位，
+    # 也靠它把「哪个服挂了」从一句模糊的「服务器不可达」里区分出来。
+    target_id: str = ""
     count: int = 0
     max_players: int | None = None
     names: list[str] = field(default_factory=list)
@@ -84,6 +102,16 @@ class McSnapshot:
     latency: float | None = None
     version: str = ""
     error: str = ""  # 取数降级/失败的原因，用于日志与 mc_check 输出
+    # RCON `list` 的**原始输出**。各服务端/语言的文案都不一样，解析结果对不上时
+    # 唯一能看的就是它，所以由这里存下来给诊断工具打，而**不是**让调用方再发一次。
+    # 两次 list 之间玩家可能进出，重发会让「打出来的原文」和「解析用的原文」
+    # 不是同一份 —— 排查时最需要对齐的恰恰是这两者。
+    raw_list: str = ""
+    # 失败的**性质**，取值见 SLP_UNREACHABLE / SLP_UNPARSEABLE / ""（没失败）。
+    # 文案层必须按它分支：两者给用户的下一步动作完全相反 ——
+    # 「连不上」去查网络和端口，「应答无法解析」去查服务端是不是还在启动。
+    # 光看 reachable 分不出来（两者都是 False），所以这个字段不能靠 error 文案反推。
+    error_kind: str = ""
 
 
 # ---------------------------------------------------------------- RCON
@@ -194,16 +222,21 @@ async def _execute(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, c
 # （`Thread RCON Client ... started` / `... shutting down`），一轮一条连接
 # 就能把服务端控制台刷满，把真正的 join/leave 和报错埋掉。复用后只剩 bot
 # 启动/重连时各一组。实测闲置 120s 连接仍存活，而轮询间隔只有 10s。
-_conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
-_cmd_lock: asyncio.Lock | None = None
+_conns: dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
+_cmd_locks: dict[str, asyncio.Lock] = {}
+
+_Conn = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
 
-def _lock() -> asyncio.Lock:
-    """命令串行锁：RCON 是单条有序流，并发写会把两条命令的响应串在一起。"""
-    global _cmd_lock
-    if _cmd_lock is None:
-        _cmd_lock = asyncio.Lock()
-    return _cmd_lock
+def _lock(target_id: str) -> asyncio.Lock:
+    """逐目标的命令串行锁：RCON 是单条有序流，并发写会把两条命令的响应串在一起。
+
+    锁按目标分开，两个子服就可以同时跑命令 —— 白名单操作不该被另一台的探测挡住。
+    """
+    lock = _cmd_locks.get(target_id)
+    if lock is None:
+        lock = _cmd_locks[target_id] = asyncio.Lock()
+    return lock
 
 
 async def _discard(writer: asyncio.StreamWriter) -> None:
@@ -212,42 +245,62 @@ async def _discard(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
 
 
-async def _close() -> None:
-    """丢掉缓存的连接（幂等）。"""
-    global _conn
-    conn, _conn = _conn, None
+async def _close(target_id: str) -> None:
+    """丢掉该目标缓存的连接（幂等）。"""
+    conn = _conns.pop(target_id, None)
     if conn is not None:
         await _discard(conn[1])
 
 
-async def _open() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+async def close_all() -> None:
+    """关掉所有目标的连接。进程收尾用。"""
+    for target_id in list(_conns):
+        await _close(target_id)
+
+
+async def prune(keep_ids: set[str]) -> list[str]:
+    """关掉配置里已经消失的目标的连接，返回被剪掉的 id。
+
+    子服从 mcs_servers.toml 里删掉后连接会一直挂着，而 MC 服务端**每条** RCON 连接
+    都会打两行 INFO 日志，留着就是持续刷对方控制台。锁不剪：它们没有对端资源，
+    而且可能正被 await 持有，剪掉会造出两把并存的锁。
+    """
+    stale = [tid for tid in _conns if tid not in keep_ids]
+    for target_id in stale:
+        await _close(target_id)
+    return stale
+
+
+async def _open(target: ServerTarget) -> _Conn:
     """建连 + 认证。失败时抛 RconConnectError / RconAuthError，并关掉半开的连接。
 
     连接与认证各自带 timeout：主机被防火墙丢包（而不是回 RST）时 TCP 握手会一直
     挂着，没超时就把整轮探测拖死；而裸的 TimeoutError 消息为空，报出来是
     「TimeoutError: 」，看不出是哪一步、也看不出超时值。这里翻译成能读的文案。
     """
-    cfg = _cfg()
+    spec = target.rcon
+    if spec is None or not spec.enabled:  # 调用方应先查 rcon_enabled，这里是兜底
+        raise RconConnectError(f"{target.name} 未配置 RCON 密码")
     try:
-        async with asyncio.timeout(cfg.rcon_timeout):
-            reader, writer = await asyncio.open_connection(cfg.host, cfg.rcon_port)
+        async with asyncio.timeout(target.rcon_timeout):
+            reader, writer = await asyncio.open_connection(target.host, spec.port)
     except asyncio.TimeoutError as exc:
         raise RconConnectError(
-            f"连接 RCON {cfg.host}:{cfg.rcon_port} 超时（{cfg.rcon_timeout:g}s，"
+            f"连接 RCON {target.rcon_addr} 超时（{target.rcon_timeout:g}s，"
             f"服务端在跑吗 / 端口对不对？）"
         ) from exc
     except OSError as exc:
         raise RconConnectError(
-            f"连接 RCON {cfg.host}:{cfg.rcon_port} 失败：{exc}"
+            f"连接 RCON {target.rcon_addr} 失败：{exc}"
         ) from exc
 
     try:
-        async with asyncio.timeout(cfg.rcon_timeout):
-            await _authenticate(reader, writer, cfg.rcon_password)
+        async with asyncio.timeout(target.rcon_timeout):
+            await _authenticate(reader, writer, spec.password)
     except asyncio.TimeoutError as exc:
         await _discard(writer)
         raise RconConnectError(
-            f"RCON 认证超时（{cfg.rcon_timeout:g}s，该端口可能不是 RCON 服务）"
+            f"RCON 认证超时（{target.rcon_timeout:g}s，该端口可能不是 RCON 服务）"
         ) from exc
     except BaseException:
         await _discard(writer)
@@ -255,13 +308,13 @@ async def _open() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     return reader, writer
 
 
-async def _run(conn: tuple[asyncio.StreamReader, asyncio.StreamWriter], command: str) -> str:
-    async with asyncio.timeout(_cfg().rcon_timeout):
+async def _run(target: ServerTarget, conn: _Conn, command: str) -> str:
+    async with asyncio.timeout(target.rcon_timeout):
         return await _execute(*conn, command)
 
 
-async def rcon_command(command: str) -> str:
-    """执行一条 RCON 命令，返回输出文本。连接跨调用复用。
+async def rcon_command(target: ServerTarget, command: str) -> str:
+    """对指定目标执行一条 RCON 命令，返回输出文本。连接跨调用复用。
 
     服务端重启、或它自己回收了闲置连接时，缓存的那条会失效。此时丢弃重连一次
     再重试，调用方无感。但**全新连接都失败就不重试**——那是真故障（没开、端口
@@ -270,25 +323,28 @@ async def rcon_command(command: str) -> str:
     超时算在「连接失效」里：复用的连接被服务端半开丢弃时，写可能成功而读一直
     没有响应，表现为超时而非 EOF。全新连接超时则不重试（`not reused` 挡住）。
     """
-    global _conn
-    async with _lock():
-        reused = _conn is not None
-        if not reused:
-            _conn = await _open()
+    if not target.rcon_enabled:
+        raise RconConnectError(f"{target.name} 未配置 RCON 密码，无法执行命令")
+
+    async with _lock(target.id):
+        conn = _conns.get(target.id)
+        reused = conn is not None
+        if conn is None:
+            conn = _conns[target.id] = await _open(target)
         try:
-            return await _run(_conn, command)
+            return await _run(target, conn, command)
         except RconAuthError:
-            await _close()
+            await _close(target.id)
             raise  # 密码错，重连也还是错
         # asyncio.TimeoutError 在 3.11+ 与内置 TimeoutError（OSError 子类）同一
         # 个类，3.10 下却是独立的，两个都列上才跨版本都对
         except (RconError, OSError, EOFError, asyncio.TimeoutError):
-            # IncompleteReadError 是 EOFError 子类：对端关了连接
-            await _close()
+            # IncompleteReadError 是 EOFError 的子类：对端关了连接
+            await _close(target.id)
             if not reused:
                 raise
-            _conn = await _open()  # 复用的连接废了，重连一次
-            return await _run(_conn, command)
+            conn = _conns[target.id] = await _open(target)  # 复用的连接废了，重连一次
+            return await _run(target, conn, command)
 
 
 # ---------------------------------------------------------------- list 解析
@@ -369,30 +425,39 @@ def parse_whitelist_names(payload: str) -> list[str] | None:
 
 # ---------------------------------------------------------------- 取数
 
-async def fetch_snapshot() -> McSnapshot:
-    """探测一次服务器，返回快照。任何失败都体现在返回值里，不抛异常。"""
-    cfg = _cfg()
-
+async def fetch_snapshot(target: ServerTarget) -> McSnapshot:
+    """探测一个目标，返回快照。任何失败都体现在返回值里，不抛异常。"""
     # 1) SLP：在线状态与人数的唯一来源
     status = None
     slp_error = ""
+    slp_kind = SLP_UNREACHABLE
     try:
         # 不用 lookup()/async_lookup()：那会走 dnspython 的 SRV 查询，对
         # 127.0.0.1 纯属浪费，还引入「链式写法要 await 两次」的坑。
         # tries 默认是 3，显式传 1 —— 消抖交给上层的失败计数器，语义更清楚，
         # 也避免 20 秒轮询被重试拖到节奏漂移。
-        server = JavaServer(cfg.host, cfg.port, timeout=cfg.timeout)
+        server = JavaServer(target.host, target.port, timeout=target.timeout)
         status = await server.async_status(tries=1)
     except Exception as exc:
-        slp_error = f"{type(exc).__name__}: {exc}"
+        slp_error = _describe_slp_failure(exc)
+        # 连不上 vs 答了但答不对，两种失败的排查方向相反，别混成一句话。
+        if not isinstance(exc, _CONN_ERRORS):
+            slp_kind = SLP_UNPARSEABLE
 
     if status is None:
         # SLP 不通就直接判不可达：即便 RCON 还能应答，也不把它当作在线信号，
         # 因为 SLP 是基线锚点（拿不到人数就没法校验名单完整性）。
-        return McSnapshot(reachable=False, error=f"SLP 不可达（{slp_error}）")
+        label = "SLP 连不上" if slp_kind == SLP_UNREACHABLE else "SLP 应答无法解析"
+        return McSnapshot(
+            target_id=target.id,
+            reachable=False,
+            error=f"{label}（{slp_error}）",
+            error_kind=slp_kind,
+        )
 
     count = int(status.players.online or 0)
     snap = McSnapshot(
+        target_id=target.id,
         reachable=True,
         count=count,
         max_players=status.players.max,
@@ -400,12 +465,16 @@ async def fetch_snapshot() -> McSnapshot:
         version=getattr(getattr(status, "version", None), "name", "") or "",
     )
 
-    # 2) RCON 取完整名单
+    # 2) RCON 取完整名单。代理层不出名单（Velocity 无原生 glist），
+    #    它的 SLP 只给全群组总人数 —— 所以直接跳过 RCON，别去发注定没意义的命令。
     rcon_error = ""
-    if cfg.rcon_enabled:
+    if not target.serves_names:
+        rcon_error = f"{target.name} 是代理，不出分服名单"
+    elif target.rcon_enabled:
         try:
+            snap.raw_list = await rcon_command(target, "list")
             # 传 expected=count 消解冒号切分位置的歧义（见 parse_list_names）
-            snap.names = parse_list_names(await rcon_command("list"), expected=count)
+            snap.names = parse_list_names(snap.raw_list, expected=count)
             # 命令成功就算 rcon 来源，即便结果是空列表（0 人在线时本就为空）
             snap.names_source = "rcon"
         except RconAuthError as exc:
@@ -415,12 +484,14 @@ async def fetch_snapshot() -> McSnapshot:
         except Exception as exc:
             rcon_error = f"{type(exc).__name__}: {exc}"
     else:
-        rcon_error = "未配置 MC_RCON_PASSWORD"
+        rcon_error = "该目标没配 rcon.password（mcs_servers.toml）"
 
     # 3) RCON 没给出完整名单时，退一步看 SLP 的 sample。
     #    sample 顺序随机、上限约 12 条，但「条数 == 在线人数」时它就是完整名单
     #    （≤12 人的私服很常见）。有这条降级路径，没开 RCON 的服也能用进服提醒。
-    if len(snap.names) != count:
+    #    代理不走这条：它的 sample 是**某一个后端**的随机样本，当成「全群组名单」
+    #    是错的，而它本来也不出名单。
+    if target.serves_names and len(snap.names) != count:
         sample = [p.name for p in (status.players.sample or []) if getattr(p, "name", "")]
         if len(sample) == count:
             snap.names = sample
@@ -429,11 +500,32 @@ async def fetch_snapshot() -> McSnapshot:
             snap.names = []
             snap.names_source = "none"
 
-    snap.names_complete = len(snap.names) == count
-    if not snap.names_complete:
+    # 代理恒为 False：它拿不到分服名单，这不是「不完整」而是「不适用」。
+    # 强制 False 是为了让所有查 names_complete 的地方（进服对账、mc_check 结论）
+    # 自动跳过代理，不必每处都记得先判 kind。
+    snap.names_complete = target.serves_names and len(snap.names) == count
+
+    if not target.serves_names:
+        # 代理没有名单不是故障，别写 error —— 判代理是否正常只看 reachable
+        snap.error = ""
+    elif not snap.names_complete:
         reason = rcon_error or f"SLP sample 只有 {len(status.players.sample or [])} 条"
         snap.error = f"名单不完整（人数 {count}，拿到 {len(snap.names)}）：{reason}"
     elif rcon_error:
         snap.error = f"已降级用 SLP sample 取名单：{rcon_error}"
 
     return snap
+
+
+async def fetch_snapshots(targets: Sequence[ServerTarget]) -> list[McSnapshot]:
+    """并发探测多个目标，返回与 targets **同序**的快照列表。
+
+    并发而非逐个：一轮的耗时取 max 而不是求和，加子服不会让轮询变慢
+    （tools/mc_check.py 的「一轮耗时预算」就是按这个前提算的）。
+
+    fetch_snapshot 自己吞掉所有异常并体现在返回值里，所以 gather 不会因单个目标
+    失败而整体抛错 —— 一台挂掉不影响其余目标的名单。
+    """
+    if not targets:
+        return []
+    return list(await asyncio.gather(*(fetch_snapshot(t) for t in targets)))

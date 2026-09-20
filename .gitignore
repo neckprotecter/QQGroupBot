@@ -7,6 +7,12 @@
 .env.*
 !.env.example
 
+# 多服务器目标表（含各子服 RCON 密码，绝不上传）
+# 部署请复制 mcs_servers.toml.example 为 mcs_servers.toml 再填写
+mcs_servers.toml
+mcs_servers.toml.*
+!mcs_servers.toml.example
+
 # ============================================================
 # Python 运行时 / 字节码
 # ============================================================
