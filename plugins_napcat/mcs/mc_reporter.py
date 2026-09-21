@@ -3,44 +3,47 @@
 两个后台循环，模式沿用 oopz/auto_reporter.py：@driver.on_startup 起 task，
 推送走 _shared/push 的 send_to_groups，整点对齐走 _shared/schedule。
 
-只推进服、不推退服（用户选择）。退服的人仍会被基线自然吸收，只是不产生消息。
+只推进服、不推退服（用户选择）。退服的人仍会被基线自然吸收，只是不产生消息 ——
+「不推」是 mcrender.format_events 里那一次过滤，对账层（mcdelta）照样算得出退服。
 
-**当前阶段只看一条群关联**：盯的目标取自「这几个目标群里的第一个群所属的那条
-[[audience]]」的主服（见 _primary）。把监控目标按群分别对账、多目标播报是下一步
-（P7）的事。所以 MC_WATCH_GROUP / MC_REPORT_GROUP 里的群必须在
-mcs_audiences.toml 里有对应的 [[audience]]，否则循环会明确报错并停摆 —— 不静默。
+**按群关联分桶（P7）**：每条写了 `watch = true` / `report = true` 的 [[audience]]
+各自一份状态、各自探自己关联的那几台服、各自合成**一条**消息推给自己的 groups。
+推送目标恒为本条的 groups —— 所以「哪个群收推送」这件事在配置里一眼可见，
+不会出现「.env 里指了一个没写进 mcs_audiences.toml 的群 → 循环停摆」那种
+（P7 之前就是这样，且只在日志里说一声）。那种配置现在**在结构上不可能存在**。
 
-.env 配置：
-  MC_WATCH_GROUP=<群号>         进服提醒目标群（逗号分隔多群，留空 = 不启用）
+一轮只探一次：所有开 watch 的关联覆盖到的目标先去重、并成一批并发探完，再把快照
+扇出给各关联对账。按关联逐个探会从「并发取 max」退化成「并发 + 串行叠加」，
+一轮耗时上界模型（round_budget）当场失效，同一台服的取数状态也会按关联数重复打印。
+
+.env 配置（**只剩节奏与总开关**，「哪个群收推送」在 mcs_audiences.toml 里）：
   MC_WATCH_INTERVAL_SEC=10      轮询间隔（秒），决定进服被发现的延迟
   MC_JOIN_MIN_INTERVAL_SEC=15   进服推送最小间隔（秒），窗口内的进服合并成一条；
                                 设 0 = 不限流。最大额外延迟 ≈ 本值 + 一个轮询间隔
   MC_NOTIFY_SERVER_STATE=true   服务器连不上 / 恢复时是否提醒
-  MC_REPORT_GROUP=<群号>        定时播报目标群（逗号分隔多群，留空 = 不启用）
   MC_REPORT_INTERVAL_MIN=60     播报间隔（分钟），整点对齐；无人在线时静默跳过
+  MC_WATCH_GROUP / MC_REPORT_GROUP  **已作废**（P5.6/P7 搬进关联文件里了）
 """
 import asyncio
 import os
-import random
 import time
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 from nonebot import get_driver
 from nonebot.log import logger
 
 from .._shared.mc import SLP_UNPARSEABLE, McSnapshot
-from .._shared.mcaudiences import audiences_path, default_config
-from .._shared.push import send_to_groups, truncate
-from .._shared.schedule import seconds_until_slot
+from .._shared.mcaudiences import Audience, default_config
+from .._shared.mcdelta import PlayerEvent, StatusEvent, reconcile
+from .._shared.mcrender import Row, format_events, render_report
 from .._shared.mcservers import ServerConfigError, ServerTarget
-from .client import _MAX_NAMES, get_snapshot
+from .._shared.push import send_to_groups
+from .._shared.schedule import seconds_until_slot
+from .client import _MAX_NAMES, get_snapshots
 
 driver = get_driver()
 
-_WATCH_GROUPS = [
-    s.strip() for s in os.environ.get("MC_WATCH_GROUP", "").split(",") if s.strip()
-]
 _WATCH_INTERVAL_SEC = float(os.environ.get("MC_WATCH_INTERVAL_SEC", "10"))
 # 限流窗口 = 进服提醒的最大额外延迟（最坏 = 本值 + 一个轮询间隔）。设 0 = 不限流，
 # 进服立刻推；一轮内进服 ≥_BURST 人仍会合并成一条，不会因去掉限流而刷屏。
@@ -51,34 +54,87 @@ _NOTIFY_SERVER_STATE = os.environ.get("MC_NOTIFY_SERVER_STATE", "").strip().lowe
     "no",
     "off",
 }
-_REPORT_GROUPS = [
-    s.strip() for s in os.environ.get("MC_REPORT_GROUP", "").split(",") if s.strip()
-]
 _REPORT_INTERVAL_MIN = int(os.environ.get("MC_REPORT_INTERVAL_MIN", "60"))
 
-# 一轮内进服人数达到这个数就合并成一条，避免刷屏
-_BURST = 3
 # 连续这么多轮探测失败才宣布服务器离线（单轮网络抖动不报）
 _OFFLINE_THRESHOLD = 2
 
-_JOIN_TEMPLATES = [
-    "🎮 {who} 加入了 {server}（当前 {count} 人在线）",
-    "🚪 {who} 溜进了 {server}（当前 {count} 人在线）",
-    "⛏️ {who} 上线了 {server}（当前 {count} 人在线）",
-    "🌍 {who} 出现在了 {server}（当前 {count} 人在线）",
-]
-
 # ---------------------------------------------------------------- 状态
 
-_known: set[str] = set()  # 基线：上一轮的在线玩家名
-_initialized = False  # 首次成功轮询只建基线，不把存量玩家当成新进服
-_fail_streak = 0  # 连续探测失败轮数
-_server_down: bool | None = None  # None = 启动后还没探测过
-_last_state: tuple | None = None  # 取数状态，仅用于日志去重
-_pending: list[str] = []  # 限流窗口内攒下的进服事件
-_last_push: float | None = None
-_last_config_error: str | None = None  # 上次打过的配置类错误，仅用于日志去重
+# 三层状态，键就是语义。混在一起的后果是「某个群看到的进服」和「某台服的连通性」
+# 互相污染 —— 后者尤其致命：连通性是**服务器的事实**，同一台服不可能对 A 群连着、
+# 对 B 群断着。放进 audience 桶会让两条关联对同一台服给出互相矛盾的结论，
+# 而两条都会推给各自的群。
 
+
+@dataclass
+class _TargetState:
+    """一台服的连通性。**按 target 分桶，不按 audience。**"""
+
+    fail_streak: int = 0
+    down: bool | None = None  # None = 启动后还没探测过
+    last_state: tuple | None = None  # 取数状态，仅用于日志去重
+
+
+@dataclass
+class _AudienceState:
+    """一个群看到的世界的账本。**按 audience 分桶。**"""
+
+    # target_id -> 基线（上一轮的名单）。粒度是 per-(关联, 目标)：某台服这轮名单不全
+    # 时只冻结它自己，同一关联里另一台照常对账 —— per-关联一份基线做不到这件事。
+    #
+    # **没有单独的 _initialized**：「known 里有没有那个 target_id」就是它。留一个能
+    # 和字典不一致的独立状态，迟早出现「标志说初始化过了、字典里却没有」的中间态，
+    # 而它的表现正是「整服的人被报成刚进服」。
+    known: dict[str, frozenset[str]] = field(default_factory=dict)
+    # 限流窗口内攒下的事件。元素是**事件**不是玩家名：跨轮合并时还得知道那件事发生在
+    # 哪台服、是换服还是进服、来源是哪台。只存名字，合并后的消息就会丢掉服名前缀与来源
+    # —— 而「从『谁是杀手』换过来」正是这条消息最该说的事。
+    pending: list[PlayerEvent | StatusEvent] = field(default_factory=list)
+    # 每条关联**各自一个窗口**：消息按关联合成，A 的推送节奏不该被 B 的进服带偏。
+    # 全局一份时 B 的人进服会占掉 A 的窗口，表现是「A 群的提醒时快时慢，看不出规律」。
+    last_push: float | None = None
+
+
+_targets: dict[str, _TargetState] = {}
+_audiences: dict[str, _AudienceState] = {}
+_last_cfg_error: dict[str, str] = {}  # 键 = 循环名
+
+
+def _target_state(target_id: str) -> _TargetState:
+    state = _targets.get(target_id)
+    if state is None:
+        state = _targets[target_id] = _TargetState()
+    return state
+
+
+def _audience_state(audience: Audience) -> _AudienceState:
+    """关联的状态桶。
+
+    键用 **`groups[0]`** 而不是关联名：群号唯一是 mcaudiences 里**已有的硬校验**，
+    而关联名在同一份配置里也没有唯一性校验（P7 顺手补上了重名报错，但状态不该依赖它）。
+    两条都叫「社团群」的关联会静默共用一份基线，症状是两边都在乱报进服且完全不报错。
+    """
+    key = audience.groups[0]
+    state = _audiences.get(key)
+    if state is None:
+        state = _audiences[key] = _AudienceState()
+    return state
+
+
+def _dedupe(targets: Sequence[ServerTarget]) -> list[ServerTarget]:
+    """按 id 去重、保首次出现顺序。
+
+    一轮里同一台服被两条关联引用是常态，不去重就会探两遍（SLP + RCON 各一次，
+    MC 服务端为每次探测留日志），日志里的取数状态跃迁也会按关联数重复打印。
+    """
+    seen: dict[str, ServerTarget] = {}
+    for target in targets:
+        seen.setdefault(target.id, target)
+    return list(seen.values())
+
+
+# ---------------------------------------------------------------- 日志
 
 def _state_key(snap: McSnapshot) -> tuple:
     if not snap.reachable:
@@ -88,162 +144,223 @@ def _state_key(snap: McSnapshot) -> tuple:
     return ("ok", snap.names_source)
 
 
-def _log_state_transition(snap: McSnapshot) -> None:
+def _log_state_transition(snap: McSnapshot, target: ServerTarget) -> None:
     """取数状态只在跃迁时打日志。
 
     每 20 秒一轮的重复告警会把日志冲成噪音，而 DEPLOY.md 恰恰教用户看日志尾巴
     排查问题。这里只报「变好」「变坏」两个时刻。
+
+    **必须带服名**：一轮现在打多台，「MC 名单来源 rcon（完整，3 人在线）」这种
+    不带主语的日志在多目标下等于没打 —— 看日志的人不知道是哪台在报。
     """
-    global _last_state
+    state = _target_state(target.id)
     key = _state_key(snap)
-    if key == _last_state:
+    if key == state.last_state:
         return
-    _last_state = key
+    state.last_state = key
     if key[0] == "ok":
-        logger.info("MC 名单来源 {}（完整，{} 人在线）", snap.names_source, snap.count)
+        logger.info(
+            "MC {} 名单来源 {}（完整，{} 人在线）", target.name, snap.names_source, snap.count
+        )
     elif key[0] == "partial":
-        logger.warning("MC 名单不完整，进服提醒已暂停：{}", snap.error or "原因未知")
+        logger.warning(
+            "MC {} 名单不完整，它的进服提醒已暂停：{}", target.name, snap.error or "原因未知"
+        )
     else:
-        logger.warning("MC 服务器探测失败：{}", snap.error or "原因未知")
+        logger.warning("MC {} 探测失败：{}", target.name, snap.error or "原因未知")
 
 
-def _log_config_error(text: str) -> None:
+def _log_config_error(loop: str, text: str) -> None:
     """配置类错误只在**内容变化**时打日志。
 
-    _tick 每 MC_WATCH_INTERVAL_SEC（默认 10）秒跑一次，而配置错误会一直持续到人改完
-    重启 —— 每 10 秒刷一条 error 会把日志尾巴冲成噪音，而 DEPLOY 恰恰教人看日志尾巴
-    排查问题。状态跃迁式的日志（_log_state_transition）出于同样的理由。
+    进服循环每 MC_WATCH_INTERVAL_SEC（默认 10）秒跑一次，而配置错误会一直持续到人
+    改完重启 —— 每 10 秒刷一条 error 会把日志尾巴冲成噪音，而 DEPLOY 恰恰教人看日志
+    尾巴排查问题。状态跃迁式的日志（_log_state_transition）出于同样的理由。
+
+    键是**循环名**：两个循环各有各的配置问题，只留一份的话后打的那条会把前一条顶掉，
+    表现是「修好了进服提醒的报错，定时播报的报错跟着一起消失（其实还在）」。
     """
-    global _last_config_error
-    if text != _last_config_error:
-        _last_config_error = text
+    if text != _last_cfg_error.get(loop):
+        _last_cfg_error[loop] = text
         logger.error("{}", text)
 
 
-def _primary(groups: Sequence[str]) -> tuple[ServerTarget | None, str]:
-    """这批目标群当前盯的目标，以及它属于哪条群关联。返回 `(目标, 关联名)`。
-
-    **当前阶段只看「主服」**：取 groups 里第一个群所属那条关联的主服
-    （[[audience]].primary，不写就是该关联的第一个目标）。改成逐目标对账、
-    多目标播报是 P7 的事，届时这个函数会被替换掉。
-
-    **刻意不留「找不到就用 targets[0]」的回退**：全量表的第一个目标和「该盯哪台」
-    毫无关系，回退过去会静默换一台服去监控，而启动日志用的是同一个函数、会跟着
-    一起错 —— 看日志也发现不了。原来读的是 mcs_servers.toml 的 [defaults].primary，
-    那个键已经搬进群关联，所以现在只能按群找。
-    """
-    if not groups:
-        return None, ""
+def _read_config(loop: str):
+    """读配置，失败就记一条去重的 error 并返回 None。两个循环共用。"""
     try:
         config = default_config()
     except ServerConfigError as exc:
-        _log_config_error(f"读取 MC 配置失败，MC 播报相关功能停摆：{exc}")
-        return None, ""
-    audience = config.for_group(groups[0])
-    if audience is None:
-        _log_config_error(
-            f"MC_WATCH_GROUP / MC_REPORT_GROUP 里的群 {groups[0]} 没有对应的群关联，"
-            f"进服提醒与定时播报停摆 —— 先把这个群写进 {audiences_path()} 的某条 "
-            f"[[audience]].groups"
-        )
-        return None, ""
-    return audience.book.primary_target, audience.name
-
-
-def _format_joins(names: list[str], count: int, server_name: str) -> str:
-    if len(names) == 1:
-        who = names[0]
-    elif len(names) <= _BURST:
-        who = "、".join(names)
-    else:
-        who = f"{names[0]}、{names[1]} 等 {len(names)} 人"
-    return random.choice(_JOIN_TEMPLATES).format(
-        who=who, server=server_name, count=count
-    )
+        _log_config_error(loop, f"读取 MC 配置失败，{loop}停摆：{exc}")
+        return None
+    # 读通了就把上次那条错误消掉：不消的话，下次真的又坏了会因为「文案一样」被吞掉
+    _last_cfg_error.pop(loop, None)
+    return config
 
 
 # ---------------------------------------------------------------- 进服提醒
 
-async def _tick() -> None:
-    global _known, _initialized, _fail_streak, _server_down, _pending, _last_push
+def _tick_health(
+    by_id: Mapping[str, McSnapshot], targets: Sequence[ServerTarget]
+) -> list[StatusEvent]:
+    """连通性判定：每台服**一轮只判一次**，产出的跃迁事件供各关联取用。
 
-    target, _ = _primary(_WATCH_GROUPS)
-    if target is None:
-        return  # 配置读不了 / 群没开通，_primary 已经打过日志；下一轮再试
+    语义与单目标时代一字不差：连续 _OFFLINE_THRESHOLD 轮失败才算掉线（单轮网络抖动
+    不报）；「答了但答不对」（多半是刚启动还在加载）和「连不上」分开说，因为两者
+    给群里人的下一步动作完全相反 —— 一律叫「连不上了」会让人去开服，而它其实正开着。
+    MC_NOTIFY_SERVER_STATE 关掉时**照样维护状态**，只是不产事件：关掉提醒不该让
+    「已恢复」的判定读到一个假的 down=True。
+    """
+    events: list[StatusEvent] = []
+    for target in targets:
+        snap = by_id.get(target.id)
+        state = _target_state(target.id)
 
-    snap = await get_snapshot(target, max_age=0)
-    _log_state_transition(snap)
+        if snap is None or not snap.reachable:
+            state.fail_streak += 1
+            if state.fail_streak >= _OFFLINE_THRESHOLD and state.down is not True:
+                state.down = True
+                logger.warning("{} 连续 {} 轮探测失败", target.name, state.fail_streak)
+                if _NOTIFY_SERVER_STATE:
+                    why = (
+                        "应答异常"
+                        if snap is not None and snap.error_kind == SLP_UNPARSEABLE
+                        else "连不上了"
+                    )
+                    events.append(
+                        StatusEvent(
+                            target.id, down=True, streak=state.fail_streak, why=why
+                        )
+                    )
+            # 探测失败时**绝不动基线**。旧实现靠「提前 return」保证这件事，现在由
+            # mcdelta.reconcile 规则 1 保证 —— 从「小心别写错」升级成结构上做不到。
+            continue
 
-    if not snap.reachable:
-        _fail_streak += 1
-        if _fail_streak >= _OFFLINE_THRESHOLD and _server_down is not True:
-            _server_down = True
-            logger.warning(
-                "{} 连续 {} 轮探测失败", target.name, _fail_streak
-            )
+        state.fail_streak = 0
+        if state.down is True:
+            state.down = False
+            logger.info("{} 已恢复", target.name)
             if _NOTIFY_SERVER_STATE:
-                # 「答了但答不对」（多半是刚启动还在加载）和「连不上」要分开说：
-                # 一律叫「连不上了」会让人去开服，而它其实正开着。
-                why = "应答异常" if snap.error_kind == SLP_UNPARSEABLE else "连不上了"
-                await send_to_groups(
-                    _WATCH_GROUPS,
-                    f"⚠️ {target.name} {why}（已连续 {_fail_streak} 轮探测失败）",
-                )
-        return  # 探测失败时绝不动基线，否则恢复时整服的人会被当成新进服
+                events.append(StatusEvent(target.id, down=False, count=snap.count))
+    return events
 
-    _fail_streak = 0
-    if _server_down is True:
-        _server_down = False
-        logger.info("{} 已恢复", target.name)
-        if _NOTIFY_SERVER_STATE:
-            await send_to_groups(
-                _WATCH_GROUPS,
-                f"✅ {target.name} 已恢复，当前 {snap.count} 人在线",
-            )
 
-    if not snap.names_complete:
-        # 名单完整性过不了就绝不更新基线：残缺名单（比如只有 12 条随机 sample）
-        # 会让下一轮「换了一批人」被误判成大量进服
-        return
+async def _tick_audience(
+    audience: Audience,
+    by_id: Mapping[str, McSnapshot],
+    status: Sequence[StatusEvent],
+) -> None:
+    """一条群关联：对账 → 攒事件 → 到了窗口就合成一条推给它自己的 groups。"""
+    state = _audience_state(audience)
+    # 顺序用 targets_primary_first：[[audience]].primary 那台排最前，其余按配置顺序。
+    # 它同时是 reconcile 的输出顺序 → 合成消息里【服名】块的顺序，块顺序每轮乱跳的话
+    # 同一条消息看着像新的一条。
+    ordered = audience.book.targets_primary_first
+    my_ids = {t.id for t in audience.book.targets}
 
-    current = set(snap.names)
-    if not _initialized:
-        _known = current
-        _initialized = True
-        logger.info("MC 进服检测已建立基线：{} 人在线", len(current))
-        return
+    delta = reconcile(
+        state.known,
+        {tid: by_id[tid] for tid in my_ids if tid in by_id},
+        ordered,
+    )
+    # 整体替换，不做「哪些键该留」的二次判断 —— 那种判断总会在某个分支漏掉，
+    # 而漏掉一次的后果正是「探测失败时把基线清空，恢复时整服的人被当成刚进服」。
+    state.known = dict(delta.baseline)
+    state.pending.extend(delta.events)
+    # 连通性事件按目标过滤：一台服挂了只该提醒**关联了它**的群。
+    # 不过滤的后果是没关联那台服的群也会收到它的掉线提醒，而群里的人根本进不去那台服。
+    state.pending.extend(e for e in status if e.target_id in my_ids)
 
-    joined = [n for n in snap.names if n not in _known]
-    _known = current
-    if joined:
-        _pending.extend(joined)
-
-    if not _pending:
+    if not state.pending:
         return
 
     now = time.monotonic()
-    # 限流窗口内的进服攒起来合并成一条。这个检查必须**每一轮都做**，不能只在
-    # 「这一轮有人进服」时做——否则「甲进服占满窗口 → 乙随后进服被攒下 → 之后没人
-    # 再进服」时，乙那条会一直压着等下一个进服，没人来就永远发不出；有人来也会被
-    # 拖到窗口结束、和后面的人合并成一条，看起来就是「进服提醒延迟很久」。
-    if _last_push is not None and now - _last_push < _JOIN_MIN_INTERVAL_SEC:
-        if joined:
-            logger.info(
-                "MC 进服提醒限流中：{} 人待推送，窗口还剩 {:.0f}s",
-                len(_pending),
-                _JOIN_MIN_INTERVAL_SEC - (now - _last_push),
-            )
+    # 掉线与恢复**当轮强制 flush**（跳过窗口检查）：它的价值在及时，等 15 秒没意义；
+    # 顺带把窗口里攒的进服一起发出去，仍然是「一个周期一条」，不会拖到下一轮。
+    urgent = any(isinstance(e, StatusEvent) for e in state.pending)
+    # 这个检查必须**每一轮都做**，不能只在「这一轮有人进服」时做 —— 否则「甲进服占满
+    # 窗口 → 乙随后进服被攒下 → 之后没人再进服」时，乙那条会一直压着等下一个进服，
+    # 没人来就永远发不出；有人来也会被拖到窗口结束、和后面的人合并成一条，
+    # 看起来就是「进服提醒延迟很久」。
+    if (
+        not urgent
+        and state.last_push is not None
+        and now - state.last_push < _JOIN_MIN_INTERVAL_SEC
+    ):
+        logger.info(
+            "MC 进服提醒限流中（「{}」）：{} 条待推送，窗口还剩 {:.0f}s",
+            audience.name,
+            len(state.pending),
+            _JOIN_MIN_INTERVAL_SEC - (now - state.last_push),
+        )
         return
 
-    names, _pending = _pending, []
-    _last_push = now
-    await send_to_groups(_WATCH_GROUPS, _format_joins(names, snap.count, target.name))
+    pending, state.pending = state.pending, []
+    text, clipped = format_events(pending, ordered)
+    if text is None:
+        # 攒了一轮只有退服事件 —— 不发，也**不占掉限流窗口**（没推出去就不算推过）。
+        return
+    state.last_push = now
+    if clipped:
+        # 渲染层不许 import nonebot（见 mcrender 的模块 docstring），所以「被截断了」
+        # 只能由这里说。这条警告不能省：切掉的正是最后几台服的事件，消息看着完全正常。
+        logger.warning(
+            "MC 进服提醒超长被截断（「{}」）：排在后面的服务器的事件可能没发出去",
+            audience.name,
+        )
+    sent = await send_to_groups(list(audience.groups), text)
+    if sent:
+        # **推成功也要打一行**，把发出去的原文一起记下。不打的后果是「进了服但没推」
+        # 和「推了」在日志里长得一模一样：人数变化（0→1）不是取数状态跃迁、不打日志，
+        # 而这条路径原先是发完就完 —— 排查时只能靠猜。
+        logger.info("MC 进服提醒（「{}」）→ {} 个群：\n{}", audience.name, sent, text)
+    else:
+        # send_to_groups 返回 0 且**没有** error 日志，只有一种可能：一个 bot 都没连上
+        # （get_bots() 为空时它静默 return False）。发送异常那条路径自己会打 error。
+        logger.warning(
+            "MC 进服提醒（「{}」）一条都没发出去（该推 {} 个群）—— "
+            "多半是 bot 没连上 NapCat，或它不在这些群里",
+            audience.name,
+            len(audience.groups),
+        )
+
+
+async def _tick() -> None:
+    # 每轮重取配置（lru_cache 命中，成本≈0）。**必须每轮取**：default_config() 刻意
+    # 不缓存异常，那个设计就是为了让「配置改好就自愈」成立；在启动时读一次并缓存下来
+    # 等于把下面那层的性质吃掉，症状是「配置改好了还得重启，且没人知道为什么」。
+    config = _read_config("进服提醒")
+    if config is None:
+        return
+
+    watched = [a for a in config.audiences if a.watch and a.book.targets]
+    if not watched:
+        _log_config_error(
+            "进服提醒",
+            "没有任何 [[audience]] 写 watch = true，进服提醒不会推送任何东西 —— "
+            "给要收提醒的那条关联加上 watch = true（改完要重启）",
+        )
+        return
+    _last_cfg_error.pop("进服提醒", None)
+
+    # 全部关联的目标去重后**一轮探一次**，再把快照扇出给各关联对账。
+    wanted = _dedupe([t for a in watched for t in a.book.targets])
+    snaps = await get_snapshots(wanted, max_age=0)
+    by_id = {s.target_id: s for s in snaps}
+
+    for target in wanted:
+        snap = by_id.get(target.id)
+        if snap is not None:
+            _log_state_transition(snap, target)
+    status = _tick_health(by_id, wanted)
+
+    for audience in watched:
+        await _tick_audience(audience, by_id, status)
 
 
 async def _watch_loop() -> None:
-    if not _WATCH_GROUPS:
-        logger.info("未配置 MC_WATCH_GROUP，进服提醒未启用")
-        return
+    # **不因为「没有 watch 关联」而退出**：配置读不了必须能下一轮重试，而「没有任何
+    # 关联开 watch」退出与不退出观察上没差别（都要改配置重启才生效）。
+    # 空转成本 = 一次 lru_cache 命中的字典扫描。
     await asyncio.sleep(15)  # 等 bot 连上 NapCat
     while True:
         started = time.monotonic()
@@ -260,49 +377,59 @@ async def _watch_loop() -> None:
 
 # ---------------------------------------------------------------- 定时播报
 
-async def _build_report_message() -> tuple[str | None, str]:
-    """生成播报文案，外加一句「为什么跳过」的原因（给日志用）。
+async def _report_tick() -> None:
+    config = _read_config("定时播报")
+    if config is None:
+        return
 
-    返回 `(None, 原因)` 表示本次不发。三种跳过各有各的原因，**必须分开说**：
-    群没开通 → 去改配置；服务器不可达 → 去开服；确实没人 → 什么都不用做。
-    原来的调用方一律打成「当前无人在线」，前两种情况下会把人指去查错方向。
-    """
-    target, audience_name = _primary(_REPORT_GROUPS)
-    if target is None:
-        # 具体原因 _primary 已经打过日志了（配置读不了 / 这个群没开通）
-        return None, "目标不可用（原因见上面那条错误）"
+    watched = [a for a in config.audiences if a.report and a.book.targets]
+    if not watched:
+        _log_config_error(
+            "定时播报",
+            "没有任何 [[audience]] 写 report = true，定时播报不会推送任何东西 —— "
+            "给要收播报的那条关联加上 report = true（改完要重启）",
+        )
+        return
+    _last_cfg_error.pop("定时播报", None)
 
-    snap = await get_snapshot(target, max_age=0)
-    if not snap.reachable:
-        return None, f"{target.name} 不可达，本次跳过"
-    if snap.count == 0:
-        # 这里**不区分**「本群没关联服务器」：那属于 _primary 那一层的失败，
-        # 走不到这里（没关联任何服务器时 primary_target 是 None）。
-        return None, f"「{audience_name}」关联的 {target.name} 当前无人在线，本次跳过"
+    wanted = _dedupe([t for a in watched for t in a.book.targets])
+    snaps = await get_snapshots(wanted, max_age=0)
+    by_id = {s.target_id: s for s in snaps}
 
-    head = f"现在有 {snap.count} 位小伙伴在线"
-    if snap.max_players:
-        head += f"（上限 {snap.max_players}）"
-
-    lines = [f"📣 {target.name} 播报 · {datetime.now():%H:%M}", "━━━━━━━━━━", head]
-    if snap.names_complete:
-        shown = snap.names[:_MAX_NAMES]
-        lines.extend(f"  • {n}" for n in shown)
-        if len(snap.names) > len(shown):
-            lines.append(f"  …还有 {len(snap.names) - len(shown)} 人")
-    elif snap.names:
-        lines.extend(f"  • {n}" for n in snap.names[:_MAX_NAMES])
-        lines.append("（名单可能不完整）")
-    else:
-        lines.append("（未能取到名单）")
-    lines.append("\n想一起玩的，直接进服找他们～")
-    return truncate("\n".join(lines)), ""
+    for audience in watched:
+        ordered = audience.book.targets_primary_first
+        rows = [Row(t, by_id[t.id]) for t in ordered if t.id in by_id]
+        # all_targets 传**全量**表（不是本条的视图）：代理尾注要拿它判断「本群是否
+        # 关联到了该代理同组的全部子服」，详见 mcrender._group_complete。
+        text, why = render_report(
+            rows,
+            total_names=_MAX_NAMES,
+            all_targets=config.book.targets,
+            audience_name=audience.name,
+        )
+        if text is None:
+            logger.info("MC 定时播报：{}", why)
+            continue
+        sent = await send_to_groups(list(audience.groups), text)
+        if sent:
+            logger.info(
+                "MC 定时播报（「{}」）→ {} 个群（{} 台服）",
+                audience.name,
+                sent,
+                len(rows),
+            )
+        else:
+            # 打 len(audience.groups) 在这里是**谎话**：一个群都没送达时它照样说
+            # 「已推送到 1 个群」。发送异常自己会打 error，走到这儿就是 bot 没连上。
+            logger.warning(
+                "MC 定时播报（「{}」）一条都没发出去（该推 {} 个群）—— "
+                "多半是 bot 没连上 NapCat，或它不在这些群里",
+                audience.name,
+                len(audience.groups),
+            )
 
 
 async def _report_loop() -> None:
-    if not _REPORT_GROUPS:
-        logger.info("未配置 MC_REPORT_GROUP，定时播报未启用")
-        return
     await asyncio.sleep(15)  # 等 bot 连上 NapCat、MC 端口可达
     while True:
         try:
@@ -310,12 +437,7 @@ async def _report_loop() -> None:
             delay = seconds_until_slot(_REPORT_INTERVAL_MIN)
             if delay:
                 await asyncio.sleep(delay)
-            msg, why = await _build_report_message()
-            if msg is None:
-                logger.info("MC 定时播报：{}", why)
-            else:
-                await send_to_groups(_REPORT_GROUPS, msg)
-                logger.info("MC 定时播报已推送到 {} 个群", len(_REPORT_GROUPS))
+            await _report_tick()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

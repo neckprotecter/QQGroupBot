@@ -25,14 +25,18 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 >
 > **MC 功能是按群开通的**：群号被写进某条 `[[audience]].groups` 才算开通，没被提到
 > 就不开通（群里会明确回一句，不是静默）。关联外的服名在那个群里查不到 —— 这是刻意的隔离。
+>
+> **「被提到 = 开通查询」不包含推送。** 查询是群友拉（问了才答），推送是机器人自己
+> 说话，所以进服提醒 / 定时播报要不要发给这个群，由那条关联自己的 `watch` /
+> `report` 决定，**缺省都是关的** —— 新加一条关联不会悄悄让那个群开始收推送。
 
 **自动功能（NapCat 版，配置见 `.env`）**
 
 - ⏰ **oopz 定时播报**：整点对齐推送（间隔 30 分钟则在 :00/:30，间隔 60 则每小时整点），向 `NAPCAT_REPORT_GROUP` 推送独立格式的「📣 oopz 语音频道播报」——**仅当 oopz 有人在线时**，无人则静默跳过
 - 👋 **进频道欢迎**：每 `NAPCAT_WELCOME_INTERVAL_SEC` 秒轮询，检测到有人进入目标域语音频道时推送趣味欢迎语（随机文案）
-- 🎮 **MC 进服提醒**：每 `MC_WATCH_INTERVAL_SEC` 秒轮询 MC 服务器，有人进服时推送提醒（**只推进服，不推退服**；最小推送间隔 `MC_JOIN_MIN_INTERVAL_SEC` 秒，窗口内的进服合并成一条）
-- ⏰ **MC 定时播报**：整点对齐推送「📣 在线播报」+ 玩家名单——**无人在线时静默跳过**
-- ⚠️ **MC 掉线提醒**：连续两轮探测失败才判定离线（单轮网络抖动不报），恢复时也会推一条；`MC_NOTIFY_SERVER_STATE=false` 可关
+- 🎮 **MC 进服提醒**：每 `MC_WATCH_INTERVAL_SEC` 秒轮询 MC 服务器，有人进服时推送提醒（**只推进服，不推退服**；最小推送间隔 `MC_JOIN_MIN_INTERVAL_SEC` 秒，窗口内的进服合并成一条）。**收件人和盯哪几台都由那条群关联决定**（`watch = true` + 它自己的 `targets`），一条关联挂三台服时一个周期内合成**一条**消息
+- ⏰ **MC 定时播报**：整点对齐推送「📣 MC 播报」+ 各服在线名单（`report = true`）——某台服没人或不可达只是**列成一行**，不再让整条播报跳过；真的全都没人才静默跳过
+- ⚠️ **MC 掉线提醒**：连续两轮探测失败才判定离线（单轮网络抖动不报），恢复时也会推一条；`MC_NOTIFY_SERVER_STATE=false` 可关。掉线只推给**关联了那台服**的群
 
 示例回复：
 
@@ -83,7 +87,8 @@ oopz-bot/
 │       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + list/白名单输出解析
 │       ├── mcservers.py      #   服务器清单（mcs_servers.toml 解析 / 校验 / 服名解析 / 投影）
 │       ├── mcaudiences.py    #   群关联（mcs_audiences.toml 解析 / 「这个群看哪几台」/ 唯一加载入口）
-│       ├── mcrender.py       #   MC 消息文案（明细 / 总览 / 播报，查询与播报共用同一份）
+│       ├── mcdelta.py        #   玩家进出对账（reconcile：两份名单差成进服/退服/换服事件）
+│       ├── mcrender.py       #   MC 消息文案（明细 / 总览 / 播报 / 合成推送，共用同一份）
 │       ├── textlen.py        #   长度上限与截断（零依赖，供渲染层用）
 │       ├── mcadmin.py        #   MC 玩家白名单命令层（解析 / 执行 / 独立验证）
 │       ├── admin.py          #   管理员名单（用户级鉴权，留空 = 拒绝一切）
@@ -192,6 +197,8 @@ groups    = [123456789]
 targets   = ["gtnh", "bingo", "backstabbed"]      # 顺序 = @查询 总览里的展示顺序
 primary   = "gtnh"                                # 不带服名的 @查询 默认看它
 whitelist = { target = "bingo", command = "whitelist" }
+watch     = true                                  # 本群的 groups 收进服提醒
+report    = true                                  # 本群的 groups 收定时播报
 
 [[audience]]
 name      = "建筑群"                               # 组服还没搭，先占位
@@ -200,11 +207,15 @@ targets   = []                                    # 合法：那个群的查询�
 ```
 
 > ⚠️ **一个群只能出现在一条 `[[audience]]` 里**（写进两条会直接报错）。想让几个群看
-> 同样的服，就把群号都写在同一条的 `groups` 里。
+> 同样的服，就把群号都写在同一条的 `groups` 里。**关联名也不能重名。**
 >
 > ⚠️ **关联外的服名在那个群里查不到**，这是刻意的隔离：每条的服务器视图是独立投影的。
 > 反过来「新加的服忘了关联给任何群」很常见 —— 那时群里打它回「没这个服」，而
 > `--list-targets` 和启动日志都会照常列出它，所以两者都会专门把它标成 ⚠️ 孤儿。
+>
+> ⚠️ **`watch` / `report` 不写就是 false。** 这两个开关只管「发不发」，**收件人恒为
+> 本条的 `groups`**。「多久一次」这类节奏参数继续留在 `.env`（那是整台机器人的节奏，
+> 不是某个群的偏好）。
 >
 > 这份文件**不含密码**（RCON 密码在 `mcs_servers.toml`），所以可以单独给人看 ——
 > 但含真实 QQ 群号，同样不该提交。改完要**重启 bot**，然后跑
@@ -247,7 +258,7 @@ whitelist = { target = "bingo", command = "whitelist" }   # 整段省略 = 本�
 
 oopz 回复由 `_build_stats_message()` 拼装。注意 oopz 查询有两个镜像副本：QQ 版在 [plugins/oopz_stats.py](plugins/oopz_stats.py)、NapCat 版在 [plugins_napcat/oopz/oopz_stats.py](plugins_napcat/oopz/oopz_stats.py)，**改格式需同步两份**（下方代码以 QQ 版行号为准）。
 
-MC 回复由 [plugins_napcat/_shared/mcrender.py](plugins_napcat/_shared/mcrender.py) 的 `render_detail()`（单服明细）/ `render_summary()`（总览）拼装。**只有这一份**：`@查询`、进服提醒、定时播报都从这里取格式，所以不会出现「群里和播报里同一个服显示成两样」。
+MC 回复由 [plugins_napcat/_shared/mcrender.py](plugins_napcat/_shared/mcrender.py) 拼装：`render_detail()`（单服明细）、`render_summary()`（总览）、`render_report()`（定时播报）、`format_events()`（进服提醒的合成消息）。**只有这一份**：三处共用同一个 `_summary_block` 和同一套进服模板，所以不会出现「群里和播报里同一个服显示成两样」。住在 `_shared/` 是有原因的 —— `tools/mc_check.py` 能**离线**逐字跑它，改文案不用起机器人。
 
 **1. 回复文案 / 排版**（[plugins/oopz_stats.py:160-167](plugins/oopz_stats.py#L160-L167)）
 
@@ -287,6 +298,7 @@ msg = "\n".join(lines)
 - **新加的服 / 新加的群没生效**：两份配置各有只读诊断，先跑它们再动代码 —— `tools/mc_check.py --list-targets`（服务器清单 + 被哪些群关联）和 `--list-audiences`（每条群关联覆盖哪些群、关联哪几台服）。
 - **管理命令没权限 / 说未配置 RCON**：见 DEPLOY.md 第 8 节 F11。最常见的是 `MC_ADMIN_QQ` 留空（= 功能整体关闭）或漏加自己的 QQ 号。
 - **统计 / 播报突然失效**：多半是 `OOPZ_JWT_TOKEN` 过期（约 31 天），重跑 `tools/oopz_login.py` → 回填 `.env` → 重启，见 DEPLOY.md 第 8 节 F7。
+- **某个群收不到 MC 推送**：先看**那条关联有没有写 `watch` / `report`**（缺省是 false，`--list-audiences` 的「推送」那一行会写出来），再看那台服在不在它的 `targets` 里。手动改过 `.env` 的 `MC_WATCH_GROUP` 的话也留个心：那两个变量已经作废，不搬进关联里就再也不会推送。逐项见 DEPLOY.md 第 8 节 F8。
 - **MC 进服提醒不触发**：先跑 `tools/mc_check.py`——**名单不完整时提醒会静默暂停**（刻意设计，避免基于残缺名单误报）。脚本会打印 RCON `list` 原文与判定原因，见 DEPLOY.md 第 8 节 F8。
 - **部分域不出现在统计里**：如「Voxel Passion 像素乐园」频道接口返回 `channels: null`，SDK 解析失败被跳过，不影响其他域（原因见 docs/chat.md §5.5）。
 - **主动推送（仅 NapCat 版）**：官方版无主动推送能力；定时播报 / 进频道欢迎 / MC 全部自动功能只在 NapCat 版生效。文案位置见 [DEPLOY.md 第 9 节](DEPLOY.md#9-日常维护)。

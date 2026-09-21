@@ -1118,8 +1118,8 @@ port = 25565
 
     _full = parse_book(_SRV_REAL)  # 全量表：proxy / bingo / backstabbed / gtnh
 
-    # 贴近真实：社团群看代理 + 两台子服 + 独立服，白名单发给代理；
-    # 建筑群的组服还没搭，targets = []，群号用字符串写（两种写法都要认）
+    # 贴近真实：社团群看代理 + 两台子服 + 独立服，白名单发给代理，两个推送开关都开；
+    # 建筑群的组服还没搭，targets = [] 且不开推送，群号用字符串写（两种写法都要认）
     _AUD_REAL = """
 [[audience]]
 name      = "社团群"
@@ -1127,6 +1127,8 @@ groups    = [11111111]
 targets   = ["proxy", "bingo", "backstabbed", "gtnh"]
 primary   = "bingo"
 whitelist = { target = "proxy", command = "globalwhitelist" }
+watch     = true
+report    = true
 
 [[audience]]
 name    = "建筑群"
@@ -1182,6 +1184,23 @@ targets = []
         print(f"   {'PASS' if ok else 'FAIL'}  空 targets 给一条警告（合法但要让人知道）")
         if not ok:
             print(f"         实际警告: {arch.warnings}")
+
+        # 推送开关从本条读出；不写 = 不收推送（默认关，不影响存量配置的行为）
+        ok = club.watch is True and club.report is True
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  watch / report 从本条关联读出（{club.watch} / {club.report}）")
+        ok = arch.watch is False and arch.report is False
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  不写开关 = 不收推送（缺省关，加群不会顺手开始刷屏）")
+
+        # 一句话说清「这条收不收推送」：两个都不开时群里安安静静，和「机器人挂了」
+        # 长得一模一样，只有启动日志这一行分得出来。
+        ok = "进服提醒" in club.flags_summary and "定时播报" in club.flags_summary
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  开关摘要列出两项（{club.flags_summary}）")
+        ok = "不推送" in arch.flags_summary
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  都没开时摘要直说「不推送」（{arch.flags_summary}）")
     print()
 
     # 报错用例：(说明, 群关联 toml, 期望错误信息里出现的关键词)
@@ -1247,6 +1266,33 @@ targets = []
             'whitelist={target="gtnh",cmd="x"}\n',
             "不认识的键",
         ),
+        # 布尔键只认 TOML 的真布尔。字符串真值必须**报错**：静默当真会让这个群莫名
+        # 收到推送，静默当假就是「配置写了没生效」，两种都正是本工程最防的那类键。
+        (
+            "watch 写成字符串（TOML 里 true 不加引号）",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nwatch="true"\n',
+            "必须是 true / false",
+        ),
+        # 反方向：isinstance(True, int) 是真的，但 1 不是 bool。拿整数当开关一并挡掉，
+        # 和 groups 那边专挡 isinstance(item, bool) 是同一个坑的两面。
+        (
+            "watch 写成 1",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nwatch=1\n',
+            "必须是 true / false",
+        ),
+        # 两个开关都要校验，不能只做 watch
+        (
+            "report 写成 \"yes\"",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nreport="yes"\n',
+            "必须是 true / false",
+        ),
+        # 关联名是日志和诊断里指代一条关联的唯一标识，重名之后看日志分不清说的是哪条
+        (
+            "两条关联重名",
+            '[[audience]]\nname="a"\ngroups=[1]\n'
+            '[[audience]]\nname="a"\ngroups=[2]\n',
+            "重复了",
+        ),
         ("语法错误", "[[audience]\nname=\n", "语法错误"),
     ]
     for desc, text, needle in _AUD_BAD:
@@ -1296,6 +1342,22 @@ targets = []
     ok = any("没配 rcon.password" in w for w in auds[0].warnings)
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  白名单服没配 rcon.password → 警告（命令发不出去）")
+
+    # 开了推送却没有服可盯：**警告而不是报错**。它不是「被忽略的配置键」—— 我们读懂了
+    # 它，并且明确说出它为什么没有输出；而硬报错会让整台 bot 起不来（ServerConfigError
+    # 一路冒到 main），代价与收益不成比例。targets 填好之后开关自动生效。
+    auds = parse_audiences(
+        '[[audience]]\nname="a"\ngroups=[1]\ntargets=[]\nwatch=true\nreport=true\n',
+        _full,
+    )
+    ok = any("watch" in w and "report" in w and "不会有任何输出" in w for w in auds[0].warnings)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  空 targets 却开了推送 → 警告（两个开关合成一句）")
+    if not ok:
+        print(f"         实际警告: {auds[0].warnings}")
+    ok = auds[0].watch is True and auds[0].report is True
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  空 targets 时开关照样读出来（只警告，不把它当没写）")
     print()
 
     # ---------------- 块 16：群号 → 关联 / 投影视图 ----------------
@@ -1322,6 +1384,72 @@ targets = []
     ok = config.known_groups == ("11111111", "22222222")
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  known_groups 汇总全部群号：{config.known_groups}")
+
+    # flag_targets：开了某个开关的关联**覆盖到的全部目标**，去重、保首次出现顺序。
+    # 这个数字直接进启动日志（「实际探测 N 台」）和 round_budget 的上界模型，
+    # 所以「去重」和「顺序」两条都得钉死：
+    #   - 不去重 → 同一台服按关联数重复计入，日志里的 N 偏大，上界也跟着偏大；
+    #   - 顺序不对 → 一轮里的探测顺序每轮乱跳，基线与事件的对应关系看着像随机的。
+    # 只测纯函数（不碰网络、不读配置文件），所以拿 _AUD_REAL 和一份合成关联就够。
+    wt = config.flag_targets("watch")
+    ok = [t.id for t in wt] == ["proxy", "bingo", "backstabbed", "gtnh"]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  flag_targets('watch') 取到社团群那条的目标，保序：{[t.id for t in wt]}")
+    if not ok:
+        print(f"         期望 ['proxy', 'bingo', 'backstabbed', 'gtnh']")
+
+    # report 也开在**同一条**关联上，所以这里必须与 watch 得到同一个答案 ——
+    # 两个开关走的是同一段代码，答案不同就说明有一个把关联筛错了。
+    ok = config.flag_targets("report") == wt
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  flag_targets('report') 与 watch 结果一致（两个开关同源）")
+
+    # 建筑群 targets=[]、两个开关都没开 → 它两边都不该出现；空 targets 那条就算开了也不贡献目标
+    ok = all(t.id in {x.id for x in club.book.targets} for t in wt)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  watch 的目标全部落在社团群自己的投影里（没串到建筑群）")
+
+    # 缺省不推送：不写 watch 的关联在 flag_targets 里一个目标都不贡献。
+    # 这条是「新加一条关联不会悄悄开始往那个群发消息」的守门断言。
+    _quiet = McConfig(
+        book=_full,
+        audiences=parse_audiences('[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n', _full),
+    )
+    ok = _quiet.flag_targets("watch") == () and _quiet.flag_targets("report") == ()
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  不写开关 → 该条不贡献任何目标（缺省不推送）")
+
+    _AUD_DEDUP = """
+[[audience]]
+name    = "甲群"
+groups  = [1]
+targets = ["bingo", "gtnh"]
+watch   = true
+
+[[audience]]
+name    = "乙群"
+groups  = [2]
+targets = ["gtnh", "bingo"]
+watch   = true
+"""
+    dedup = McConfig(book=_full, audiences=parse_audiences(_AUD_DEDUP, _full))
+    got = [t.id for t in dedup.flag_targets("watch")]
+    # bingo 在两条关联里都有 → 只出现一次；且 bingo 在 gtnh 之前，是甲群的书写顺序。
+    # 若实现按字母序排，这里会变成 ['bingo','gtnh'] 而**恰好也通过** —— 所以故意让
+    # 甲群写成 bingo 在前、乙群反过来，两个「谁先」的答案在两条关联里不一致，
+    # 只有这样才排除掉「碰巧」。
+    ok = got == ["bingo", "gtnh"]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  两条关联共享 bingo → 去重且取首次出现顺序：{got}")
+
+    ok = dedup.flag_targets("report") == ()
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  没有任何关联开 report → 空元组（据此不打预算告警）")
+
+    # 返回的是真 ServerTarget 对象（不是 id 字符串）：调用方要拿它去 get_snapshots 和取服名
+    ok = all(hasattr(t, "name") for t in wt) and dedup.flag_targets("watch")[0].id == "bingo"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  返回 ServerTarget 本身（能取服名，能直接喂 get_snapshots）")
 
     # 投影必须重建 _by_id：get() 对本条关联的每个 id 都非 None
     assert club is not None and arch is not None
@@ -1402,26 +1530,58 @@ targets = []
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  每个目标都被关联到了 → 不出孤儿警告")
 
-    # .env 里的 MC_ALLOWED_GROUPS：删干净了就不该响；留着要吼一声，
-    # 因为它的存在会让人以为群范围还归它管（实际拦人的是「有没有被关联提到」）
-    _saved = os.environ.get("MC_ALLOWED_GROUPS")
+    # .env 里已作废的群相关变量：删干净了就不该响；留着要吼一声，因为它的存在会让人
+    # 以为它还管着事（MC_ALLOWED_GROUPS 是群范围，另两个是「推给谁」）。
+    #
+    # 遍历 _LEGACY_GROUP_VARS 而不是写死变量名：将来再搬一个变量走，这里自动就有了
+    # 覆盖 —— 写死的话漏一个的表现是「那个变量留在 .env 里，谁也不吭声」，
+    # 而它正是这张表存在的全部理由。
+    from plugins_napcat._shared.mcaudiences import _LEGACY_GROUP_VARS
+
+    _saved_legacy = {v: os.environ.get(v) for v in _LEGACY_GROUP_VARS}
     try:
-        os.environ.pop("MC_ALLOWED_GROUPS", None)
+        # 一个都不留 → 不该有任何残留警告
+        for var in _LEGACY_GROUP_VARS:
+            os.environ.pop(var, None)
         ok = not any("已不再生效" in w for w in _cross_warnings(_orphan, auds))
         failed += not ok
-        print(f"   {'PASS' if ok else 'FAIL'}  .env 里没有 MC_ALLOWED_GROUPS → 不出残留警告")
+        print(f"   {'PASS' if ok else 'FAIL'}  .env 里三个已作废变量都不留 → 不出残留警告")
 
-        os.environ["MC_ALLOWED_GROUPS"] = "11111111"
-        warns = _cross_warnings(_orphan, auds)
-        ok = any("MC_ALLOWED_GROUPS" in w and "已不再生效" in w for w in warns)
+        for var in _LEGACY_GROUP_VARS:
+            os.environ[var] = "11111111"
+            warns = _cross_warnings(_orphan, auds)
+            ok = any(var in w and "已不再生效" in w for w in warns)
+            failed += not ok
+            print(f"   {'PASS' if ok else 'FAIL'}  .env 里留着 {var} → 警告「已不再生效」")
+            if not ok:
+                print(f"         实际警告: {warns}")
+            os.environ.pop(var, None)
+
+        # 搬走的三个变量里，WATCH / REPORT 的修法**不是**改 groups，而是在关联上加一个
+        # 推送开关。警告必须把这句说出来，否则照着「改 groups」去改的人会发现提醒照样
+        # 不推，而那时残留警告已经因为他「看过一次」被忽略掉了。
+        for var, needle in (("MC_WATCH_GROUP", "watch"), ("MC_REPORT_GROUP", "report")):
+            os.environ[var] = "11111111"
+            warns = _cross_warnings(_orphan, auds)
+            ok = any(var in w and needle in w for w in warns)
+            failed += not ok
+            print(f"   {'PASS' if ok else 'FAIL'}  {var} 的残留警告指向 [[audience]].{needle}")
+            if not ok:
+                print(f"         实际警告: {warns}")
+            os.environ.pop(var, None)
+
+        # 三个都留着 → 只出**一条**汇总警告，不是三条（日志尾巴要能一眼看完）
+        for var in _LEGACY_GROUP_VARS:
+            os.environ[var] = "11111111"
+        warns = [w for w in _cross_warnings(_orphan, auds) if "已不再生效" in w]
+        ok = len(warns) == 1
         failed += not ok
-        print(f"   {'PASS' if ok else 'FAIL'}  .env 里留着 MC_ALLOWED_GROUPS → 警告「已不再生效」")
-        if not ok:
-            print(f"         实际警告: {warns}")
+        print(f"   {'PASS' if ok else 'FAIL'}  三个都留着 → 合成一条警告（实际 {len(warns)} 条）")
     finally:
-        os.environ.pop("MC_ALLOWED_GROUPS", None)
-        if _saved is not None:
-            os.environ["MC_ALLOWED_GROUPS"] = _saved
+        for var, value in _saved_legacy.items():
+            os.environ.pop(var, None)
+            if value is not None:
+                os.environ[var] = value
     print()
 
     # ---------------- 块 18：变更命令「到底发没发」 ----------------
@@ -1494,6 +1654,456 @@ targets = []
     ok = "mutation_sent" in _body and "命令没有发出去" in _body
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  群内文案区分「没发出去」与「发了但未能验证」")
+    print()
+
+    print("== 玩家进出对账自测（reconcile 纯函数）==")
+
+    from plugins_napcat._shared.mc import McSnapshot
+    from plugins_napcat._shared.mcdelta import (
+        KIND_JOIN,
+        KIND_LEAVE,
+        KIND_SWITCH,
+        reconcile,
+    )
+
+    def _snap(tid, names=(), *, reachable=True, complete=True, count=None):
+        """手工造一份快照。count 缺省 = len(names)，与 mc.py 「名单完整」的含义一致；
+        要造「答了但名单残缺」的假数据得显式传 count 和 complete=False。"""
+        return McSnapshot(
+            reachable=reachable,
+            target_id=tid,
+            count=len(names) if count is None else count,
+            names=list(names),
+            names_complete=complete,
+        )
+
+    _TG = {t.id: t for t in _full.targets}
+    # bingo / backstabbed / proxy 同属「主服群」；gtnh 没写 group（缺省成自己的 id）。
+    _ORDER = [_TG["bingo"], _TG["backstabbed"], _TG["gtnh"], _TG["proxy"]]
+
+    def _rec(prev, snaps, targets=None):
+        return reconcile(prev, {s.target_id: s for s in snaps}, _ORDER if targets is None else targets)
+
+    def _brief(delta):
+        return [(e.kind, e.player, e.target_id, e.origin_id) for e in delta.events]
+
+    # ① 首次建基线：prev 是空的，两台各 2 人 → 零事件。
+    #    这条挡的是最刺眼的一类假消息 —— 机器人重启后把全服的人报成刚进服。
+    d = _rec({}, [_snap("bingo", ["甲", "乙"]), _snap("backstabbed", ["丙", "丁"])])
+    ok = (
+        d.events == ()
+        and set(d.baseline) == {"bingo", "backstabbed"}
+        and d.baseline["bingo"] == frozenset({"甲", "乙"})
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  没有基线 → 零事件、baseline 记下当前名单（存量玩家不是刚进服）")
+
+    # ② 单人进服 → 恰 1 条 join，归属到进的那台
+    d = _rec({"bingo": frozenset({"甲"})}, [_snap("bingo", ["甲", "乙"])])
+    ok = _brief(d) == [(KIND_JOIN, "乙", "bingo", "")]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单人进服 → 恰 1 条 join 且落在进的那台：{_brief(d)}")
+
+    # ③ 单人退服 → 恰 1 条 leave（对账层必须算得出来；「不推 leave」是文案层的决定）
+    d = _rec({"bingo": frozenset({"甲", "乙"})}, [_snap("bingo", ["甲"])])
+    ok = _brief(d) == [(KIND_LEAVE, "乙", "bingo", "")]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单人退服 → 恰 1 条 leave：{_brief(d)}")
+
+    # ④ 同组换服 → **恰 1 条** switch，没有孤立的 join/leave。
+    #    多出一条 join 的症状是群里同时收到「换服过来」和「加入了」，
+    #    读起来像他进了两次。
+    d = _rec(
+        {"bingo": frozenset({"甲", "小明"}), "backstabbed": frozenset({"乙"})},
+        [_snap("bingo", ["甲"]), _snap("backstabbed", ["乙", "小明"])],
+    )
+    ok = _brief(d) == [(KIND_SWITCH, "小明", "backstabbed", "bingo")] and d.events[0].count == 2
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  同组换服 → 恰 1 条 switch，且没有多余的 join/leave：{_brief(d)}")
+    if not ok:
+        print(f"         count={d.events[0].count if d.events else None}（应取到达端人数 2）")
+
+    # ⑤ 跨组移动 → 拆成普通 join + 普通 leave，**没有** switch。
+    #    「从 GTNH 过来」是猜的（他可能先退了 GTNH、去吃了饭、再进 Bingo），
+    #    而 leave 不推，所以群里只看到「加入了 Bingo」。
+    d = _rec(
+        # bingo 也要有基线（哪怕空集），否则它只是「本轮新出现的目标」，连 join 都不产
+        {"bingo": frozenset(), "gtnh": frozenset({"小明"})},
+        [_snap("bingo", ["小明"]), _snap("gtnh", [])],
+    )
+    ok = _brief(d) == [
+        (KIND_JOIN, "小明", "bingo", ""),
+        (KIND_LEAVE, "小明", "gtnh", ""),
+    ]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  跨组移动 → join + leave，不报换服：{_brief(d)}")
+
+    # ⑥ 两台都没写 group → 各自缺省成自己的 id，天然不同组，永不被判成换服。
+    #    钉住 mcservers.py 里 `group = ... or target_id` 那个缺省 —— 谁把它删掉，
+    #    这两台服之间就会开始报「换服过来」，而它们其实毫无关系。
+    _nogroup = parse_book(
+        '[[targets]]\nid = "a"\nkind = "backend"\nhost = "127.0.0.1"\nport = 1\n'
+        '[[targets]]\nid = "b"\nkind = "backend"\nhost = "127.0.0.1"\nport = 2\n'
+    )
+    d = reconcile(
+        {"a": frozenset({"小明"})}, {"b": _snap("b", ["小明"])}, _nogroup.targets
+    )
+    ok = (
+        _nogroup.get("a").group == "a"
+        and _nogroup.get("b").group == "b"
+        and all(e.kind != KIND_SWITCH for e in d.events)
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  不写 group 的两台服不会互报换服（group 缺省成 id）")
+
+    # ⑦ reachable=False → 零事件且基线**原样冻结**。
+    #    这条是整个模块最重要的一条：抖一轮就清空基线，恢复时整服的人被报成刚进服。
+    d = _rec(
+        {"bingo": frozenset({"甲", "乙"})},
+        [_snap("bingo", [], reachable=False, complete=False)],
+    )
+    ok = d.events == () and d.baseline["bingo"] == frozenset({"甲", "乙"})
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  探测失败 → 零事件、基线原样冻结（抖动 ≠ 集体退服）")
+
+    # ⑧ names_complete=False → 同样零事件、基线不变。
+    #    与 mc.py 那道 `len(names) == 人数` 闸门是同一条原则：残缺名单里「不在名单中」
+    #    等于「我们没看到」，不等于「他走了」。
+    d = _rec(
+        {"bingo": frozenset({"甲", "乙"})},
+        [_snap("bingo", ["甲"], complete=False, count=5)],
+    )
+    ok = d.events == () and d.baseline["bingo"] == frozenset({"甲", "乙"})
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  名单不完整 → 零事件、基线不变（我们没看到 ≠ 他走了）")
+
+    # ⑨ 代理：names_complete 恒为假，于是自动落进「不参与对账」——
+    #    既不会当换服端点，也不会因为「代理名单为空」误伤同组的子服。
+    #    这条不变量（代理不出分服名单、不是故障）在这里第一次真正当护栏用。
+    d = _rec(
+        {"proxy": frozenset({"甲"}), "bingo": frozenset({"乙"})},
+        [_snap("proxy", [], complete=False, count=9), _snap("bingo", ["乙", "丙"])],
+    )
+    ok = _brief(d) == [(KIND_JOIN, "丙", "bingo", "")] and d.baseline["proxy"] == frozenset({"甲"})
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  代理天然不参与对账，也不影响同组子服：{_brief(d)}")
+
+    # ⑩ 来源不唯一 → 降级成普通进服 + 普通离开，不猜是哪台。
+    #    跨服同名账号（或上一轮数据本身有残留）就是这个形状。
+    d = _rec(
+        {"bingo": frozenset({"小明", "甲"}), "backstabbed": frozenset({"小明", "乙"})},
+        [_snap("bingo", ["甲"]), _snap("backstabbed", ["小明", "乙"])],
+    )
+    ok = _brief(d) == [(KIND_LEAVE, "小明", "bingo", "")]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  上轮同时出现在同组两台 → 不猜来源，无 switch：{_brief(d)}")
+
+    # ⑩' 同一形状但到达端唯一、来源端有两个 → 仍然不许猜。
+    #    只用三台同组服才构造得出来，所以这里单独起一份小表（主服群只有两台 backend）。
+    _GRP3 = parse_book(
+        '[[targets]]\nid = "a"\nkind = "backend"\ngroup = "G"\nhost = "127.0.0.1"\nport = 1\n'
+        '[[targets]]\nid = "b"\nkind = "backend"\ngroup = "G"\nhost = "127.0.0.1"\nport = 2\n'
+        '[[targets]]\nid = "c"\nkind = "backend"\ngroup = "G"\nhost = "127.0.0.1"\nport = 3\n'
+    )
+    d = reconcile(
+        # c 要给个空基线，否则它只是「新目标」，连 join 都不会有
+        {"a": frozenset({"小明"}), "b": frozenset({"小明"}), "c": frozenset()},
+        {"a": _snap("a", []), "b": _snap("b", []), "c": _snap("c", ["小明"])},
+        _GRP3.targets,
+    )
+    ok = all(e.kind != KIND_SWITCH for e in d.events) and len(d.events) == 3
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  来源有两个候选 → 仍然不猜：{_brief(d)}")
+
+    # ⑪ 新加进关联的一台服：prev 里没有它的键 → 只建基线，存量 5 人不报进服。
+    #    这是配置改动的常见后果，DEPLOY 有整节教人分辨这类假事件。
+    d = _rec(
+        {"bingo": frozenset({"甲"})},
+        [_snap("bingo", ["甲"]), _snap("backstabbed", ["a", "b", "c", "d", "e"])],
+    )
+    ok = d.events == () and len(d.baseline) == 2 and len(d.baseline["backstabbed"]) == 5
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  本轮新出现的目标只建基线，不把存量玩家报成进服")
+
+    # ⑫ prev 里有已经被移出配置的服 → 新基线里没有它（基线跟着配置走，不留残影）
+    d = _rec(
+        {"bingo": frozenset({"甲"}), "ghost": frozenset({"幻"})}, [_snap("bingo", ["甲"])]
+    )
+    ok = "ghost" not in d.baseline
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  移出配置的目标不进新基线：{sorted(d.baseline)}")
+
+    # ⑬ **空集 ≠ 没有这个键**。这两行是同一个快照喂出来的两个截然不同的答案，
+    #    钉住的就是被删掉的 _initialized（「有没有这个键」本身就是它）。
+    _three = [_snap("gtnh", ["甲", "乙", "丙"])]
+    d_empty = _rec({"gtnh": frozenset()}, _three)
+    d_none = _rec({}, _three)
+    ok = (
+        len(d_empty.events) == 3
+        and all(e.kind == KIND_JOIN for e in d_empty.events)
+        and d_none.events == ()
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  空基线报 3 条进服、无键则零事件（空集 ≠ 没有基线）")
+    if not ok:
+        print(f"         空集: {_brief(d_empty)} / 无键: {_brief(d_none)}")
+
+    # ⑭ 确定性：同一份输入喂两次，事件逐项相等且顺序相同。
+    #    顺序不稳的症状是消息里各台服的块每轮换位置，看着像随机刷新。
+    _prev = {"bingo": frozenset({"甲"}), "backstabbed": frozenset({"乙"})}
+    _snaps = [
+        _snap("bingo", ["甲", "戊", "丙"]),
+        _snap("backstabbed", ["乙", "丁"]),
+        _snap("gtnh", ["己"]),
+    ]
+    ok = _rec(_prev, _snaps).events == _rec(_prev, _snaps).events
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  同一份输入两次结果逐项相同（消息不会每轮换位置）")
+
+    print()
+
+    print("== 播报文案自测（合成排版 / 定时播报）==")
+
+    from datetime import datetime as _dt
+
+    from plugins_napcat._shared import mcrender as _mr
+    from plugins_napcat._shared.mcdelta import KIND_SWITCH as _SW
+    from plugins_napcat._shared.mcdelta import PlayerEvent as _PE
+    from plugins_napcat._shared.mcdelta import StatusEvent as _SE
+    from plugins_napcat._shared.mcrender import (
+        Row as _Row,
+        format_events as _fe,
+        render_report as _rr,
+        render_summary as _rs,
+    )
+    from plugins_napcat._shared.textlen import MAX_LEN as _MAX
+
+    def _t(tid, name="", group="主服群", kind="backend"):
+        return ServerTarget(
+            id=tid, name=name or tid, kind=kind, group=group,
+            host="h", port=1, timeout=5.0, rcon_timeout=5.0,
+        )
+
+    def _row(tid, name, count, names=(), *, reachable=True, complete=True, kind="backend"):
+        return _Row(
+            _t(tid, name, kind=kind),
+            McSnapshot(
+                target_id=tid, reachable=reachable, count=count,
+                names=list(names), names_complete=complete,
+            ),
+        )
+
+    # 进服模板有 4 句，随机挑一句属于「体验」，不属于要钉的东西 —— 而随机性会让
+    # 逐字断言变成碰运气。整个块换成固定模板（结束前还原）。
+    _tpl_saved = _mr._JOIN_TEMPLATES
+    _mr._JOIN_TEMPLATES = ["🎮 {who} 加入了{where}（当前 {count} 人在线）"]
+
+    _T2 = [_t("gtnh", "GTNH"), _t("bingo", "Bingo"), _t("backstabbed", "谁是杀手")]
+    _NOW = _dt(2026, 9, 21, 14, 32)
+
+    # ① 没有事件就别发消息（空消息在群里是一行空白，比不发更糟）
+    text, clipped = _fe([], _T2, now=_NOW)
+    ok = text is None and clipped is False
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  零事件 → None")
+
+    # ② 单个进服：**逐字**等于今天那句（DEPLOY.md / README.md 引用着它）
+    text, clipped = _fe([_PE(KIND_JOIN, "阿伟", "bingo", count=3)], _T2, now=_NOW)
+    ok = text == "🎮 阿伟 加入了 Bingo（当前 3 人在线）" and not clipped
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单个进服 → 旧文案一字不改：{text!r}")
+
+    # ③ 三台服都有事件 → 每台一个【服名】块，块顺序 = 传入的 targets 顺序
+    events = [
+        _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
+        _PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5),
+        _PE(KIND_JOIN, "小红", "bingo", count=9),
+    ]
+    text, _ = _fe(events, _T2, now=_NOW)
+    want = "\n".join([
+        "🎮 MC 动态 · 14:32",
+        "【GTNH】",
+        "  🎮 阿伟 加入了（当前 3 人在线）",
+        "【Bingo】",
+        "  🔄 小明 从「谁是杀手」换服过来（当前 5 人在线）",
+        "  🎮 小红 加入了（当前 9 人在线）",
+    ])
+    ok = text == want
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  多台服合成一条：块按 targets 顺序、换服行在进服行之前")
+    if not ok:
+        print(f"         期望:\n{want}\n         实际:\n{text}")
+
+    # ④ 纯退服 → 不进消息。**对账层照样产出它**（块 19 有一条用例钉着），
+    #    这里是推送层说「不推」的地方 —— 哪天要开退服提醒，改的就是这一处。
+    text, _ = _fe([_PE(KIND_LEAVE, "小明", "bingo", count=2)], _T2, now=_NOW)
+    ok = text is None
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  纯退服 → 不发消息（对账层有它，推送层丢它）")
+
+    # ⑤ 退服不产生行，也**不改变**其余行的顺序/内容 —— 混进来时不能顺手多带一行
+    text, _ = _fe(
+        [
+            _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
+            _PE(KIND_LEAVE, "小明", "bingo", count=2),
+            _PE(_SW, "小红", "bingo", origin_id="gtnh", count=5),
+        ],
+        _T2,
+        now=_NOW,
+    )
+    want = "\n".join([
+        "🎮 MC 动态 · 14:32",
+        "【GTNH】",
+        "  🎮 阿伟 加入了（当前 3 人在线）",
+        "【Bingo】",
+        "  🔄 小红 从「GTNH」换服过来（当前 5 人在线）",
+    ])
+    ok = text == want and "小明" not in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  退服不占行、不影响其余行（同一份事件里混着也不乱）")
+    if not ok:
+        print(f"         期望:\n{want}\n         实际:\n{text}")
+
+    # ⑥ 单个换服：没有旧文案可留，所以哪怕只有一个事件也走合成排版
+    text, _ = _fe([_PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5)], _T2, now=_NOW)
+    ok = text == "\n".join([
+        "🎮 MC 动态 · 14:32",
+        "【Bingo】",
+        "  🔄 小明 从「谁是杀手」换服过来（当前 5 人在线）",
+    ])
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单个换服 → 合成排版里的「从「X」换服过来」一行")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # ⑦ 掉线 / 恢复单个事件也走旧文案（DEPLOY 与 README 同样引用着这两句）
+    text, _ = _fe([_SE("bingo", down=True, streak=2, why="连不上了")], _T2, now=_NOW)
+    ok = text == "⚠️ Bingo 连不上了（已连续 2 轮探测失败）"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单个掉线 → 旧文案一字不改：{text!r}")
+
+    text, _ = _fe([_SE("bingo", down=False, count=5)], _T2, now=_NOW)
+    ok = text == "✅ Bingo 已恢复，当前 5 人在线"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单个恢复 → 旧文案一字不改：{text!r}")
+
+    # ⑧ 状态跃迁混进合成消息时，服名由【】块头承担，所以行内不再重复服名 ——
+    #    重复的症状是「【Bingo】/ ⚠️ Bingo 连不上了」，同一个名字一行里出现两次
+    text, _ = _fe(
+        [
+            _SE("bingo", down=True, streak=2, why="应答异常"),
+            _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
+        ],
+        _T2,
+        now=_NOW,
+    )
+    ok = "  ⚠️ 应答异常（已连续 2 轮探测失败）" in text and "Bingo 应答异常" not in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  合成排版里状态行不重复服名，且区分「应答异常」")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # ⑨ 播报：一台有人 + 一台 0 人 + 一台不可达 → **照发**，三台各一块。
+    #    这是本期行为变更的核心：单目标时代「0 人 → 整条不发」在多目标下没道理，
+    #    3 台服的播报里有 1 台没人，不代表这次播报没意义。
+    rows = [
+        _row("gtnh", "GTNH", 3, ["阿伟", "小明", "小红"]),
+        _row("bingo", "Bingo", 0),
+        _row("backstabbed", "谁是杀手", 0, reachable=False),
+    ]
+    _all = [r.target for r in rows]
+    text, why = _rr(rows, total_names=50, all_targets=_all, audience_name="社团群", now=_NOW)
+    ok = (
+        text is not None
+        and why == ""
+        and text.splitlines()[0] == "📣 MC 播报 · 14:32"
+        and "【GTNH】在线 3" in text
+        and "【Bingo】在线 0　目前无人" in text
+        and "【谁是杀手】😵 不可达" in text
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  播报：有人 / 没人 / 不可达三台各一块，照发不跳过")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # ⑩ 两种跳过的**原因必须不同**：全不可达去开服，全员 0 人什么都不用做。
+    #    混成一句「当前无人在线」会把前一种的人指去查错方向。
+    t1, r1 = _rr(
+        [_row("a", "A", 0, reachable=False), _row("b", "B", 0, reachable=False)],
+        total_names=50, all_targets=[_t("a", "A"), _t("b", "B")], audience_name="社团群", now=_NOW,
+    )
+    t2, r2 = _rr(
+        [_row("a", "A", 0), _row("b", "B", 0)],
+        total_names=50, all_targets=[_t("a", "A"), _t("b", "B")], audience_name="社团群", now=_NOW,
+    )
+    ok = (
+        t1 is None and t2 is None and r1 != r2
+        and "全部探测失败" in r1 and "都没人在线" in r2
+        and "社团群" in r1
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  两种跳过原因分开说：\n         {r1}\n         {r2}")
+
+    # ⑪ 只挂一台代理且它有 5 人 → **不**跳过。
+    #    判定「有没有人」若用 _counting() 的求和，代理被排除在外，求和是 0，
+    #    这一条就会被误判成「无人在线」而静默跳过 —— 可明明有人。
+    prows = [_row("proxy", "主服群", 5, kind="proxy")]
+    text, why = _rr(
+        prows, total_names=50, all_targets=[prows[0].target], audience_name="社团群", now=_NOW
+    )
+    ok = text is not None and "全群组 5 人" in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  只挂一台有人的代理 → 不跳过，且报全群组人数")
+    if not ok:
+        print(f"         实际: text={text!r} why={why!r}")
+
+    # ⑫ 同一台服在「总览」和「播报」里**逐字相同** —— 这是 mcrender 那份 docstring
+    #    的承诺（同一个服在两个地方不能显示成两种样子），今天之前它还是句空话：
+    #    播报是 mc_reporter 自己拼的，根本没 import mcrender。
+    _same = [_row("gtnh", "GTNH", 3, ["阿伟", "小明", "小红"]), _row("bingo", "Bingo", 0)]
+    _same_all = [r.target for r in _same]
+    summ = _rs(_same, total_names=50, all_targets=_same_all)
+    rep, _ = _rr(_same, total_names=50, all_targets=_same_all, audience_name="社团群", now=_NOW)
+    block = "【GTNH】在线 3\n  • 阿伟\n  • 小明\n  • 小红"
+    ok = block in summ and rep is not None and block in rep
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  同一台服的块在总览与播报里逐字相同")
+    if not ok:
+        print(f"         总览:\n{summ}\n         播报:\n{rep}")
+
+    # ⑬ 超长：不许从头截断（切掉的是尾部 = 最后几台服 + 尾注，而尾注正是
+    #    「上面这些数对不上」那句）。_fit 靠逐行减名额重渲染，总览与播报共用它。
+    #
+    #    40 台 × 25 个长名字是**量出来的**：初始渲染 3600 字远超上限，减到名额 1 时
+    #    仍有 1950 字（还是超），减到 0 才落到 990 字 —— 也就是说「名额被减到 0」
+    #    和「尾注还在」这两件事在这一组数据下同时成立，断言才有意义。名字短一点
+    #    会在某个中间额度就停下，那两条都会碰巧通过。
+    _N = 40
+    _many = [
+        _row(
+            f"t{i}", f"服{i}", 25,
+            [f"LongPlayerName{i:03d}{j:02d}" for j in range(25)],
+            complete=(i < _N - 2),
+        )
+        for i in range(_N)
+    ]
+    _many_all = [r.target for r in _many]
+    tot = sum(len(r.snap.names) for r in _many)
+    summ = _rs(_many, total_names=tot, all_targets=_many_all)
+    rep, why = _rr(
+        _many, total_names=tot, all_targets=_many_all, audience_name="社团群", now=_NOW
+    )
+    _note = f"⚠️ 名单不完整：服{_N - 2}、服{_N - 1}"
+    ok = (
+        len(summ) <= _MAX and _note in summ and "  • " not in summ
+        and rep is not None and len(rep) <= _MAX and _note in rep and "  • " not in rep
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  超长时逐行减名额、砍到 0 也不丢尾注（总览 {len(summ)} / 播报 {len(rep or '')} 字）")
+    if not ok:
+        print(f"         总览尾注={(_note in summ)} 总览还有人名={('  • ' in summ)}")
+
+    _mr._JOIN_TEMPLATES = _tpl_saved
     print()
 
     print(f"== 自测结果：{'全部通过' if not failed else f'{failed} 项失败'} ==")
@@ -1820,6 +2430,7 @@ def _list_targets() -> int:
     for audience in config.audiences:
         print(f"   {audience.summary()}")
         print(f"      {audience.whitelist_summary}")
+        print(f"      推送   {audience.flags_summary}")
     print("   白名单是**按群关联**定的，逐条细节与命令前缀见：")
     print("       .venv\\Scripts\\python.exe tools\\mc_check.py --list-audiences")
     print()
@@ -1827,24 +2438,38 @@ def _list_targets() -> int:
     # 一轮探测的耗时预算。**这是上界，不是典型值**：正常一轮在毫秒级，
     # 只有「SLP 通但 RCON 卡住」这种病态情况才会走满（RCON 可能重连一次所以算两倍）。
     # 目标之间是并发探测，所以取 max 而不是求和 —— 加子服不会让这个数变大。
-    slp, rcon, budget = round_budget(book)
+    #
+    # 基数必须是**「开着 watch 的关联覆盖到的目标并集」**，与 mcs/__init__.py 里
+    # 启动日志那次完全一致（round_budget 的 docstring 要求两处一致）：全量表里可能
+    # 有一台只被 watch = false 的关联引用的服，按它算的上界会永远顶着一条与轮询无关
+    # 的告警 —— 告警被无视之后，真超了也看不出来。
+    watched = [t.id for t in config.flag_targets("watch")]
     print("== 一轮耗时预算（上界，非典型值）==")
-    print(f"   SLP {slp:g}s + RCON {rcon:g}s ×2 = 最坏 {budget:g}s")
-    raw_interval = os.environ.get("MC_WATCH_INTERVAL_SEC", "").strip()
-    if raw_interval:
-        try:
-            interval = float(raw_interval)
-        except ValueError:
-            print(f"   [!] MC_WATCH_INTERVAL_SEC 不是数字：{raw_interval!r}")
-        else:
-            if budget > interval:
-                # mc_reporter._watch_loop 是「跑完再补睡剩余时间」：sleep(max(1, 间隔-耗时))，
-                # 所以最坏情况**不会重叠**，只是把轮询周期从 10s 撑到 16s 左右 ——
-                # 进服发现晚几秒，不会堆积。
-                print(f"   [!] 上界 {budget:g}s 超过 MC_WATCH_INTERVAL_SEC={interval:g}s："
-                      f"病态情况下周期被拉长到约 {budget + 1:g}s（不会重叠，只是变慢）")
+    if not watched:
+        # 与 mcs/__init__.py 一致：没有 watch 关联时预算取 (0,0,0)，也就是不打告警。
+        # 这里多说一句「为什么没有」，比打一行 0s 强 —— 看这个输出的人多半正在查
+        # 「进服提醒怎么没反应」，而原因往往就是忘了写 watch = true。
+        print("   没有任何 [[audience]] 写 watch = true，进服提醒不跑轮询，没有预算可言")
+    else:
+        slp, rcon, budget = round_budget(book.scoped(watched))
+        print(f"   基数：开着 watch 的关联覆盖到的 {len(watched)} 台服"
+              f"（全量表共 {len(book.targets)} 台，没开 watch 的不算）")
+        print(f"   SLP {slp:g}s + RCON {rcon:g}s ×2 = 最坏 {budget:g}s")
+        raw_interval = os.environ.get("MC_WATCH_INTERVAL_SEC", "").strip()
+        if raw_interval:
+            try:
+                interval = float(raw_interval)
+            except ValueError:
+                print(f"   [!] MC_WATCH_INTERVAL_SEC 不是数字：{raw_interval!r}")
             else:
-                print(f"   轮询间隔 MC_WATCH_INTERVAL_SEC={interval:g}s，够用")
+                if budget > interval:
+                    # mc_reporter._watch_loop 是「跑完再补睡剩余时间」：sleep(max(1, 间隔-耗时))，
+                    # 所以最坏情况**不会重叠**，只是把轮询周期从 10s 撑到 16s 左右 ——
+                    # 进服发现晚几秒，不会堆积。
+                    print(f"   [!] 上界 {budget:g}s 超过 MC_WATCH_INTERVAL_SEC={interval:g}s："
+                          f"病态情况下周期被拉长到约 {budget + 1:g}s（不会重叠，只是变慢）")
+                else:
+                    print(f"   轮询间隔 MC_WATCH_INTERVAL_SEC={interval:g}s，够用")
     print()
 
     # 两层警告都打，内容不重复：book.warnings 是全量的（端口冲突、没配 rcon 密码），
@@ -1907,6 +2532,9 @@ def _list_audiences() -> int:
             # 「这个群查什么都是空的」是**配置如此**，不是坏了。
             print("    关联   （空）—— 该群查询会回「本群关联的服务器还没接入」")
         print(f"    白名单 {audience.whitelist_summary}")
+        # 推送开关单独一行：两个都没开时这个群「查询一切正常、却什么都收不到」，
+        # 而它的表现（群里安安静静）和「机器人挂了」一模一样。
+        print(f"    推送   {audience.flags_summary}")
         for w in audience.warnings:
             print(f"    [!] {w}")
         print()

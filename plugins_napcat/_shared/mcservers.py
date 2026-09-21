@@ -334,6 +334,21 @@ def _as_text(value: object, where: str, *, allow_empty: bool = True) -> str:
     return text
 
 
+def _as_bool(value: object, where: str) -> bool:
+    """布尔键：只认 TOML 的真布尔，不做「字符串真值」那一套。
+
+    `watch = "true"` 这种写法**必须报错**。静默当真会让这个群莫名收到推送，静默当假
+    则等于「配置写了但没生效」—— 后者正是本工程最防的那类键（改的人以为自己改好了）。
+
+    也**刻意不认 1 / 0**：`isinstance(True, int)` 是真的，反过来 `1` 不是 bool，只认 bool
+    就把「拿整数当开关」一并挡掉。这和 groups 那边专挡 `isinstance(item, bool)` 是同一个
+    坑的两面（那边是 bool 混进 int 里，这边是 int 混进 bool 里）。
+    """
+    if not isinstance(value, bool):
+        raise ServerConfigError(f"{where} 必须是 true / false，实际是 {value!r}")
+    return value
+
+
 def _reject_unknown(table: dict, allowed: frozenset[str], where: str) -> None:
     unknown = sorted(set(table) - allowed)
     if unknown:

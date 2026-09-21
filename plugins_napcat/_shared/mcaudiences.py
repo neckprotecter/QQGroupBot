@@ -11,6 +11,12 @@
     targets   = ["gtnh", "bingo"]            # 可选，**可为空**。顺序即总览顺序
     primary   = "gtnh"                       # 可选，本群默认先看哪台
     whitelist = { target = "bingo", command = "whitelist" }   # 可选，省略 = 本群不管白名单
+    watch     = true                         # 可选，缺省 false。本条的 groups 收进服提醒
+    report    = true                         # 可选，缺省 false。本条的 groups 收定时播报
+
+「查询」和「推送」是两个轴，别混：**被提到 = 开通查询**（群里问就答），而**推不推送**由
+watch / report 决定，缺省关闭。查询是群友拉、推送是机器人自己说话，让新加进来的关联默认
+安静是刻意的 —— 否则「加个群进去」会顺手变成「那个群开始每小时被刷一条」。
 
 **为什么和 mcs_servers.toml 分成两个文件**：那个含各服 RCON 明文密码，这个不含 ——
 敏感度和受众都不一样，分开之后「这份可以单独给人看」。代价是两份配置要对上，所以
@@ -41,6 +47,8 @@ from .mcservers import (
     _DEFAULT_COMMAND,
     ServerBook,
     ServerConfigError,
+    ServerTarget,
+    _as_bool,
     _as_text,
     _reject_unknown,
     book_path,
@@ -49,12 +57,21 @@ from .mcservers import (
 
 # 各表允许出现的键。多一个都报错——见模块 docstring 第 3 条。
 _TOP_KEYS = frozenset({"audience"})
-_AUDIENCE_KEYS = frozenset({"name", "groups", "targets", "primary", "whitelist"})
+_AUDIENCE_KEYS = frozenset(
+    {"name", "groups", "targets", "primary", "whitelist", "watch", "report"}
+)
 _WHITELIST_KEYS = frozenset({"target", "command"})
 
-# .env 里已经不作数的群白名单变量。留着它不会拦任何人（拦人的是「有没有被群关联
-# 提到」），但会让人以为它还在管权限 —— 往新文件加群时才发现它根本没拦。
-_LEGACY_GROUP_VARS = ("MC_ALLOWED_GROUPS",)
+# .env 里已经不作数的群相关变量：变量名 -> 它搬到哪去了。
+# 后半句会**直接拼进警告**，所以必须写成「照着做就能改对」的**动作**，不能是一句现状
+# 描述 —— MC_WATCH_GROUP / MC_REPORT_GROUP 的修法**不是**改 groups，而是在那条关联上
+# 加一个推送开关。照抄上半句会把人指去改 groups，改完提醒照样不推，而残留警告已经因为
+# 他「看过一次」被忽略掉了。
+_LEGACY_GROUP_VARS: dict[str, str] = {
+    "MC_ALLOWED_GROUPS": "群范围改由 mcs_audiences.toml 的 [[audience]].groups 决定",
+    "MC_WATCH_GROUP": "改成给那条 [[audience]] 加 watch = true",
+    "MC_REPORT_GROUP": "改成给那条 [[audience]] 加 report = true",
+}
 
 _GROUPS_EXAMPLE = "groups = [123456]（整数或字符串都行，逗号分隔写多个）"
 
@@ -67,9 +84,21 @@ class Audience:
     groups: tuple[str, ...]  # 归一化成字符串，便于和事件的 group_id（int）比对
     book: ServerBook  # 本关联的服务器（全量表的投影，见 ServerBook.scoped）
     warnings: tuple[str, ...] = ()
+    watch: bool = False  # 本条的 groups 收进服提醒
+    report: bool = False  # 本条的 groups 收定时播报
 
     def owns(self, group_id: int | str) -> bool:
         return str(group_id) in self.groups
+
+    @property
+    def flags_summary(self) -> str:
+        """这一条收不收推送。启动日志与 --list-audiences 共用。
+
+        必须显眼：两个开关都没开时，这个群「查询一切正常、却什么都收不到」—— 而它的
+        表现（群里安安静静）和「机器人挂了」长得一模一样，看群里是分不出来的。
+        """
+        on = [n for n, v in (("进服提醒", self.watch), ("定时播报", self.report)) if v]
+        return "、".join(on) if on else "不推送（watch / report 都没开）"
 
     @property
     def whitelist_summary(self) -> str:
@@ -111,6 +140,23 @@ class McConfig:
         """配置里提到过的全部群号。用于「这个群没开通」的日志里说明有哪些群开着。"""
         return tuple(g for a in self.audiences for g in a.groups)
 
+    def flag_targets(self, flag: str) -> tuple[ServerTarget, ...]:
+        """开了某个推送开关（"watch" / "report"）的关联覆盖到的**全部目标**，去重保序。
+
+        耗时就该按它算：进服提醒一轮真正探的就是这些目标（探测是并发的，所以上界取
+        max 而不是求和）。按全量表算会多算进只被别的关联引用的服 —— 那台服超时写得大
+        一点，就会有**一条与轮询无关的告警永远顶着**，而告警被无视之后真超了也看不出来。
+
+        bot 的启动日志与 tools/mc_check.py 的 --list-targets 都用这个函数：两处各算
+        一遍一定会漂，而它们本来就该说同一个数。
+        """
+        seen: dict[str, ServerTarget] = {}
+        for audience in self.audiences:
+            if getattr(audience, flag):
+                for target in audience.book.targets:
+                    seen.setdefault(target.id, target)
+        return tuple(seen.values())
+
 
 def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
     """解析 mcs_audiences.toml 的**文本**，对着全量表 book 校验。
@@ -138,6 +184,9 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
     # 群号 → 已占用它的关联名。跨条重复是硬错误：同一个群落在两条关联里，
     # 「这个群查询该看哪几台」就说不清了。
     owner_of: dict[str, str] = {}
+    # 已经用过的关联名。重名会让日志和 --list-audiences 里「群关联「X」」指代两条不同的
+    # 东西，看日志的人无从判断说的是哪条 —— 而日志正是本项目指定的第一排查入口。
+    name_seen: set[str] = set()
 
     for index, raw in enumerate(raw_list, start=1):
         where = f"第 {index} 条 [[audience]]"
@@ -146,7 +195,17 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
         _reject_unknown(raw, _AUDIENCE_KEYS, where)
 
         name = _as_text(raw.get("name", ""), f"{where}.name", allow_empty=False)
+        if name in name_seen:
+            raise ServerConfigError(
+                f"{where} 的名字「{name}」和前面某条重复了；关联名是日志和诊断里指代"
+                f"这条关联的唯一标识，重名之后看日志分不清说的是哪条"
+            )
+        name_seen.add(name)
         where = f"群关联「{name}」"
+
+        # 推送开关。缺省 false —— 见模块 docstring：查询是群友拉，推送是机器人自己说话。
+        watch = _as_bool(raw.get("watch", False), f"{where}.watch")
+        report = _as_bool(raw.get("report", False), f"{where}.report")
 
         groups_raw = raw.get("groups")
         if groups_raw is None:
@@ -222,7 +281,7 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
                 )
 
         warnings = _audience_warnings(
-            name, ids, whitelist_raw, whitelist_target, book
+            name, ids, whitelist_raw, whitelist_target, book, watch=watch, report=report
         )
         audiences.append(
             Audience(
@@ -237,6 +296,8 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
                     whitelist_command=whitelist_command,
                 ),
                 warnings=tuple(warnings),
+                watch=watch,
+                report=report,
             )
         )
 
@@ -249,6 +310,9 @@ def _audience_warnings(
     whitelist_raw: object,
     whitelist_target: str,
     book: ServerBook,
+    *,
+    watch: bool = False,
+    report: bool = False,
 ) -> list[str]:
     """只属于某条关联的警告。
 
@@ -261,6 +325,15 @@ def _audience_warnings(
         warnings.append(
             f"「{name}」没关联任何服务器 —— 该群查询会回「本群关联的服务器还没接入」"
         )
+        # 开了推送却没有服可盯：警告而不是报错。它不是「被忽略的配置键」—— 我们读懂了
+        # 它，并且明确说出它为什么没有输出；而硬报错会让整台 bot 起不来，代价与收益
+        # 不成比例。targets 填好之后开关自动生效，不用再改配置。
+        on = "、".join(n for n, v in (("watch", watch), ("report", report)) if v)
+        if on:
+            warnings.append(
+                f"「{name}」写了 {on} 但本条没关联任何服务器 —— 推送对它不会有任何输出；"
+                f"targets 填好之后自动生效，不用改这个开关"
+            )
     if whitelist_target:
         owner = book.get(whitelist_target)
         # 上面已校验过它一定在 ids 里，所以 owner 不会是 None
@@ -291,11 +364,15 @@ def _cross_warnings(book: ServerBook, audiences: tuple[Audience, ...]) -> tuple[
                 f"把它加进某条 [[audience]] 的 targets 才有人能用"
             )
 
-    legacy = [v for v in _LEGACY_GROUP_VARS if os.environ.get(v, "").strip()]
+    legacy = [
+        f"{var}（{hint}）"
+        for var, hint in _LEGACY_GROUP_VARS.items()
+        if os.environ.get(var, "").strip()
+    ]
     if legacy:
         warnings.append(
-            f".env 里的 {'、'.join(legacy)} 已不再生效（群范围改由 mcs_audiences.toml 决定），"
-            f"请删掉这行 —— 留着它会让人以为它还在拦人"
+            f".env 里的 {'、'.join(legacy)} 已不再生效，请删掉这几行 —— "
+            f"留着会让人以为它还在管，而它已经什么都不管了"
         )
 
     return tuple(warnings)

@@ -1,16 +1,25 @@
 """MC 消息渲染：纯文本拼装，**不 import nonebot、不 import mcs/**。
 
-`@查询`（mcs/mc_stats.py）与进服提醒/定时播报（mcs/mc_reporter.py）共用同一份格式，
+`@查询`（mcs/mc_stats.py）、进服提醒与定时播报（mcs/mc_reporter.py）共用同一份格式，
 所以它必须住在这里，而不是任一调用方里 —— 否则「总览」和「播报」的排版会各自漂移，
 同一个服在两个地方显示成两种样子。
 
+**这三处确实是同一个渲染层**：`render_summary` 与 `render_report` 共用 `_summary_block`
+（同一台服在两处逐字一样），进服提醒也复用 `_JOIN_TEMPLATES`。以前播报是 mc_reporter
+自己拼的，两套排版各写各的；P7 把它接了过来。
+
 不许 import nonebot 是硬约束：tools/mc_check.py 直接 import 这个模块做离线自测，
 那条路必须在 nonebot.init() 之前就能走通。长度上限因此来自 textlen.py 而不是 push.py。
+**这条约束有个直接后果**：渲染层打不了日志，所以「被截断了」这类必须让人知道的事
+只能**返回给调用方**去说（见 format_events 的第二个返回值）。
 """
-from collections.abc import Sequence
+import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from .mc import SLP_UNPARSEABLE, McSnapshot
+from .mcdelta import KIND_JOIN, KIND_LEAVE, KIND_SWITCH, PlayerEvent, StatusEvent
 from .mcservers import ServerTarget
 from .textlen import MAX_LEN, truncate
 
@@ -212,6 +221,29 @@ def _assemble(rows: Sequence[Row], budget: int, all_targets: Sequence[ServerTarg
     return "\n".join(lines)
 
 
+def _fit(build: Callable[[int], str], budget: int) -> str:
+    """按额度渲染；超长就**逐行减少每个目标的名额**重渲染，而不是从头截断。
+
+    从头截断切掉的是尾部 = 最后几台服 + 尾注，切完消息看着完全正常，只是悄悄少了
+    「这些数对不上」那句 —— 而这句恰恰是这类消息里最该看到的。
+
+    一次只减 1 是刻意的：按「一行大约多少字」去估算会大幅过冲（名字长短差很多，
+    实测过一版估算式，10 个名额被一步打到 0，结果是**超长时一个人名都不显示**）。
+    渲染只是拼字符串，多试几次不值钱，换来的是「能显示多少就显示多少」。
+
+    总览与播报的表头和块间距都不一样，但这段循环一模一样，所以只有这一份 ——
+    复制一份的后果是两边迟早只在一边修，而「超长时丢掉尾注」这种毛病在正常长度下
+    根本看不见。
+    """
+    while budget > 0:
+        text = build(budget)
+        if len(text) <= MAX_LEN:
+            return text
+        budget -= 1
+    # 名额清零还是超长（目标极多）才认输截断，此时尾注也只能让位给服名
+    return truncate(build(0))
+
+
 def render_summary(
     rows: Sequence[Row], *, total_names: int, all_targets: Sequence[ServerTarget]
 ) -> str:
@@ -223,19 +255,234 @@ def render_summary(
     """
     if not rows:
         return NO_TARGETS
+    return _fit(
+        lambda budget: _assemble(rows, budget, all_targets),
+        name_budget(total_names, len(rows)),
+    )
 
-    budget = name_budget(total_names, len(rows))
-    # 先按额度渲染；超长就**逐行减少每个目标的名额**重渲染，而不是从头截断。
-    # 从头截断切掉的是尾部 = 最后几台服 + 尾注，切完消息看着完全正常，
-    # 只是悄悄少了「这些数对不上」那句 —— 而这句恰恰是总览里最该看到的。
-    #
-    # 一次只减 1 是刻意的：按「一行大约多少字」去估算会大幅过冲（名字长短差很多，
-    # 实测过一版估算式，10 个名额被一步打到 0，结果是**超长时一个人名都不显示**）。
-    # 渲染只是拼字符串，多试几次不值钱，换来的是「能显示多少就显示多少」。
-    while budget > 0:
-        text = _assemble(rows, budget, all_targets)
-        if len(text) <= MAX_LEN:
-            return text
-        budget -= 1
-    # 名额清零还是超长（目标极多）才认输截断，此时尾注也只能让位给服名
-    return truncate(_assemble(rows, 0, all_targets))
+
+def render_report(
+    rows: Sequence[Row],
+    *,
+    total_names: int,
+    all_targets: Sequence[ServerTarget],
+    audience_name: str = "",
+    now: datetime | None = None,
+) -> tuple[str | None, str]:
+    """定时播报（一条群关联一个周期一条）。返回 `(文案, 跳过原因)`。
+
+    文案为 None = 本次不发，第二个元素是给日志用的**原因**。跳过只有两种，且
+    **原因必须分开说**：全都连不上 → 去开服；确实没人在线 → 什么都不用做。
+    混成一句「当前无人在线」会把前一种的人指去查错方向（沿用 mc_reporter 原有契约）。
+
+    **「某一台没人 / 某一台不可达」不再是跳过理由** —— 它只是 _summary_block 已经能
+    渲染的一行。单目标时代那条「0 人 → 整条不发」在多目标下必须拆掉：3 台服的播报里
+    有 1 台没人，不代表这次播报没意义。真正没信息量的只剩「全是😵」。
+
+    判定「有没有人」用的是 `any(count)` 而**不是** `_counting()` 的求和：代理的 count
+    是全群组总人数且被 _counting 排除在外，只挂一台代理的关联会被求和误判成
+    「无人在线」—— 可明明有人。
+    """
+    where = f"「{audience_name}」关联的" if audience_name else "本群关联的"
+    if not rows:
+        # 正常配置走不到这里（report 关联的 targets 为空时加载期就有警告、循环也不会
+        # 收它进 watched）。留着是与 render_summary 的契约对齐，也防将来别处调它。
+        return None, "本群没有关联任何服务器，本次跳过"
+    reachable = [r for r in rows if r.snap.reachable]
+    if not reachable:
+        return None, f"{where} {len(rows)} 台服全部探测失败，本次跳过"
+    if not any(r.snap.count for r in reachable):
+        return None, f"{where} {len(rows)} 台服现在都没人在线，本次跳过"
+    return (
+        _fit(
+            lambda budget: _assemble_report(rows, budget, all_targets, now),
+            name_budget(total_names, len(rows)),
+        ),
+        "",
+    )
+
+
+def _assemble_report(
+    rows: Sequence[Row],
+    budget: int,
+    all_targets: Sequence[ServerTarget],
+    now: datetime | None,
+) -> str:
+    counted = _counting(rows)
+    if counted:
+        head = f"现在有 {sum(r.snap.count for r in counted)} 位小伙伴在线（{len(counted)} 台服）"
+    else:
+        # 本条关联里只有代理（它的人数不能与分服相加，见 _counting），没有可报的合计
+        # 数字。写「0 位小伙伴在线」会是**假话** —— 代理块里明明写着有人在。
+        head = "现在的在线情况"
+
+    lines = [f"📣 MC 播报 · {(now or datetime.now()):%H:%M}", "━━━━━━━━━━", head, ""]
+    for row in rows:
+        # 块之间不留空行（总览留）：播报常常是连续几台「在线 N 人」的一行块，
+        # 逐个空行会把它拉成一屏，而这几行本该一眼扫完。
+        lines.extend(_summary_block(row, budget))
+    lines.append("")
+    lines.append("想一起玩的，直接进服找他们～")
+
+    note = _footnote(rows, all_targets)
+    if note:
+        # 代理总数与子服之和对不上，在播报里比在总览里更该看到（播报是主动推的，
+        # 群里的人没有别的渠道去对账）
+        lines.append("")
+        lines.append(note)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 进服提醒
+
+# 一轮内进服人数达到这个数就合并成一条，避免刷屏
+_BURST = 3
+
+# **进服那一行只有这一份模板**，单事件与合成排版都从它来。
+# 拆成「有服名」和「无服名」两套的后果是两边迟早只改一边，同一个动作在
+# 群里两种说法。
+#
+# {where} 展开成「 Bingo」或空串（空串时服名已经写在【】块头里）——
+# 因为它在句子中间，用「拼完再删掉服名」那种做法会留下多余空格。
+_JOIN_TEMPLATES = [
+    "🎮 {who} 加入了{where}（当前 {count} 人在线）",
+    "🚪 {who} 溜进了{where}（当前 {count} 人在线）",
+    "⛏️ {who} 上线了{where}（当前 {count} 人在线）",
+    "🌍 {who} 出现在了{where}（当前 {count} 人在线）",
+]
+
+
+def _who(names: Sequence[str]) -> str:
+    """一批进服玩家的称呼。1 人直呼其名、≤3 人顿号连接、再多就只报前两个 + 总数。"""
+    if len(names) == 1:
+        return names[0]
+    if len(names) <= _BURST:
+        return "、".join(names)
+    return f"{names[0]}、{names[1]} 等 {len(names)} 人"
+
+
+def _join_line(who: str, count: int, server_name: str = "") -> str:
+    """进服那一行。server_name 留空 = 服名由【】块头承担（合成排版）。"""
+    return random.choice(_JOIN_TEMPLATES).format(
+        who=who, where=f" {server_name}" if server_name else "", count=count
+    )
+
+
+def format_events(
+    events: Sequence[PlayerEvent | StatusEvent],
+    targets: Sequence[ServerTarget],
+    *,
+    now: datetime | None = None,
+) -> tuple[str | None, bool]:
+    """把一轮（或几轮合并后）的事件拼成**一条**推给一个群的消息。
+
+    返回 `(文案, 是否被截断)`。文案为 None = 什么都不发。第二个返回值是给调用方打
+    日志用的 —— 渲染层不许 import nonebot（见模块 docstring），而「被截断」这件事
+    必须让人知道：切掉的正是最后几台服的事件，消息看着却完全正常。
+
+    **退服不推**（沿用既有产品决策）：leave 事件在对账层（mcdelta）照常产出，
+    在这里被丢掉。哪天要开退服提醒，改的是这里，不是对账层。
+
+    两类排版，规则只有一条：
+
+    > 整条消息只有 1 个事件、且它不是「换服」时，逐字沿用旧文案；
+    > 其余一律走【服名】块 + 两空格缩进行的合成排版。
+
+    这样让 DEPLOY / README 引用的那三句（`🎮 X 加入了 Bingo（当前 3 人在线）`、
+    `⚠️ Bingo 连不上了（已连续 2 轮探测失败）`、`✅ Bingo 已恢复，当前 5 人在线`）
+    一字不改地继续成立，而它们是 99% 的情况 —— 为一个人进服这种最常见的事套一层
+    排版，是拿最常见的情况去迁就最少见的。换服（switch）是本期的全新事物，没有旧
+    文案要保，所以无论几个事件都走合成排版。
+    """
+    shown = [
+        e for e in events if not (isinstance(e, PlayerEvent) and e.kind == KIND_LEAVE)
+    ]
+    if not shown:
+        return None, False
+
+    name_of = {t.id: t.name for t in targets}
+
+    if len(shown) == 1:
+        solo = _solo_text(shown[0], name_of)
+        if solo is not None:
+            return solo, False
+
+    text = _composite(shown, targets, name_of, now)
+    if len(text) > MAX_LEN:
+        return truncate(text), True
+    return text, False
+
+
+def _name_of(target_id: str, name_of: dict[str, str]) -> str:
+    """目标 id → 服名。查不到就直接拿 id 当名字 —— 见 _composite 里那段说明。"""
+    return name_of.get(target_id, target_id)
+
+
+def _solo_text(event: PlayerEvent | StatusEvent, name_of: dict[str, str]) -> str | None:
+    """单个事件时的旧文案。返回 None = 这个事件没有旧文案，得走合成排版。"""
+    name = _name_of(event.target_id, name_of)
+    if isinstance(event, StatusEvent):
+        if event.down:
+            # 「答了但答不对」（多半是刚启动还在加载）和「连不上」分开说：
+            # 一律叫「连不上了」会让人去开服，而它其实正开着。
+            return f"⚠️ {name} {event.why}（已连续 {event.streak} 轮探测失败）"
+        return f"✅ {name} 已恢复，当前 {event.count} 人在线"
+    if event.kind == KIND_JOIN:
+        return _join_line(event.player, event.count, name)
+    return None  # 换服
+
+
+def _composite(
+    events: Sequence[PlayerEvent | StatusEvent],
+    targets: Sequence[ServerTarget],
+    name_of: dict[str, str],
+    now: datetime | None,
+) -> str:
+    buckets: dict[str, list[PlayerEvent | StatusEvent]] = {}
+    for event in events:
+        buckets.setdefault(event.target_id, []).append(event)
+
+    order = {t.id: i for i, t in enumerate(targets)}
+    # 事件落在 targets 之外（调用方传错了目标表）时**不丢**，排在最后、直接拿 id 当服名。
+    # 丢掉的话症状是「某个群少收到一台服的提醒」，而消息本身看着完全正常。
+    ids = sorted(buckets, key=lambda tid: (order.get(tid, len(order)), tid))
+
+    lines = [f"🎮 MC 动态 · {(now or datetime.now()):%H:%M}"]
+    for tid in ids:
+        # 只有出过事件的目标才有块 —— 摆一排「今天没人进服」的空块会把真正的那台埋掉
+        lines.append(f"【{_name_of(tid, name_of)}】")
+        lines.extend(_block_lines(buckets[tid], name_of))
+    return "\n".join(lines)
+
+
+def _block_lines(
+    events: Sequence[PlayerEvent | StatusEvent], name_of: dict[str, str]
+) -> list[str]:
+    """一个【服名】块里的行。行序：换服 → 进服 → 状态跃迁。
+
+    到达类在前（「谁来了」是这条消息存在的理由）。leave 排哪一行无从谈起 ——
+    它在 format_events 入口就被丢掉了，从来不渲染。
+    """
+    lines: list[str] = []
+
+    # 换服每条单独一行（来源可能各不相同），玩家名排序让同一份输入永远同一份输出
+    for event in sorted(
+        (e for e in events if isinstance(e, PlayerEvent) and e.kind == KIND_SWITCH),
+        key=lambda e: e.player,
+    ):
+        origin = _name_of(event.origin_id, name_of)
+        lines.append(f"  🔄 {event.player} 从「{origin}」换服过来（当前 {event.count} 人在线）")
+
+    joins = [e for e in events if isinstance(e, PlayerEvent) and e.kind == KIND_JOIN]
+    if joins:
+        # 人数取**最后一个** join 的：限流窗口把几轮并到一起时，后者才是最新的快照。
+        # 名字排序是为了输出稳定 —— 顺序每轮乱跳的话，同一条消息看着像新的一条。
+        lines.append(f"  {_join_line(_who(sorted(e.player for e in joins)), joins[-1].count)}")
+
+    for event in (e for e in events if isinstance(e, StatusEvent)):
+        if event.down:
+            lines.append(f"  ⚠️ {event.why}（已连续 {event.streak} 轮探测失败）")
+        else:
+            lines.append(f"  ✅ 已恢复（当前 {event.count} 人在线）")
+
+    return lines

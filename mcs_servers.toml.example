@@ -41,6 +41,9 @@
 #   timeout   可选。SLP 探测超时（秒），不写用 [defaults].timeout。**必须小于
 #             MC_WATCH_INTERVAL_SEC，否则病态情况下轮询周期会被拉长**（不会重叠，
 #             只是变慢；启动日志和 --list-targets 都会提示）。
+#             上界是按「开了 watch 的群关联覆盖到的目标」算的（目标之间并发探测，
+#             所以取 max 不求和）：一台只被 watch = false 的关联引用的服，就算超时
+#             调得再大也不会顶出告警来。
 #   rcon_timeout 可选。同上，不写用 [defaults].rcon_timeout。
 #   aliases   可选。群里可以用的别名，方便输入。**注意服名不要和机器人触发词撞词**，
 #             详见文件末尾。

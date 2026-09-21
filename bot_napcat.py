@@ -57,6 +57,22 @@ nb_logger.add(
     filter=_quiet_filter,
     format=default_format,
 )
+# 同时落盘（按天切）。控制台刷过去就没了，而「某轮为什么没推」这类问题只能靠回看
+# 日志 —— DEPLOY.md 里一直写着日志写到 logs/ 下，但那个 sink 早就没了，文档没跟着改。
+# 用同一个 _quiet_filter，所以文件里和屏幕上逐字一致（读文件 = 看屏幕，不用两套判断）。
+# encoding 必须写死 utf-8：本机代码页是 936，不写就用 GBK 落盘，中文全是乱码。
+nb_logger.add(
+    "logs/napcat_bot_{time:YYYY-MM-DD}.log",
+    level=0,
+    encoding="utf-8",
+    rotation="00:00",
+    retention="14 days",
+    enqueue=True,
+    backtrace=False,
+    diagnose=False,
+    filter=_quiet_filter,
+    format=default_format,
+)
 
 driver = nonebot.get_driver()
 driver.register_adapter(Adapter)

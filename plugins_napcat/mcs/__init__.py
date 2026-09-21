@@ -21,25 +21,34 @@ __all__ = ["client", "mc_admin", "mc_reporter", "mc_stats"]
 driver = get_driver()
 
 
-def _log_watch_target(label: str, groups: list[str]) -> None:
-    """进服提醒 / 定时播报**当前盯的是哪台**。
+def _log_push_targets(config, flag: str, label: str) -> None:
+    """进服提醒 / 定时播报**每条关联各盯哪几台**。
 
-    必须明写：它们现在只看一条群关联的主服（P7 之前），而「主服」住在群关联里，
-    很容易和「全量表的第一个目标」混起来 —— 盯错了不会报错，只是悄悄监控了另一台服。
+    必须明写：漏掉一台不会报错，只是那台服的进服提醒永远不出现，而同一个群关联的
+    其它服一切正常 —— 看上去像「那台服没人上」。这是本项目最怕的那类静默失败，
+    所以把「谁推给谁」在启动日志里摊开。
+
+    一条都没开时不报错、只说怎么开：`watch` / `report` 缺省是 false（新加一条关联
+    默认安静），所以「一个都没开」在配置刚加完、还没来得及开开关时是**正常状态**。
     """
-    if not groups:
-        logger.info("MC {}：未配置目标群，未启用", label)
+    opened = [a for a in config.audiences if getattr(a, flag)]
+    if not opened:
+        logger.info(
+            "MC {}：没有任何 [[audience]] 写 {} = true，未启用"
+            "（.env 里的 MC_WATCH_GROUP / MC_REPORT_GROUP 已作废）",
+            label,
+            flag,
+        )
         return
-    target, audience = mc_reporter._primary(groups)
-    if target is None:
-        return  # 原因 _primary 已经打过 error
-    logger.info(
-        "MC {}：盯的是「{}」关联的 {}[{}]（P7 会改成按群关联分别对账）",
-        label,
-        audience,
-        target.name,
-        target.id,
-    )
+    logger.info("MC {}：{} 条群关联开了 {} = true", label, len(opened), flag)
+    for audience in opened:
+        targets = audience.book.targets
+        if not targets:
+            # 加载期已有一条警告（「写了开关但本条没关联任何服务器」），这里不重复说
+            logger.info("  「{}」：没关联任何服务器", audience.name)
+            continue
+        described = "、".join(f"{t.name}[{t.id}]" for t in targets)
+        logger.info("  「{}」→ {} 台：{}", audience.name, len(targets), described)
 
 
 @driver.on_startup
@@ -69,13 +78,16 @@ async def _log_targets() -> None:
     for audience in config.audiences:
         logger.info("  {}", audience.summary())
         logger.info("      {}", audience.whitelist_summary)
+        # 推送开关：两个都没开的关联「查询一切正常、却什么都收不到」，而它的表现
+        # （群里安安静静）和「机器人挂了」一模一样。所以每条都明写一行。
+        logger.info("      推送   {}", audience.flags_summary)
 
     # 触发词（群里打的）与命令前缀（RCON 里发的）是两个不同的轴，代理上线后必然
     # 分叉：群里仍打 `whitelist`，RCON 里要发 `globalwhitelist`。前缀错了的表现是
     # 每次操作都回 Unknown command、群里报「未生效」，所以 whitelist_summary 里写出来了。
 
-    _log_watch_target("进服提醒", mc_reporter._WATCH_GROUPS)
-    _log_watch_target("定时播报", mc_reporter._REPORT_GROUPS)
+    _log_push_targets(config, "watch", "进服提醒")
+    _log_push_targets(config, "report", "定时播报")
 
     # 两层警告都打，但内容不重复：book.warnings 是全量的（端口冲突、某个目标没配
     # rcon 密码），config.warnings 是跨文件的（孤儿目标、.env 残留），
@@ -88,7 +100,14 @@ async def _log_targets() -> None:
         for warning in audience.warnings:
             logger.warning("MC 群关联「{}」：{}", audience.name, warning)
 
-    _, _, budget = round_budget(book)
+    # 预算的**基数**是「开着 watch 的关联覆盖到的目标并集」，不是全量 book。
+    # 全量里完全可能有一台只被 watch = false 的关联引用的服（超时 30s），按它算的
+    # 上界会永远顶着一条与轮询无关的告警 —— 告警被无视之后，真超了也看不出来。
+    #
+    # round_budget 的**模型**没变，也不该变：探测是 asyncio.gather 并发的，所以取
+    # max 正确，与台数无关。没有 watch 关联时是空 book → (0,0,0) → 不打告警，正确。
+    watched_ids = [t.id for t in config.flag_targets("watch")]
+    _, _, budget = round_budget(book.scoped(watched_ids))
     interval = mc_reporter._WATCH_INTERVAL_SEC
     if budget > interval:
         # _watch_loop 是「跑完再补睡剩余时间」，所以超了**不会重叠**，只是周期被
