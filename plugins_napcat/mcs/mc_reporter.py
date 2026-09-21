@@ -5,6 +5,11 @@
 
 只推进服、不推退服（用户选择）。退服的人仍会被基线自然吸收，只是不产生消息。
 
+**当前阶段只看一条群关联**：盯的目标取自「这几个目标群里的第一个群所属的那条
+[[audience]]」的主服（见 _primary）。把监控目标按群分别对账、多目标播报是下一步
+（P7）的事。所以 MC_WATCH_GROUP / MC_REPORT_GROUP 里的群必须在
+mcs_audiences.toml 里有对应的 [[audience]]，否则循环会明确报错并停摆 —— 不静默。
+
 .env 配置：
   MC_WATCH_GROUP=<群号>         进服提醒目标群（逗号分隔多群，留空 = 不启用）
   MC_WATCH_INTERVAL_SEC=10      轮询间隔（秒），决定进服被发现的延迟
@@ -18,15 +23,17 @@ import asyncio
 import os
 import random
 import time
+from collections.abc import Sequence
 from datetime import datetime
 
 from nonebot import get_driver
 from nonebot.log import logger
 
 from .._shared.mc import SLP_UNPARSEABLE, McSnapshot
+from .._shared.mcaudiences import audiences_path, default_config
 from .._shared.push import send_to_groups, truncate
 from .._shared.schedule import seconds_until_slot
-from .._shared.mcservers import ServerConfigError, ServerTarget, default_book
+from .._shared.mcservers import ServerConfigError, ServerTarget
 from .client import _MAX_NAMES, get_snapshot
 
 driver = get_driver()
@@ -70,6 +77,7 @@ _server_down: bool | None = None  # None = 启动后还没探测过
 _last_state: tuple | None = None  # 取数状态，仅用于日志去重
 _pending: list[str] = []  # 限流窗口内攒下的进服事件
 _last_push: float | None = None
+_last_config_error: str | None = None  # 上次打过的配置类错误，仅用于日志去重
 
 
 def _state_key(snap: McSnapshot) -> tuple:
@@ -99,17 +107,47 @@ def _log_state_transition(snap: McSnapshot) -> None:
         logger.warning("MC 服务器探测失败：{}", snap.error or "原因未知")
 
 
-def _primary() -> ServerTarget | None:
-    """进服提醒与定时播报当前看的目标。
+def _log_config_error(text: str) -> None:
+    """配置类错误只在**内容变化**时打日志。
 
-    **当前阶段只看「主服」**（mcs_servers.toml 的 [defaults].primary，不写就是列表
-    第一个）。改成逐目标对账、多目标播报是下一步的事，届时这个函数会被替换掉。
+    _tick 每 MC_WATCH_INTERVAL_SEC（默认 10）秒跑一次，而配置错误会一直持续到人改完
+    重启 —— 每 10 秒刷一条 error 会把日志尾巴冲成噪音，而 DEPLOY 恰恰教人看日志尾巴
+    排查问题。状态跃迁式的日志（_log_state_transition）出于同样的理由。
     """
+    global _last_config_error
+    if text != _last_config_error:
+        _last_config_error = text
+        logger.error("{}", text)
+
+
+def _primary(groups: Sequence[str]) -> tuple[ServerTarget | None, str]:
+    """这批目标群当前盯的目标，以及它属于哪条群关联。返回 `(目标, 关联名)`。
+
+    **当前阶段只看「主服」**：取 groups 里第一个群所属那条关联的主服
+    （[[audience]].primary，不写就是该关联的第一个目标）。改成逐目标对账、
+    多目标播报是 P7 的事，届时这个函数会被替换掉。
+
+    **刻意不留「找不到就用 targets[0]」的回退**：全量表的第一个目标和「该盯哪台」
+    毫无关系，回退过去会静默换一台服去监控，而启动日志用的是同一个函数、会跟着
+    一起错 —— 看日志也发现不了。原来读的是 mcs_servers.toml 的 [defaults].primary，
+    那个键已经搬进群关联，所以现在只能按群找。
+    """
+    if not groups:
+        return None, ""
     try:
-        return default_book().primary_target
+        config = default_config()
     except ServerConfigError as exc:
-        logger.error("读取 mcs_servers.toml 失败：{}", exc)
-        return None
+        _log_config_error(f"读取 MC 配置失败，MC 播报相关功能停摆：{exc}")
+        return None, ""
+    audience = config.for_group(groups[0])
+    if audience is None:
+        _log_config_error(
+            f"MC_WATCH_GROUP / MC_REPORT_GROUP 里的群 {groups[0]} 没有对应的群关联，"
+            f"进服提醒与定时播报停摆 —— 先把这个群写进 {audiences_path()} 的某条 "
+            f"[[audience]].groups"
+        )
+        return None, ""
+    return audience.book.primary_target, audience.name
 
 
 def _format_joins(names: list[str], count: int, server_name: str) -> str:
@@ -129,9 +167,9 @@ def _format_joins(names: list[str], count: int, server_name: str) -> str:
 async def _tick() -> None:
     global _known, _initialized, _fail_streak, _server_down, _pending, _last_push
 
-    target = _primary()
+    target, _ = _primary(_WATCH_GROUPS)
     if target is None:
-        return  # 配置读不了，_primary 已经打过日志；下一轮再试
+        return  # 配置读不了 / 群没开通，_primary 已经打过日志；下一轮再试
 
     snap = await get_snapshot(target, max_age=0)
     _log_state_transition(snap)
@@ -222,18 +260,25 @@ async def _watch_loop() -> None:
 
 # ---------------------------------------------------------------- 定时播报
 
-async def _build_report_message() -> str | None:
-    """生成播报文案。服务器不可达或无人在线时返回 None（静默跳过，与 oopz 一致）。"""
-    target = _primary()
+async def _build_report_message() -> tuple[str | None, str]:
+    """生成播报文案，外加一句「为什么跳过」的原因（给日志用）。
+
+    返回 `(None, 原因)` 表示本次不发。三种跳过各有各的原因，**必须分开说**：
+    群没开通 → 去改配置；服务器不可达 → 去开服；确实没人 → 什么都不用做。
+    原来的调用方一律打成「当前无人在线」，前两种情况下会把人指去查错方向。
+    """
+    target, audience_name = _primary(_REPORT_GROUPS)
     if target is None:
-        return None
+        # 具体原因 _primary 已经打过日志了（配置读不了 / 这个群没开通）
+        return None, "目标不可用（原因见上面那条错误）"
 
     snap = await get_snapshot(target, max_age=0)
     if not snap.reachable:
-        logger.info("MC 定时播报：{} 不可达，本次跳过", target.name)
-        return None
+        return None, f"{target.name} 不可达，本次跳过"
     if snap.count == 0:
-        return None
+        # 这里**不区分**「本群没关联服务器」：那属于 _primary 那一层的失败，
+        # 走不到这里（没关联任何服务器时 primary_target 是 None）。
+        return None, f"「{audience_name}」关联的 {target.name} 当前无人在线，本次跳过"
 
     head = f"现在有 {snap.count} 位小伙伴在线"
     if snap.max_players:
@@ -251,7 +296,7 @@ async def _build_report_message() -> str | None:
     else:
         lines.append("（未能取到名单）")
     lines.append("\n想一起玩的，直接进服找他们～")
-    return truncate("\n".join(lines))
+    return truncate("\n".join(lines)), ""
 
 
 async def _report_loop() -> None:
@@ -265,9 +310,9 @@ async def _report_loop() -> None:
             delay = seconds_until_slot(_REPORT_INTERVAL_MIN)
             if delay:
                 await asyncio.sleep(delay)
-            msg = await _build_report_message()
+            msg, why = await _build_report_message()
             if msg is None:
-                logger.info("MC 定时播报：当前无人在线，本次跳过")
+                logger.info("MC 定时播报：{}", why)
             else:
                 await send_to_groups(_REPORT_GROUPS, msg)
                 logger.info("MC 定时播报已推送到 {} 个群", len(_REPORT_GROUPS))

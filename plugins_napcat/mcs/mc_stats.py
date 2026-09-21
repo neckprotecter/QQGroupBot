@@ -1,11 +1,13 @@
 """@mc 查询（NapCat / OneBot v11 版）：群内 @机器人发含触发词的消息 → 回复 MC 服务器在线快照。
 
 两种用法：
-    @机器人 mc            → 所有目标的**总览**（每个目标一小段名单）
+    @机器人 mc            → 本群关联的服务器的**总览**（每个目标一小段名单）
     @机器人 mc bingo      → 该目标的**明细**
 
+「本群看哪几台服」由 mcs_audiences.toml 决定（每条 [[audience]] 是一个群关联），
+「有哪些服」由 mcs_servers.toml 决定。查不到这个群 → 明确回绝，不静默。
+目标定义与名字解析见 _shared/mcservers.py，群关联见 _shared/mcaudiences.py。
 快照取数与缓存见 mcs/client.py，取数细节见 _shared/mc.py。
-目标定义在 mcs_servers.toml，解析见 _shared/mcservers.py。
 文案拼装在 _shared/mcrender.py（与进服提醒/定时播报共用同一份格式）。
 触发词归属与载荷切分见 _shared/triggers.py（与 oopz 查询互斥，不会同时回两条）。
 """
@@ -13,16 +15,12 @@ from nonebot import on_message
 from nonebot.log import logger
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 
-from .._shared import whitelist
-from .._shared.mcrender import Row, render_detail, render_summary
+from .._shared.mcaudiences import audiences_path, default_config
+from .._shared.mcrender import NO_AUDIENCE, NO_TARGETS, Row, render_detail, render_summary
+from .._shared.mcservers import ServerConfigError
 from .._shared.push import text_message
-from .._shared.mcservers import ServerConfigError, default_book
 from .._shared.triggers import locate, primary_keyword, strip_keyword
 from .client import _MAX_NAMES, get_snapshot, get_snapshots
-
-# MC 查询的群白名单回退链：MC_ALLOWED_GROUPS 留空时用 NAPCAT_ALLOWED_GROUPS。
-# 不直接只认 NAPCAT_ALLOWED_GROUPS——那样会变成「想让 MC 能查，就必须让 oopz 也能查」。
-_ALLOWED_GROUPS_VARS = ("MC_ALLOWED_GROUPS", "NAPCAT_ALLOWED_GROUPS")
 
 stat = on_message(priority=1, block=False)
 
@@ -47,13 +45,10 @@ async def handle_stat(bot: Bot, event: MessageEvent):
         return  # 只响应群内 @，私聊不管
     if not event.to_me:
         return  # 必须 @ 机器人才触发
-    # 群白名单：不在名单内的群不响应查询（被拦下时会打一条 warning，便于排查）
-    if not whitelist.allowed(group_id, "mc", *_ALLOWED_GROUPS_VARS):
-        return
     text = event.get_plaintext().strip()
     hit = locate(text)
     if hit is None or hit.plugin != "mc":
-        return  # 触发词归属见 _shared/triggers.py
+        return  # 触发词归属见 _shared/triggers.py；不归我的消息本插件全程不发声
 
     # 触发词之后的都算载荷：`@bot mc bingo` → `bingo`。空载荷 = 看总览。
     # 触发词本身被剥掉（该插件的**全部**触发词，见 strip_keyword），
@@ -65,14 +60,41 @@ async def handle_stat(bot: Bot, event: MessageEvent):
     # —— 从这里起本插件已独占这条消息，每个分支都必须回复 ——
     # 与 mcs/mc_admin.py 同一条约束：默默 return 会让群里彻底没反应，
     # 比加这个功能之前还糟（那时至少还能收到 hello 的功能引导）。
+    #
+    # 闸门顺序很关键：**先认领（locate），再查这个群有没有开通**。旧版是反过来的
+    # （先查群白名单，不在名单里就静默 return），那时还没确定这条消息是不是自己的，
+    # 所以只能闭嘴。归属定下来之后就不许再静默了。
+    # 代价：没开通的群里，任何含 mc / 我的世界 / **服务器** 的 @ 消息都会收到 MC 的
+    # 拒绝文案，hello 的功能引导被抑制 —— 所以拒绝文案末尾附了指路那句。
     try:
-        book = default_book()
+        config = default_config()
     except ServerConfigError as exc:
-        logger.error("读取 mcs_servers.toml 失败：{}", exc)
+        logger.error("读取 MC 配置失败：{}", exc)
         await _reply(bot, group_id, f"⚠️ 服务器配置读不了：{exc}")
         return
+
+    audience = config.for_group(group_id)
+    if audience is None:
+        # 「这个群没写进 mcs_audiences.toml」和「机器人掉线了」在群里长得一模一样
+        # （都是没有反应），而这两种的修法完全不同 —— 所以必须打这条 warning。
+        # 旧版这里打的是 _shared/whitelist.py 的「不在白名单内」，DEPLOY 的 F10 整节
+        # 就是教用户 grep 它，所以这条要带同样多的信息。
+        logger.warning(
+            "群 {} 收到 mc 查询，但它没开通：不在 {} 的任何 [[audience]].groups 里。"
+            "已开通的群：{}",
+            group_id,
+            audiences_path(),
+            "、".join(config.known_groups) or "（一个都没有）",
+        )
+        await _reply(bot, group_id, NO_AUDIENCE)
+        return
+
+    # 本群关联的服务器视图：只有这几台，所以关联外的服名 resolve 不出结果。
+    book = audience.book
     if not book.targets:
-        await _reply(bot, group_id, "⚠️ mcs_servers.toml 里没有配置任何目标。")
+        # 得排在解析载荷**之前**：没有目标时「没有叫 X 的服。可选：」会拼出空候选，
+        # 而那个群真正的情况是「本群关联的服务器还没接入」。
+        await _reply(bot, group_id, NO_TARGETS)
         return
 
     if payload:
@@ -101,10 +123,16 @@ async def handle_stat(bot: Bot, event: MessageEvent):
         await _reply(bot, group_id, render_detail(snap, target, max_names=_MAX_NAMES))
         return
 
-    # 总览：并发取全部目标。max_age 用默认的缓存 TTL —— 群里连点两下不该打两遍
-    # SLP+RCON（MC 服务端会为每次探测留日志）。
-    # 顺序用 targets_primary_first：[defaults].primary 那台排最前，其余按配置顺序。
+    # 总览：并发取本群关联的全部目标。max_age 用默认的缓存 TTL —— 群里连点两下不该
+    # 打两遍 SLP+RCON（MC 服务端会为每次探测留日志）。
+    # 顺序用 targets_primary_first：[[audience]].primary 那台排最前，其余按配置顺序。
     ordered = book.targets_primary_first
     snaps = await get_snapshots(ordered)
     rows = [Row(target=t, snap=s) for t, s in zip(ordered, snaps)]
-    await _reply(bot, group_id, render_summary(rows, total_names=_MAX_NAMES))
+    # all_targets 传**全量**表（不是本群的视图）：代理尾注要拿它判断「本群是否关联到了
+    # 该代理同组的全部子服」，详见 mcrender._group_complete。
+    await _reply(
+        bot,
+        group_id,
+        render_summary(rows, total_names=_MAX_NAMES, all_targets=config.book.targets),
+    )

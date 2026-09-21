@@ -15,12 +15,16 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 |--------|------|
 | `@机器人 你好` | 「收到！被动回复链路已打通 🎉」——链路自检 |
 | `@机器人 oopz` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
-| `@机器人 mc [服名]` | 🗺️ Minecraft 在线人数 + 玩家名单。**不带服名 = 全部服的总览**（每个服一小段名单）；带服名 = 该服明细，服名支持 id / 名字 / 别名 / 唯一前缀，认不出或有歧义都会明确回复 |
-| `@机器人 whitelist add/remove <玩家名>`<br>`@机器人 whitelist list` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且 `mcs_servers.toml` 的 `[whitelist]` 要指到一台配了 RCON 的服） |
+| `@机器人 mc [服名]` | 🗺️ Minecraft 在线人数 + 玩家名单。**不带服名 = 本群关联的服的总览**（每个服一小段名单）；带服名 = 该服明细，服名支持 id / 名字 / 别名 / 唯一前缀，认不出或有歧义都会明确回复 |
+| `@机器人 whitelist add/remove <玩家名>`<br>`@机器人 whitelist list` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且本群那条群关联的 `whitelist` 要指到一台配了 RCON 的服） |
 
 > 触发词可改：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（逗号分隔，不区分大小写）。一条消息只会被一个插件响应。
 >
-> MC 服务器的地址、显示名、RCON 密码在 **`mcs_servers.toml`**（不在 `.env`），见 [DEPLOY.md 4.1](DEPLOY.md)。
+> MC 服务器的地址、显示名、RCON 密码在 **`mcs_servers.toml`**；**哪个 QQ 群看哪几台服**
+> 在 **`mcs_audiences.toml`**（两份都不在 `.env`），见 [DEPLOY.md 4.1 / 4.2](DEPLOY.md)。
+>
+> **MC 功能是按群开通的**：群号被写进某条 `[[audience]].groups` 才算开通，没被提到
+> 就不开通（群里会明确回一句，不是静默）。关联外的服名在那个群里查不到 —— 这是刻意的隔离。
 
 **自动功能（NapCat 版，配置见 `.env`）**
 
@@ -50,7 +54,9 @@ oopz-bot/
 ├── .env                      # 凭证 + 行为类开关（勿提交公开仓库）
 ├── .env.example              # 配置模板 → 复制为 .env
 ├── mcs_servers.toml          # MC 服务器清单（含各服 RCON 密码，勿提交公开仓库）
-├── mcs_servers.toml.example  # 清单模板 → 复制为 mcs_servers.toml
+├── mcs_servers.toml.example  # 服务器清单模板 → 复制为 mcs_servers.toml
+├── mcs_audiences.toml        # MC 群关联（哪个群看哪几台；不含密码，但含真实群号）
+├── mcs_audiences.toml.example # 群关联模板 → 复制为 mcs_audiences.toml
 ├── bot.py                    # 启动入口①：QQ 官方版（被动响应）
 ├── bot_napcat.py             # 启动入口②：NapCat/OneBot 版（可主动推送）
 ├── requirements.txt          # Python 依赖清单
@@ -58,7 +64,7 @@ oopz-bot/
 ├── tools/
 │   ├── oopz_login.py         # 手机号+密码 → 写入 OOPZ_* 凭据
 │   ├── oopz_check.py         # 独立验证 oopz 查询链路
-│   └── mc_check.py           # 独立验证 MC 取数链路（`--list-targets` 看配置 / `--target` 测单台 / `--self-test` 离线自测）
+│   └── mc_check.py           # 独立验证 MC 取数链路（`--list-targets` 看服务器 / `--list-audiences` 看群关联 / `--target` 测单台 / `--self-test` 离线自测）
 ├── plugins/                  # QQ 官方版插件（bot.py 加载）
 │   ├── hello.py              # @你好 → 链路自检
 │   └── oopz_stats.py         # @oopz → 实时成员报告
@@ -75,7 +81,8 @@ oopz-bot/
 │   │   └── mc_reporter.py    #   进服提醒 + 定时播报
 │   └── _shared/              # 跨插件共享工具（下划线前缀 → 不会被当插件加载）
 │       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + list/白名单输出解析
-│       ├── mcservers.py      #   服务器清单（mcs_servers.toml 解析 / 校验 / 服名解析）
+│       ├── mcservers.py      #   服务器清单（mcs_servers.toml 解析 / 校验 / 服名解析 / 投影）
+│       ├── mcaudiences.py    #   群关联（mcs_audiences.toml 解析 / 「这个群看哪几台」/ 唯一加载入口）
 │       ├── mcrender.py       #   MC 消息文案（明细 / 总览 / 播报，查询与播报共用同一份）
 │       ├── textlen.py        #   长度上限与截断（零依赖，供渲染层用）
 │       ├── mcadmin.py        #   MC 玩家白名单命令层（解析 / 执行 / 独立验证）
@@ -83,7 +90,7 @@ oopz-bot/
 │       ├── push.py           #   群消息推送 + 长度上限
 │       ├── schedule.py       #   整点对齐时间槽
 │       ├── triggers.py       #   触发词归属（决定消息归哪个插件响应）
-│       └── whitelist.py      #   群白名单（被拦下时打 warning，避免静默失效）
+│       └── whitelist.py      #   群白名单（**现在只有 oopz 在用**；被拦下时打 warning）
 ├── DEPLOY.md                 # 从零部署指南
 └── docs/
     └── chat.md               # 完整技术文档与踩坑记录
@@ -129,16 +136,21 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 先按 [DEPLOY.md 第 4.1 节](DEPLOY.md#41-minecraft-服务端准备rcon) 在 MC 服务端打开 RCON（**别漏 `broadcast-rcon-to-ops=false`**），再跑：
 
 ```powershell
-.venv\Scripts\python.exe tools\mc_check.py                     # 实测全部目标（并发）
+.venv\Scripts\python.exe tools\mc_check.py                     # 实测所选群关联的全部目标（并发）
 .venv\Scripts\python.exe tools\mc_check.py --target bingo      # 只测一台
+.venv\Scripts\python.exe tools\mc_check.py --audience 社团群    # 换一条群关联的视角
+.venv\Scripts\python.exe tools\mc_check.py --list-targets      # 只读：服务器清单 + 被哪些群关联
+.venv\Scripts\python.exe tools\mc_check.py --list-audiences    # 只读：每条群关联覆盖哪些群、哪几台服
 .venv\Scripts\python.exe tools\mc_check.py --self-test         # 只跑解析自测，不联网
 .venv\Scripts\python.exe tools\mc_check.py --whitelist         # 只读地看一眼服务端白名单
 ```
 
 每个目标一个块，块头就是结论；末尾汇总 `N/M 个目标正常`，**有目标不正常时退出码为 1**。
 看到 `[OK] … 名单完整` 即成功。不完整时脚本会打印 RCON `list` 的**原始输出**和判定原因。
-`--target` 的服名走和群里同一套解析（id / 名字 / 别名 / 唯一前缀），写错了会明确报错而不是
-悄悄测全部。
+
+`--target` 的服名走和群里同一套解析（id / 名字 / 别名 / 唯一前缀）**且限定在所选群关联内**
+（默认第一条），写错了会明确报错而不是悄悄测全部。不带 `--audience` 时报的服务器集合
+就是第一条关联里的那几台 —— 这跟群友看到的是同一个集合。
 
 **6. 启动机器人（QQ 官方版）**
 
@@ -162,8 +174,41 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 
 在 QQ 群 @ 机器人发送 `oopz`、`mc` 或 `你好` 即可。仅响应群内 @，私聊不回复。
 
-> NapCat 版默认**所有群**都能触发查询；想限定群，在 `.env` 设 `NAPCAT_ALLOWED_GROUPS`（逗号分隔群号，留空 = 不限制）。MC 查询用 `MC_ALLOWED_GROUPS`，留空时回退到 `NAPCAT_ALLOWED_GROUPS`。
+> NapCat 版默认**所有群**都能触发 **oopz** 查询；想限定群，在 `.env` 设 `NAPCAT_ALLOWED_GROUPS`（逗号分隔群号，留空 = 不限制）。
+> **MC 查询不看这个变量**：它由 `mcs_audiences.toml` 的群关联决定（见下），一个群被哪条
+> `[[audience]]` 提到才开通。`MC_ALLOWED_GROUPS` 是这套机制之前的做法，**已作废**。
 > 官方版对应 `QQ_ALLOWED_GROUPS`（group_openid 列表），且**不支持 MC 功能**（无主动推送能力，自动功能都做不了）。
+
+### 让一个群用上 MC 功能
+
+MC 功能是**按群开通**的。群号写进 `mcs_audiences.toml` 的某条 `[[audience]].groups` 才算
+开通，没被提到就不开通 —— 群里会明确回一句「🤔 本群还没有开通 MC 查询」，不是静默。
+
+```toml
+# mcs_audiences.toml：社团群看自己的三台服，默认先看 gtnh
+[[audience]]
+name      = "社团群"
+groups    = [123456789]
+targets   = ["gtnh", "bingo", "backstabbed"]      # 顺序 = @查询 总览里的展示顺序
+primary   = "gtnh"                                # 不带服名的 @查询 默认看它
+whitelist = { target = "bingo", command = "whitelist" }
+
+[[audience]]
+name      = "建筑群"                               # 组服还没搭，先占位
+groups    = [987654321]
+targets   = []                                    # 合法：那个群的查询会回「还没接入」
+```
+
+> ⚠️ **一个群只能出现在一条 `[[audience]]` 里**（写进两条会直接报错）。想让几个群看
+> 同样的服，就把群号都写在同一条的 `groups` 里。
+>
+> ⚠️ **关联外的服名在那个群里查不到**，这是刻意的隔离：每条的服务器视图是独立投影的。
+> 反过来「新加的服忘了关联给任何群」很常见 —— 那时群里打它回「没这个服」，而
+> `--list-targets` 和启动日志都会照常列出它，所以两者都会专门把它标成 ⚠️ 孤儿。
+>
+> 这份文件**不含密码**（RCON 密码在 `mcs_servers.toml`），所以可以单独给人看 ——
+> 但含真实 QQ 群号，同样不该提交。改完要**重启 bot**，然后跑
+> `tools/mc_check.py --list-audiences` 确认。细节见 [DEPLOY.md 4.2](DEPLOY.md)。
 
 ### 管理 MC 玩家白名单
 
@@ -175,19 +220,24 @@ MC_ADMIN_QQ=123456789,987654321
 ```
 
 ```toml
-# mcs_servers.toml：命令发给哪台服、用什么前缀
-[whitelist]
-target  = "bingo"          # 某个 [[targets]] 的 id
-command = "whitelist"      # RCON 里实际发的命令前缀
+# mcs_audiences.toml：**按群**指定命令发给哪台服、用什么前缀
+[[audience]]
+name      = "社团群"
+groups    = [123456789]
+targets   = ["bingo", "backstabbed"]
+whitelist = { target = "bingo", command = "whitelist" }   # 整段省略 = 本群不管白名单
 ```
 
 > ⚠️ `MC_ADMIN_QQ` **留空 = 该功能对所有人关闭**——与其他「留空 = 不限制」的配置相反，这是刻意的：配错的后果是任何人都能改服务端白名单。
 >
-> ⚠️ `[whitelist].command` **必须与插件注册的命令一字不差**：vanilla 是 `whitelist`，Global Whitelist 是 `globalwhitelist`，ProxyWhitelist 是 `pwl`。写错的表现是每次操作都回 `Unknown command`、群里报「未生效」，而且不报错。注意群里打的触发词（`.env` 的 `MC_ADMIN_TRIGGER`）和这个前缀是两个不同的轴。
+> ⚠️ `whitelist` 是**每条群关联各一份**（不是全局一份）：社团群的管理员碰不到建筑群的白名单。`target` 必须是**本条 `targets`** 之一，`command` **必须与插件注册的命令一字不差**：vanilla / NekoList 是 `whitelist`，Global Whitelist 是 `globalwhitelist`，ProxyWhitelist 是 `pwl`。写错的表现是每次操作都回 `Unknown command`、群里报「未生效」，而且**不报错**。注意群里打的触发词（`.env` 的 `MC_ADMIN_TRIGGER`）和这个前缀是两个不同的轴。
 >
-> 别把两个「白名单」搞混：**群白名单**（`MC_ALLOWED_GROUPS`）限制的是**哪个群**能 @查询；**MC 玩家白名单**（`whitelist.json`）是服务端的玩家准入表，由本功能管理。两者毫无关系，可以同时生效。
+> 那条关联没写 `whitelist` → 群里回「⚠️ 本群没有指定白名单服」；写了但那台没配
+> `rcon.password` → 回「⚠️ 白名单服 X 没配 RCON 密码」。
 >
-> 本功能走 RCON，所以 `[whitelist].target` 要指到一台配了 `rcon.password` 的服；且只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`。
+> 别把两个「白名单」搞混：**群关联**（`mcs_audiences.toml`，限制哪些 QQ 群能用 MC 功能、各看哪几台）和 **MC 玩家白名单**（`whitelist.json`，服务端的玩家准入表，由本功能管理）毫无关系，可以同时生效。`MC_ALLOWED_GROUPS` 是 2026-09-21 之前那套群白名单，已被群关联取代、不再生效。
+>
+> 本功能走 RCON，所以该条的 `whitelist.target` 要指到一台配了 `rcon.password` 的服；且只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`。
 >
 > 名字打什么大小写都行：bot 先读一遍白名单，下发命令时改用服务端记录的那条拼写（`add vul` 服务端存的是 `Vul`，回复里会注明），判定同样忽略大小写。**重复添加和重复移除都会如实回「无需改动」，不会虚报成功。**
 >
@@ -233,7 +283,8 @@ msg = "\n".join(lines)
 
 完整排查清单见 [DEPLOY.md 常见问题](DEPLOY.md#8-常见问题已知坑)（F1~F11）与 [日常维护](DEPLOY.md#9-日常维护)。高频六条：
 
-- **@机器人 毫无反应**：先看日志有没有「不在白名单内」的 warning——群白名单拦下时群里的表现和「机器人掉线」完全一样，见 DEPLOY.md 第 8 节 F10。
+- **@机器人 毫无反应**：MC 这边现在**一定会回一句**（「本群还没有开通 MC 查询」/「本群关联的服务器还没接入」），所以彻底沉默多半是 oopz 群白名单拦下的 —— 先看日志有没有「不在白名单内」的 warning，见 DEPLOY.md 第 8 节 F10。
+- **新加的服 / 新加的群没生效**：两份配置各有只读诊断，先跑它们再动代码 —— `tools/mc_check.py --list-targets`（服务器清单 + 被哪些群关联）和 `--list-audiences`（每条群关联覆盖哪些群、关联哪几台服）。
 - **管理命令没权限 / 说未配置 RCON**：见 DEPLOY.md 第 8 节 F11。最常见的是 `MC_ADMIN_QQ` 留空（= 功能整体关闭）或漏加自己的 QQ 号。
 - **统计 / 播报突然失效**：多半是 `OOPZ_JWT_TOKEN` 过期（约 31 天），重跑 `tools/oopz_login.py` → 回填 `.env` → 重启，见 DEPLOY.md 第 8 节 F7。
 - **MC 进服提醒不触发**：先跑 `tools/mc_check.py`——**名单不完整时提醒会静默暂停**（刻意设计，避免基于残缺名单误报）。脚本会打印 RCON `list` 原文与判定原因，见 DEPLOY.md 第 8 节 F8。

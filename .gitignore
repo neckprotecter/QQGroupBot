@@ -13,6 +13,13 @@ mcs_servers.toml
 mcs_servers.toml.*
 !mcs_servers.toml.example
 
+# 群关联表（一个 QQ 群看哪几台服）。**不含任何密码**，但含真实 QQ 群号，
+# 与 .env.example 用占位符的惯例一致，所以同样不推送。
+# 部署请复制 mcs_audiences.toml.example 为 mcs_audiences.toml 再填写
+mcs_audiences.toml
+mcs_audiences.toml.*
+!mcs_audiences.toml.example
+
 # ============================================================
 # Python 运行时 / 字节码
 # ============================================================

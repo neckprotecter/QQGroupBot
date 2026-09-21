@@ -14,6 +14,19 @@ from .mc import SLP_UNPARSEABLE, McSnapshot
 from .mcservers import ServerTarget
 from .textlen import MAX_LEN, truncate
 
+# 下面两条是**群内会说出口**的拒绝文案，放在这里是因为 mc_stats 与 mc_admin 都会用到，
+# 而两份副本一定会漂。措辞只说「本群」：群友不知道 mcs_audiences.toml 里那些名字是什么，
+# 所以拒绝文案一律不带关联名。
+
+# 「本群没关联任何服务器」（关联到了，但 targets 是空的）。mc_stats 在解析载荷**之前**
+# 就短路返回，render_summary 收到空 rows 是同一件事 —— 两处必须是同一句话。
+NO_TARGETS = "🏗️ 本群关联的服务器还没接入，暂时没有可查询的内容。"
+
+# 「本群压根没写进 mcs_audiences.toml」。末尾那句指路很重要：没开通的群里，任何含
+# mc / 我的世界 / 服务器 的 @ 消息都会被 MC 插件认领（触发词子串匹配），hello 的
+# 功能引导因此被抑制，得在这里把人接回去。
+NO_AUDIENCE = "🤔 本群还没有开通 MC 查询。其它功能可以发「@机器人 你好」看看。"
+
 
 @dataclass(frozen=True)
 class Row:
@@ -118,7 +131,31 @@ def _counting(rows: Sequence[Row]) -> list[Row]:
     return [r for r in rows if r.target.serves_names and r.snap.reachable]
 
 
-def _footnote(rows: Sequence[Row]) -> str:
+def _group_complete(proxy: Row, rows: Sequence[Row], all_targets: Sequence[ServerTarget]) -> bool:
+    """本群是否关联到了与该代理同组的**全部**非代理目标。
+
+    代理报的是全群组总人数，「代理总数 vs 子服之和」只有在同组子服**都在这里**时
+    才是有意义的对照。本群只关联到其中一部分时两者本来就对不上 —— 那是关联本身
+    的必然结果，不是故障。不加这个判断，每次总览都会挂一条「可能是 ping-passthrough」
+    的误导提示，把人指去查一个不存在的问题。
+
+    `all_targets` 传的是**全量**目标表（不只是本群关联的），否则这个比较无从做起。
+    """
+    peers = {t.id for t in all_targets if t.serves_names and t.group == proxy.target.group}
+    if not peers:
+        # 代理和子服没声明同一个 group（group 缺省 = 用 id，各占一组）时无从知道谁
+        # 归它管，退回「拿全量里的非代理目标当它的子服」—— 宁可偶尔误报一条，
+        # 也不要因为配置少写一个 group 就把这条提示永久静默掉。
+        peers = {t.id for t in all_targets if t.serves_names}
+    shown = {
+        r.target.id
+        for r in rows
+        if r.target.serves_names and r.target.group == proxy.target.group
+    }
+    return peers <= shown
+
+
+def _footnote(rows: Sequence[Row], all_targets: Sequence[ServerTarget]) -> str:
     """尾注。**必须放在最后且不许被截掉** —— 它说的正是「上面的数对不上」。
 
     两种提示都只在真有话可说时出现，正常运行时这一整段是空的。
@@ -142,7 +179,7 @@ def _footnote(rows: Sequence[Row]) -> str:
     if proxies and len(counted) >= 2:
         total = sum(r.snap.count for r in counted)
         for p in proxies:
-            if p.snap.count != total:
+            if p.snap.count != total and _group_complete(p, rows, all_targets):
                 notes.append(
                     f"⚠️ {p.target.name} 报全群组 {p.snap.count} 人，各子服合计 {total} 人。"
                     f"有子服掉线时这正常；都在线则可能是代理开了 ping-passthrough"
@@ -152,7 +189,7 @@ def _footnote(rows: Sequence[Row]) -> str:
     return "\n".join(notes)
 
 
-def _assemble(rows: Sequence[Row], budget: int) -> str:
+def _assemble(rows: Sequence[Row], budget: int, all_targets: Sequence[ServerTarget]) -> str:
     counted = _counting(rows)
     total = sum(r.snap.count for r in counted)
     down = sum(1 for r in rows if not r.snap.reachable)
@@ -168,17 +205,24 @@ def _assemble(rows: Sequence[Row], budget: int) -> str:
         lines.append("")
         lines.extend(_summary_block(row, budget))
 
-    note = _footnote(rows)
+    note = _footnote(rows, all_targets)
     if note:
         lines.append("")
         lines.append(note)
     return "\n".join(lines)
 
 
-def render_summary(rows: Sequence[Row], *, total_names: int) -> str:
-    """总览（`@bot mc` 不带服名）：每个目标一行，各自带一小段名单。"""
+def render_summary(
+    rows: Sequence[Row], *, total_names: int, all_targets: Sequence[ServerTarget]
+) -> str:
+    """总览（`@bot mc` 不带服名）：每个目标一行，各自带一小段名单。
+
+    `all_targets` 是**全量**目标表（不只是本群关联的），只用于代理尾注那条判断：
+    只有本群关联到了该代理同组的全部子服时，才提醒「代理总数与子服之和对不上」。
+    设成必填参数是刻意的 —— 漏传会让每条总览都挂一条误导提示，而那是静默的。
+    """
     if not rows:
-        return "⚠️ mcs_servers.toml 里没有配置任何目标。"
+        return NO_TARGETS
 
     budget = name_budget(total_names, len(rows))
     # 先按额度渲染；超长就**逐行减少每个目标的名额**重渲染，而不是从头截断。
@@ -189,9 +233,9 @@ def render_summary(rows: Sequence[Row], *, total_names: int) -> str:
     # 实测过一版估算式，10 个名额被一步打到 0，结果是**超长时一个人名都不显示**）。
     # 渲染只是拼字符串，多试几次不值钱，换来的是「能显示多少就显示多少」。
     while budget > 0:
-        text = _assemble(rows, budget)
+        text = _assemble(rows, budget, all_targets)
         if len(text) <= MAX_LEN:
             return text
         budget -= 1
     # 名额清零还是超长（目标极多）才认输截断，此时尾注也只能让位给服名
-    return truncate(_assemble(rows, 0))
+    return truncate(_assemble(rows, 0, all_targets))

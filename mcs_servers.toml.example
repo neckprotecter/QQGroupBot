@@ -1,20 +1,26 @@
 # ============================================================
 # 多服务器目标表
 #
-# 机器人要监控的全部 MC 服务器都在这里，一台一段 [[targets]]。
+# 机器人能看到的**全部** MC 服务器都在这里，一台一段 [[targets]]。
 # **复制本文件为 mcs_servers.toml 再填**（mcs_servers.toml 已在 .gitignore 里，不会上传）。
 #
 # ⚠️ 本文件含各服 RCON 密码，是明文。别提交、别贴群里。
+#
+# ⚠️ 本文件**只管「有哪些服」**。「哪个 QQ 群看哪几台」「白名单发给谁」都在另一份
+#    mcs_audiences.toml 里（它不含密码，所以可以单独给人看）。两份都要有，缺一份
+#    机器人起不来 —— 只填了这台清单、没填群关联，群里会回「本群还没有开通 MC 查询」。
+#
 # ⚠️ 改完要**重启机器人**（配置在启动时读一次）。
 #    排查「新加的服为什么没生效」先跑：
 #        .venv\Scripts\python.exe tools\mc_check.py --list-targets
-#    它只读配置、不联网，会把「读的是哪个文件、每个目标的名字、白名单指向谁、
+#        .venv\Scripts\python.exe tools\mc_check.py --list-audiences
+#    它们只读配置、不联网，会把「读的是哪个文件、每个目标的名字、哪些群在看它、
 #    有哪些配置冲突」全打出来。比在群里发消息试快得多。
 #    配置确认无误后，再实机验连通性：
-#        .venv\Scripts\python.exe tools\mc_check.py            # 全部目标，逐台给结论
-#        .venv\Scripts\python.exe tools\mc_check.py --target bingo
-#    服名走和群里同一套解析（id / 名字 / 别名 / 唯一前缀），脚本里能跑通的写法
-#    群友打出来也一定跑得通。
+#        .venv\Scripts\python.exe tools\mc_check.py --audience 社团群   # 该关联内全部目标
+#        .venv\Scripts\python.exe tools\mc_check.py --audience 社团群 --target bingo
+#    服名走和群里同一套解析（id / 名字 / 别名 / 唯一前缀）**且限定在所选关联内**，
+#    所以脚本里能跑通的写法，那个群里的群友打出来也一定跑得通。
 #
 # 三种 kind 的区别：
 #   proxy       代理（Velocity / BungeeCord）。**不出分服名单** —— 它的 SLP 只给
@@ -38,33 +44,13 @@
 #   rcon_timeout 可选。同上，不写用 [defaults].rcon_timeout。
 #   aliases   可选。群里可以用的别名，方便输入。**注意服名不要和机器人触发词撞词**，
 #             详见文件末尾。
-# ============================================================
-
-
-# ------------------------------------------------------------
-# 白名单管理走哪台服（恰好一个）
 #
-# 群里发 whitelist add/remove/list 时，命令发给这里指定的目标。
-# 一次只能指一台 —— 白名单本身可能分布在不同服上，机器人不去猜。
-# ------------------------------------------------------------
-[whitelist]
-# 填某个 target 的 id。**留空或删掉这一段 = 白名单管理功能整体关闭**
-# （群里会说「服务器配置读不了」而不是静默无反应）。
-target = "bingo"
-
-# RCON 里实际下发的命令前缀。**必须与插件注册的命令一字不差**。
-# 写错的表现是每次操作都回 Unknown command、群里报「未生效」，而且不报错。
-#   vanilla / NekoList        → whitelist
-#   Global Whitelist          → globalwhitelist      ← 代理上线后多半是这个
-#   ProxyWhitelist            → pwl
-#   VelocitySafe              → vwhitelist
-command = "whitelist"
-
-# 「触发词」和「命令前缀」是两个不同的轴，别搞混：
-#   触发词   = 群友在群里打的词（.env 的 MC_ADMIN_TRIGGER，默认 whitelist）
-#   命令前缀 = 机器人通过 RCON 发给服务端的词（就是这个字段）
-# 今天两者恰好都叫 whitelist。代理上线后必然分叉：群里照样打 whitelist，
-# 而 RCON 里要发 globalwhitelist。
+# ⚠️ **[whitelist] 段和 [defaults].primary 已经不在这里了**（2026-09-21 搬走）。
+#    它们要按 QQ 群区分，所以住进了 mcs_audiences.toml 的每条 [[audience]]：
+#       whitelist = { target = "bingo", command = "whitelist" }
+#       primary   = "gtnh"
+#    在本文件里留下它们会**直接报错**（并告诉你搬去哪），不会静默忽略。
+# ============================================================
 
 
 # ------------------------------------------------------------
@@ -73,11 +59,6 @@ command = "whitelist"
 [defaults]
 timeout      = 5
 rcon_timeout = 5
-
-# 「主服」：不带服名的 @查询、进服提醒、定时播报默认看它，汇总里也排最前。
-# 不写 = 用下面列表里的第一个。
-# 注意这个键和「列表顺序」是两回事：顺序只决定 --list-targets 的打印次序。
-primary = "gtnh"
 
 
 # ------------------------------------------------------------
@@ -133,8 +114,10 @@ rcon    = { port = 25585, password = "<RCON 密码>" }
 # port  = 25565
 # rcon  = { port = 25575, password = "<Velocircon 的密码>" }
 #
-# # 代理的 rcon 只为白名单服务（它没有 list 命令）。上面 [whitelist].target
-# # 改成 "proxy"，command 改成插件实际命令（Global Whitelist 是 globalwhitelist）。
+# # 代理的 rcon 只为白名单服务（它没有 list 命令）。在 mcs_audiences.toml 里把该关联的
+# # whitelist.target 改成 "proxy"，command 改成插件实际命令（Global Whitelist 是
+# # globalwhitelist）。⚠️ 代理也必须在**每条**要用白名单的 [[audience]].targets 里，
+# # 否则那条关联的 whitelist.target 会校验失败。
 #
 # # 代理上**不要装 glist 类的插件**。分服名单一律由各子服自己的 RCON 提供，
 # # 代理挂了不该让所有子服的名单一起消失。

@@ -66,6 +66,12 @@ class AdminResult:
     # 名单本来就是目标状态，没下发任何命令。add 命中 = 本来就在；remove 命中 = 本来就不在。
     # 不能让这种「无事发生」走「已添加 / 已移出」的文案：那是把没发生的事报成成功。
     noop: bool = False
+    # **变更命令**（add / remove）是否真的发给服务端了。ok is None 时靠它分辨两种
+    # 含义相反的情况：前置读就没读懂 → 一条命令都没发；反查没读懂 → 命令已经发出去了。
+    # 两者的 ok 都是 None，都不该塌缩成 False，但**该说的话正相反** —— 拿这个字段
+    # 分开说，否则「没发出去」会被报成「已发送（未能验证）」，等于把没发生的事报成发生了。
+    # list 不改动任何东西，所以恒为 False（调用方在 list 分支上不看它，见 mc_admin）。
+    mutation_sent: bool = False
 
 
 def parse_command(text: str) -> tuple[AdminCommand | None, str]:
@@ -167,8 +173,17 @@ def settle(
     return ok, player
 
 
-async def run_whitelist_command(cmd: AdminCommand, target: ServerTarget) -> AdminResult:
+async def run_whitelist_command(
+    cmd: AdminCommand, target: ServerTarget, command: str = "whitelist"
+) -> AdminResult:
     """对指定目标执行命令并独立验证。
+
+    `command` 是 RCON 里实际发的命令前缀，来自**本群那条群关联**的
+    `whitelist.command`（见 mcaudiences）。它必须与插件注册的命令一字不差：
+    vanilla / NekoList 是 `whitelist`，Global Whitelist 是 `globalwhitelist`。
+    写错的表现是每次都回 `Unknown command`、群里报「未生效」，而且**不报错** ——
+    所以调用方必须把配置值传进来，不能在这里硬编码（那样这个配置键就是「被接受
+    但被忽略」，比没有它更坏）。
 
     RCON 故障（RconError 子类）照常抛出，由调用方转成用户文案——在这里塞进字符串
     字段反而会丢掉类型，没法给出「密码错」和「连不上」不同的提示。
@@ -184,23 +199,28 @@ async def run_whitelist_command(cmd: AdminCommand, target: ServerTarget) -> Admi
     已经是目标状态时只花 1 个。这是管理员手动触发的低频操作，不在轮询里，值得。
     并发仍然安全：mc.rcon_command 在该目标的锁上串行，两个管理员不会把响应串在一起。
 
-    白名单只发往**一个**目标（mcs_servers.toml 的 [whitelist].target）——代理层白名单是
+    白名单只发往**一个**目标（本条群关联的 `whitelist.target`）——代理层白名单是
     网络级的一份，逐子服各改一遍只会让几份名单漂移。
     """
+    listed = f"{command} list"
+
     if cmd.verb == "list":
-        names = parse_whitelist_names(await rcon_command(target, "whitelist list"))
+        names = parse_whitelist_names(await rcon_command(target, listed))
         return AdminResult(
             verb="list",
             player="",
             ok=names is not None,
             names=names or [],
-            detail="" if names is not None else "whitelist list 输出无法解析",
+            detail="" if names is not None else f"{listed} 输出无法解析",
         )
 
-    matches = whitelist_matches(await rcon_command(target, "whitelist list"), cmd.player)
+    matches = whitelist_matches(await rcon_command(target, listed), cmd.player)
     if matches is None:
+        # 前置读就读不懂 → **一条变更命令都没发**（mutation_sent 保持默认 False）。
+        # 读不到当前名单就不敢下手，这是刻意的：不知道名单里有什么，
+        # 「添加」可能写出重复条目，「移除」可能删错拼写。
         return AdminResult(
-            verb=cmd.verb, player=cmd.player, ok=None, detail="whitelist list 输出无法解析"
+            verb=cmd.verb, player=cmd.player, ok=None, detail=f"{listed} 输出无法解析"
         )
     noop, spellings = plan_mutation(cmd.verb, cmd.player, matches)
     if noop:
@@ -217,14 +237,20 @@ async def run_whitelist_command(cmd: AdminCommand, target: ServerTarget) -> Admi
     # 循环变量叫 spelling 不叫 target：本函数的形参 target 是服务器目标，
     # 而这里遍历的是**玩家名的拼写**（同一玩家在服务端可能有不止一条记录）。
     for spelling in spellings:
-        raw = await rcon_command(target, f"whitelist {cmd.verb} {spelling}")
+        raw = await rcon_command(target, f"{command} {cmd.verb} {spelling}")
         # 回执只记 debug：它的文案是本地化的，不足以判定成败（见 docstring 第 3 条）
-        logger.debug("RCON whitelist {} {} 回执: {}", cmd.verb, spelling, raw)
+        logger.debug("RCON {} {} {} 回执: {}", command, cmd.verb, spelling, raw)
 
-    after = whitelist_matches(await rcon_command(target, "whitelist list"), cmd.player)
+    after = whitelist_matches(await rcon_command(target, listed), cmd.player)
     if after is None:
+        # 命令**已经发出去了**（上面的循环），只是反查读不懂 —— 和前置读读不懂是
+        # 两件相反的事，所以 mutation_sent 要显式给 True。
         return AdminResult(
-            verb=cmd.verb, player=cmd.player, ok=None, detail="whitelist list 输出无法解析"
+            verb=cmd.verb,
+            player=cmd.player,
+            ok=None,
+            detail=f"{listed} 输出无法解析",
+            mutation_sent=True,
         )
     ok, server_name = settle(cmd.verb, cmd.player, spellings, after)
     return AdminResult(
@@ -234,4 +260,5 @@ async def run_whitelist_command(cmd: AdminCommand, target: ServerTarget) -> Admi
         detail="" if ok else f"回执: {raw[:200]!r}",
         server_name=server_name,
         targets=spellings,
+        mutation_sent=True,
     )

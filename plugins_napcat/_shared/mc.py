@@ -401,6 +401,37 @@ def parse_list_names(payload: str, expected: int | None = None) -> list[str]:
     return fallback or []
 
 
+def _normalize_reply(text: str) -> str:
+    """把一句回执压成可比对的形状：去 § 颜色码、把连续空白压成一个空格、忽略大小写。"""
+    return " ".join(_COLOR_CODE.sub("", text).split()).casefold()
+
+
+# 「白名单是空的」在服务端用的是**另一个翻译键**（vanilla 的 commands.whitelist.none），
+# 那句话**整句没有冒号**，于是会被下面「第一个冒号切前缀」的规则误判成「格式不认识」。
+# 实测（2026-09-21，Bingo 26.2）：
+#     There are no whitelisted players
+#
+# 代价不只是查不到：add / remove 的**前置读**也拿不到结果，mcadmin 会在那里提前
+# return，命令根本发不出去 —— 白名单为空（每台新服的初始状态）时，管理员没法从群里
+# 加第一个人。
+#
+# 所以这里认一组「已知的空名单哨兵句」，**必须整句相等**（见 _normalize_reply）。
+# 刻意**不**做成「没冒号就算空名单」：命令前缀写错时的回执同样没冒号，实测 Bingo 26.2
+# 的 `nosuchcmd list` 回的是
+#     Unknown or incomplete command. See below for errornosuchcmd list<--[HERE]
+# 那样就会把「前缀写错」误报成「白名单是空的」，比原本的「未能解析」更难查。
+#
+# 匹配不上时行为完全不变（照旧 None、照旧如实报「未能解析」），所以加哨兵只可能把被
+# 误伤的正经回执救回来，不会让任何现有判定退化。换了语言/插件的服若报「未能解析」，
+# 先跑 `mc_check.py --whitelist` 看原文，把那句**原样**加进这里即可。
+_EMPTY_WHITELIST_REPLIES = frozenset(
+    _normalize_reply(reply)
+    for reply in (
+        "There are no whitelisted players",  # vanilla en_us：commands.whitelist.none
+    )
+)
+
+
 def parse_whitelist_names(payload: str) -> list[str] | None:
     """从 RCON `whitelist list` 的输出里取全部白名单玩家名。
 
@@ -413,10 +444,16 @@ def parse_whitelist_names(payload: str) -> list[str] | None:
 
     不能图省事直接按逗号切整段：`There are 2 whitelisted players: Alice, Bob` 的第一段
     会连着前缀文案一起变成 `There are 2 whitelisted players: Alice`，跟 `Alice` 比不上。
+
+    **空名单是个例外，走 _EMPTY_WHITELIST_REPLIES 整句比对**：那句回执没有冒号，
+    不特判就会掉进「判不出来」。这条必须排在冒号判断**之前** —— 排在后面等于永远
+    到不了（没有冒号的分支已经 return None 了）。
     """
     text = (payload or "").strip()
     if not text:
         return None
+    if _normalize_reply(text) in _EMPTY_WHITELIST_REPLIES:
+        return []  # 确定是「没人」，不是「看不懂」—— 两者对调用方含义相反
     cut = next((i for i, ch in enumerate(text) if ch in ":："), None)
     if cut is None:
         return None  # 没有冒号：可能是 EssentialsX 之类改写过的格式，不猜

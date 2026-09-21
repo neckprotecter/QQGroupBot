@@ -28,6 +28,8 @@ oopz-bot/
 ├─ .env                      # 实际配置（含密钥，勿外泄/勿提交）
 ├─ mcs_servers.toml.example  # MC 服务器清单模板 → 复制为 mcs_servers.toml 填写
 ├─ mcs_servers.toml          # 实际清单（含各服 RCON 密码，勿外泄/勿提交）
+├─ mcs_audiences.toml.example # MC 群关联模板 → 复制为 mcs_audiences.toml 填写
+├─ mcs_audiences.toml        # 实际群关联（不含密码，但含真实群号，勿提交）
 ├─ DEPLOY.md                 # 本文档
 ├─ README.md                 # 项目简介
 ├─ docs/chat.md              # 维护记录（含 NapCat 踩坑细节）
@@ -123,7 +125,9 @@ copy .env.example .env
 
 > ⚠️ **MC 服务器的地址 / 显示名 / 超时 / RCON 密码都不在 `.env` 里。**
 > 它们在同目录的 **`mcs_servers.toml`**（一台服一段 `[[targets]]`），见 4.1 节。
-> 复制 `mcs_servers.toml.example` 为 `mcs_servers.toml` 再填。改完要**重启 bot**。
+> 「**哪个 QQ 群看哪几台服、白名单发给谁、默认先看哪台**」则在
+> **`mcs_audiences.toml`**，见 4.2 节。两份 `.example` 各复制一份再填。
+> 改完要**重启 bot**。
 
 ### 4.1 服务器清单 mcs_servers.toml
 
@@ -134,15 +138,20 @@ copy .env.example .env
 Copy-Item mcs_servers.toml.example mcs_servers.toml
 ```
 
-`mcs_servers.toml` 已在 `.gitignore` 里（含各服 RCON 密码明文，别提交）。三件事要填：
+`mcs_servers.toml` 已在 `.gitignore` 里（含各服 RCON 密码明文，别提交）。它只管
+**「有哪些服」**，要填的只有两样：
 
 1. **每台服一段 `[[targets]]`**：`id`（也是 `@查询` 里打的服名）、`name`、`kind`
    （`proxy` / `backend` / `standalone`）、`host` / `port`、`rcon = { port, password }`。
-2. **`[whitelist]`**：白名单命令发给哪台服、**命令前缀是什么**（见下）。
-3. **`[defaults] primary`**：不带服名的 `@查询`、进服提醒、定时播报默认看哪台服。
+2. **`[defaults]`**：`timeout` / `rcon_timeout` 两个默认超时。
+
+> ⚠️ **`[whitelist]` 段和 `[defaults] primary` 已经不在这里了**（2026-09-21 搬到
+> `mcs_audiences.toml` 的每条 `[[audience]]`）——它们要**按 QQ 群区分**，不能再是
+> 全局一份。留在本文件里会**直接报错**（报错里会说搬到哪），不会静默忽略。
+> 只填了这份、没填 4.2 节那份，机器人起不来。
 
 改完**重启 bot**。首选诊断手段是 `--list-targets` —— 它**只读配置、不联网**，
-会把「读的是哪个文件、每个目标的名字、白名单指向谁、有哪些配置冲突」全打出来，
+会把「读的是哪个文件、每个目标的名字、**被哪些群关联**、有哪些配置冲突」全打出来，
 是排查「新加的服为什么没生效」最快的入口：
 
 ```powershell
@@ -166,10 +175,10 @@ MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SL
 > 查 A 会把正在跑的 B 的数据当成 A 报出去，界面上看起来完全正常。`--list-targets`
 > 会警告，但它不是错误，所以警告要认真看。
 
-> ⚠️ **命令前缀必须和插件注册的命令一字不差。** `[whitelist].command` 决定 RCON 里
-> 实际发什么：vanilla 是 `whitelist`，Global Whitelist 是 `globalwhitelist`，
-> ProxyWhitelist 是 `pwl`。写错的表现是每次白名单操作都回 `Unknown command`、
-> 群里报「未生效」，而且不报错。
+> ⚠️ **命令前缀必须和插件注册的命令一字不差。** 4.2 节里每条 `[[audience]]` 的
+> `whitelist.command` 决定 RCON 里实际发什么：vanilla / NekoList 是 `whitelist`，
+> Global Whitelist 是 `globalwhitelist`，ProxyWhitelist 是 `pwl`。写错的表现是每次
+> 白名单操作都回 `Unknown command`、群里报「未生效」，而且**不报错**。
 >
 > 注意**触发词和命令前缀是两个不同的轴**：群友在群里打的词由 `.env` 的
 > `MC_ADMIN_TRIGGER` 决定（默认 `whitelist`），机器人发给服务端的词由这个字段决定。
@@ -178,15 +187,24 @@ MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SL
 改完**重启 MC 服务端**，然后跑诊断脚本确认：
 
 ```powershell
-.\.venv\Scripts\python.exe tools\mc_check.py              # 并发探测全部目标
-.\.venv\Scripts\python.exe tools\mc_check.py --target bingo   # 只看一台
+.\.venv\Scripts\python.exe tools\mc_check.py                      # 并发探测所选关联的全部目标
+.\.venv\Scripts\python.exe tools\mc_check.py --target bingo       # 只看一台
+.\.venv\Scripts\python.exe tools\mc_check.py --audience 建筑群    # 换一条群关联的视角
 ```
 
 每个目标打一个块，块头就是结论（`[OK]` / `[!!]`），末尾汇总 `N/M 个目标正常`；
-**只要有目标不正常，退出码就是 1**，可以直接在脚本里判断。`--target` 后面写的服名
-走**和群里同一套解析**（id / 名字 / 别名 / 唯一前缀，忽略大小写与全角），所以脚本里
-跑得通的写法，群友打出来也一定跑得通；认不出来或前缀有歧义都会**明确报错**，不会
-悄悄退化成「探测全部」。
+**只要有目标不正常，退出码就是 1**，可以直接在脚本里判断。
+
+> ⚠️ **探测哪几台服现在是「按群」定的。** 不带 `--audience` 时脚本站在**第一条**
+> 群关联的视角上（输出的头两行会写明是哪条），所以 `--target` 能认出的服名、
+> 不带参数时探到的服务器集合，都以那条关联为限。**这正是不带参数时不再探测「全部
+> 目标」的原因**：群友永远站在某条关联里，脚本必须能复现他看到的那个集合，
+> 否则「脚本里跑得通、群里查不到」就查不出来了。要按全量表探测就分别跑每条关联。
+
+`--target` 后面写的服名走**和群里同一套解析**（id / 名字 / 别名 / 唯一前缀，忽略
+大小写与全角）**且限定在所选关联内**，所以脚本里跑得通的写法，那个群里的群友打出来
+也一定跑得通；认不出来或前缀有歧义都会**明确报错**，不会悄悄退化成「探测全部」。
+关联外的服名会被如实报成「认不出」，并在提示里点明这是隔离规则、不是配置写错。
 
 看到块头是 `[OK] … 名单完整` 即成功。若是 `[!!] … 名单不完整`，脚本会打印 RCON
 `list` 的**原始输出**和判定原因，照着排查。
@@ -197,22 +215,94 @@ MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SL
 
 > ⚠️ **RCON 是明文协议，密码可被重放**。`rcon.port` 只绑内网/本机，**绝对不要暴露公网**。
 
+### 4.2 群关联 mcs_audiences.toml
+
+`mcs_servers.toml` 只说「有哪些服」。机器人同时服务多个 QQ 群，而**每个群看的服不
+一样**（社团群看自己的三台；建筑群自己的组服还没搭），所以「哪个群关联哪几台」是
+单独一份配置：
+
+```powershell
+Copy-Item mcs_audiences.toml.example mcs_audiences.toml
+```
+
+它**不含任何密码**（RCON 密码全在 `mcs_servers.toml` 里），所以**可以单独给人看、
+单独贴出来讨论** —— 前提是别把密码抄进来。但含真实 QQ 群号，同样在 `.gitignore` 里。
+
+一条 `[[audience]]` = 一条**群关联**：
+
+```toml
+[[audience]]
+name      = "社团群"                                       # 必填。日志和诊断里用它指代本条
+groups    = [11111111]                                     # 必填，非空。这些群共享本关联
+targets   = ["gtnh", "bingo", "backstabbed"]               # 可选，**可为空**。顺序即总览顺序
+primary   = "gtnh"                                         # 可选。不带服名的 @查询默认看它
+whitelist = { target = "bingo", command = "whitelist" }    # 可选。整段省略 = 本群不管白名单
+
+[[audience]]
+name      = "建筑群"                                       # 服还没搭，先占位
+groups    = [22222222]
+targets   = []
+```
+
+**群能不能用 MC 功能，就看它有没有被这里提到** —— 被提到就算开通，没提到就不开通：
+群里会明确回一句「🤔 本群还没有开通 MC 查询」并在日志里留一条 warning。
+所以 `.env` 里的 `MC_ALLOWED_GROUPS` **已经不作数了**（留着会被当残留报一条警告）。
+
+`targets` 写 `[]` 是**合法**的，不是「没配完」：那个群的查询会回
+「🏗️ 本群关联的服务器还没接入，暂时没有可查询的内容」—— 比笼统的「本群还没有开通」
+准确：开通了，只是没服可看。
+
+改完**重启 bot**，然后跑：
+
+```powershell
+.\.venv\Scripts\python.exe tools\mc_check.py --list-audiences
+```
+
+它**只读配置、不联网**，逐条打出覆盖哪些群、关联哪几台服、主服是哪台、白名单发给谁，
+另有一段专门列「**没被任何群关联的目标**」（孤儿）。把 `mcs_audiences.toml.example`
+末尾写的四个坑照抄过来，因为它们正是这个命令要帮你发现的东西：
+
+1. **一个群只能出现在一条 `[[audience]]` 里。** 写进两条会**直接报错**：那样「这个群
+   查询该看哪几台」就说不清了，而取先出现的那条正是本工程一直在防的静默猜。
+2. **关联外的服名查不到（刻意的隔离）。** 建筑群打 `@bot mc gtnh` 回「没有叫 gtnh
+   的服」，而社团群的服名在建筑群那边根本不存在。反过来，**新加的服忘了关联给任何群**
+   是很常见的疏漏：群里打它回「没这个服」，而 `--list-targets` 和启动日志**都会正常
+   列出它**。所以两条命令都会专门把孤儿目标标出来，看到就补 `targets`。
+3. **`whitelist.command` 必须与服务端插件注册的命令一字不差**（见上一节）。
+4. **要用代理管白名单，代理得在这条的 `targets` 里**：`whitelist.target` 必须是
+   **本条 `targets`** 之一（不是「全量表里有就行」），否则加载时就报错，不会等到
+   群里发命令才炸。代理通常不属于任何群自己看的那几台，所以群组就绪后要给每条要用
+   白名单的 `[[audience]]` 都把 `"proxy"` 加进 `targets`。
+
+> ⚠️ `.env` 的 `MC_WATCH_GROUP` / `MC_REPORT_GROUP` 里的群**也**必须在这里有对应的
+> `[[audience]]`，否则进服提醒与定时播报会明确报错并停摆（不是静默不推）。
+> 当前阶段它们只看那条关联的**主服**，启动日志里会写明盯的是哪条关联的哪台服。
+
 **别把两个「白名单」搞混**（这是本节最容易读错的地方）：
 
 | 叫法 | 是什么 | 配置在哪 |
 |---|---|---|
-| **群白名单** | 哪些 **QQ 群**能 @机器人 查询 | `MC_ALLOWED_GROUPS` / `NAPCAT_ALLOWED_GROUPS` |
-| **MC 玩家白名单** | 服务端 `whitelist.json`，谁能进服 | 由群里的 `whitelist` 命令管理；谁能执行看 `MC_ADMIN_QQ` |
+| **群关联** | 哪些 **QQ 群**能用 MC 功能、各看哪几台服 | `mcs_audiences.toml` 的 `[[audience]]` |
+| **MC 玩家白名单** | 服务端 `whitelist.json`，谁能进服 | 由群里的 `whitelist` 命令管理；发给哪台、用什么前缀看该条的 `whitelist`；谁能执行看 `MC_ADMIN_QQ` |
 
-两者毫无关系、可以同时生效：一个限制「哪个群」，一个限制「哪个人」，另一个限制「哪个玩家能进服」。
+两者毫无关系、可以同时生效：一个限制「哪个群、看哪几台」，一个限制「哪个玩家能进服」。
+
+> `MC_ALLOWED_GROUPS` 是 2026-09-21 之前的**群白名单**机制，已被「群关联」取代。
+> 它不再拦任何人 —— 拦人的是「这个群有没有被某条 `[[audience]]` 提到」。
 
 白名单管理功能要单独验一遍（**只读**，不改服务端）：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\mc_check.py --whitelist
+.\.venv\Scripts\python.exe tools\mc_check.py --audience 建筑群 --whitelist
 ```
 
-它打印 `whitelist list` 的原文和解析结果。看到 `[OK] 解析正常` 就说明本服的白名单输出格式能被正确判定成败；若报「判不出来」，说明格式被插件改写过，加白命令会回「未能验证」而不是「已添加」（功能仍可用，只是无法自动确认）。
+不带 `--audience` 时看第一条群关联的白名单目标。它打印 `whitelist list` 的原文和
+解析结果。看到 `[OK] 解析正常` 就说明本服的白名单输出格式能被正确判定成败；若报
+「判不出来」，说明格式被插件改写过，加白命令会回「未能验证」而不是「已添加」
+（功能仍可用，只是无法自动确认）。若那条关联没写 `whitelist`，它会直接说明
+「该群的白名单管理不可用」并给出该补的那一行 —— 这正是群里那句
+「⚠️ 本群没有指定白名单服」对应的配置。
 
 **关于服务端控制台的 RCON 日志**：MC 对**每条** RCON 连接都会打两行 INFO（`Thread RCON Client /… started` / `… shutting down`）。bot 复用一条长连接，所以正常情况下只有 bot 启动时那一组；如果控制台又开始每 10 秒刷一组，说明连接在反复重连——先查服务端是否在重启、`rcon.port` 是否被别的程序占用。
 
@@ -252,7 +342,26 @@ MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SL
 - 群里 `@机器人 oopz` → 回复 oopz 语音频道在线明细
 - 定时播报：到整点槽位（间隔 30 分钟则为 :00/:30），若 oopz 有人在线则推送「📣 oopz 语音频道播报…」（无人在线时静默跳过，属正常）
 - 进频道欢迎：有人进入目标域语音频道后，约 1 个轮询周期内推送趣味欢迎语
-- **MC 查询**：群里 `@机器人 mc` → 回复 MC 服务器在线人数与名单
+- **启动日志**：确认这几行都在，它们把两份配置的实际读法全摊开了
+  （「新加的服 / 新加的群为什么没生效」看一眼就知道）：
+  `MC 目标 N 个：…`、`MC 关联服务器：N 条` 及其下每条 `名字（N 个群）→ …`、
+  `MC 进服提醒：盯的是「<关联名>」关联的 <服名>[<id>]`。有警告的话紧跟着分别是
+  `MC 目标配置：` / `MC 群关联配置：` / `MC 群关联「<名字>」：` 三类。
+- **MC 查询**：在**已开通**的群里 `@机器人 mc` → 回复该群关联的服务器总览（主服排最前）
+  - 在该群里 `@机器人 mc <服名>` → 单服明细；打 `@机器人 mc b` 这种半截名 → 列出候选
+  - ⚠️ **必测跨群隔离**：在一个**没写进** `mcs_audiences.toml` 的群里发 `@机器人 mc`，
+    应回「🤔 本群还没有开通 MC 查询」，且日志里有一条同等信息的 warning（见 F10）
+  - 若某条关联 `targets = []`（配置里那条占位条目就是，群号是假的所以没法在群里测），
+    那个群应回「🏗️ 本群关联的服务器还没接入」——**不是**「本群还没有开通」。
+    两者混了说明闸门顺序错了。这条可以离线验：`--audience <该条名字> --target <任意服>`
+    会说明「这条关联里没有任何服务器，无可探测」，而不是拿全量表兜底
+  - 关联外的服名（在该条关联下的群里打 `@bot mc gtnh`）应回「没有叫 gtnh 的服」，
+    这是刻意隔离；离线对应 `--audience <该条名字> --target gtnh`
+- **MC 群关联配置**（离线，不用等群消息）：
+  ```powershell
+  .\.venv\Scripts\python.exe tools\mc_check.py --list-audiences
+  ```
+  每条关联覆盖哪些群、关联哪几台服、白名单发给谁，以及有没有「没被任何群关联的孤儿目标」。
 - **MC 进服提醒**：自己进服，最慢 `MC_WATCH_INTERVAL_SEC` + `MC_JOIN_MIN_INTERVAL_SEC` 秒内推送「🎮 X 加入了…」（默认 10+15，即 25 秒内；两人紧挨着进服会合并成一条）
   - ⚠️ **首次启动只建基线**（当时已在线的玩家不算「新进服」），所以重启后不会刷屏。若重启后立刻推出一堆存量玩家，说明基线门控有 bug。
 - **MC 玩家白名单管理**（配了 `MC_ADMIN_QQ` 才需要验）：
@@ -316,7 +425,12 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 - **名单完整 False** → 进服提醒会**静默暂停**（不误报，但也不推消息）。这是刻意的设计：名单残缺时（比如只拿到 12 条随机样本）推「进服」全是假的。
   - 该目标没配 `rcon.password`（`mcs_servers.toml`）：在线人数 ≤12 时 SLP 样本本身就是完整名单；超过就必须开 RCON（见 4.1）。
   - 配了 RCON 仍不完整：看脚本打印的 `list` **原始输出**——可能是插件改写了 `list` 格式，或 `enable-rcon` 没生效。
-- **名单完整 True 但仍不推** → 查 `.env` 的 `MC_WATCH_GROUP` 是否填了、bot 是否在该群。
+- **名单完整 True 但仍不推** → 查 `.env` 的 `MC_WATCH_GROUP` 是否填了、bot 是否在该群；
+  再查**那个群有没有写进 `mcs_audiences.toml`**（见 4.2）——盯的服务器是从它那条
+  关联的 `primary` 来的，那个群没关联就整个停摆（启动日志里有一条明确的 error 说明）。
+- **盯错了服**（进服提醒推的是另一台）→ 启动日志里有一行
+  `MC 进服提醒：盯的是「<关联名>」关联的 <服名>[<id>]`。当前阶段它只看那条关联的主服；
+  主服由该条的 `primary` 决定，不写就是那条 `targets` 的第一个。
 - **日志噪音**：RCON 出问题时**只在状态跃迁时打一条告警**，不是每轮一条。所以日志里只有一条 warning 是正常的，别以为没报错就没问题——以 `mc_check.py` 的输出为准。
 
 ### F9 MC 名单对不上 / 频繁假进服
@@ -324,20 +438,51 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 - 若确实频繁误报，可在服务端试 `list uuids`（输出形如 `Alice (uuid)`），改用 UUID 作身份基准即可。先用 `mc_check.py` 确认你那台服务端支持再改。
 
 ### F10 @机器人 查询毫无反应（群里一条回复都没有）
+
+> 📌 **2026-09-21 起 MC 查询的「群」不再靠 `.env` 拦。** 改由 `mcs_audiences.toml`
+> 的**群关联**决定（见 4.2 节），而且**不响应的群里现在会收到一句明确回复**，
+> 不再是彻底沉默。所以这一节分两种情况看。
+
+**情况一：群里收到「🤔 本群还没有开通 MC 查询」**
+
+MC 插件认领了这条消息，但这个群没被写进任何 `[[audience]].groups`。日志里有配套 warning：
+
+```
+群 123456789 收到 mc 查询，但它没开通：不在 .../mcs_audiences.toml 的任何
+[[audience]].groups 里。已开通的群：11111111、22222222
+```
+
+→ 去 `mcs_audiences.toml` 把这个群号加进对应那条 `[[audience]].groups`（想让几个群看
+同样的服就都写进同一条），重启 bot。加完先跑 `--list-audiences` 确认群号认对了。
+
+**情况二：群里收到「🏗️ 本群关联的服务器还没接入」**
+
+这个群**开通了**，但那条 `[[audience]].targets` 是空的（配置里那条占位条目就是这种）。
+
+→ 去 `mcs_servers.toml` 确认那些服在不在表里，再把它们的 id 填进这条关联的 `targets`
+（id 用 `--list-targets` 看）。**别把群号从 `groups` 里挪走** —— 那样就从「开通了但没服」
+变成「没开通」，文案跟着换一句，问题反而更难看出。
+
+**情况三：还是彻底一条回复都没有**
+
 **先看日志有没有这条 warning**：
 
 ```
-群 123456789 @mc 查询被忽略：不在白名单内。NAPCAT_ALLOWED_GROUPS=...（逗号分隔；留空 = 所有群都可查）
+群 123456789 @oopz 查询被忽略：不在白名单内。NAPCAT_ALLOWED_GROUPS=...（逗号分隔；留空 = 所有群都可查）
 ```
 
-有 → 该群不在白名单里。把群号加进 `NAPCAT_ALLOWED_GROUPS`（MC 另有 `MC_ALLOWED_GROUPS`，留空时回退到前者），重启 bot。
+有 → 那是 **oopz 那边**的白名单拦下的（`NAPCAT_ALLOWED_GROUPS`）。把群号加进去，重启 bot。
 
 没有这条 warning → 说明消息根本没被判定成「@机器人」，检查是不是 @ 到了别的号 / 只是打了触发词没 @。
 
-> 这里拦人的是**群白名单**（限制哪些 QQ 群能 @查询），跟「MC 玩家白名单」（服务端 `whitelist.json`）是两回事，别顺着这条去改 `MC_ADMIN_QQ`。
+> **为什么 MC 那边要专门回一句**：`mc` / `我的世界` / **`服务器`** 这几个触发词是在整条
+> 消息上做子串匹配的，被 MC 认领的消息不会再有别的插件应答。原先白名单是**静默 return**，
+> 于是没开通的群里打什么都像「机器人掉线」——连 hello 的功能引导也不出现。改成一个群
+> **必须**收到一句回复之后，这条静默路径就没了；但代价是拒绝文案会盖掉 hello 的引导，
+> 所以文案末尾附了一句指路（「其它功能可以发 @机器人 你好 看看」）。
 >
-> 为什么容易踩：**白名单拦截时群里的表现和「机器人掉线」一模一样**——oopz / MC 两边都不吭声，
-> 连 hello 的功能引导也不会出现（因为它被触发词互斥挡掉了）。所以务必以日志为准，别靠群里的表现猜。
+> 拦人的是**群关联**（限制哪些 QQ 群能用 MC 功能），跟「MC 玩家白名单」（服务端
+> `whitelist.json`）是两回事，别顺着这条去改 `MC_ADMIN_QQ`。
 
 ### F11 `@机器人 whitelist` 没反应 / 说没权限 / 说未能验证
 
@@ -346,11 +491,13 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 | 群里看到 | 原因 | 修复 |
 |---|---|---|
 | 「🚫 你没有 MC 管理权限」 | 你的号不在 `MC_ADMIN_QQ` 里；或该项**留空**（留空 = 功能对所有人关闭） | 把自己的 QQ 号加进去，重启 bot。日志里能区分「未配置」和「不在名单内」两种 |
-| 「🚫 本群未启用 MC 管理命令」 | 该群不在 `MC_ALLOWED_GROUPS` / `NAPCAT_ALLOWED_GROUPS` 里（与 @查询 共用同一条链） | 加群号或清空该配置 |
-| 「⚠️ MC 玩家白名单管理不可用：mcs_servers.toml 里没有可用的白名单目标…」 | 管理命令必须走 RCON，没有降级路径 | 按 4.1 节配好 `[whitelist].target` 和该目标的 `rcon.password` |
-| 「⚠️ 服务器配置读不了：…」 | `mcs_servers.toml` 不存在或有语法/校验错误 | 报错里带原始原因，照着改；先跑 `--list-targets` 看详细 |
-| 「❌ 未生效：名单里仍没有 X」 | 命令发出去了，但服务端没执行 | 看日志里那行 warning 的 **RCON 回执原文**——常见是服务端根本没启用 `whitelist` 命令，或被权限插件接管 |
-| 「⚠️ 命令已发送（未能验证）」 | 服务端 `whitelist list` 的输出格式解析不了（没有冒号，多半被插件改写过） | **命令很可能已经生效**，去服务端 `whitelist list` 确认。想根治先跑 `tools\mc_check.py --whitelist` 看原文 |
+| 「🤔 本群还没有开通 MC 查询」 | 该群没被写进任何 `[[audience]].groups` | 见 F10 情况一 |
+| 「⚠️ 本群没有指定白名单服，白名单管理不可用。」 | 这个群开通了，但那条 `[[audience]]` 没写 `whitelist` 段（或只写了 `command` 没写 `target`） | 按 4.2 节给那条 `[[audience]]` 补 `whitelist = { target = "...", command = "..." }`；只读地先看一遍：`mc_check.py --audience <关联名> --whitelist` |
+| 「⚠️ 白名单服 Bingo 没配 RCON 密码，命令发不出去。」 | 该条 `whitelist.target` 指到了目标，但那台没配 `rcon.password` | 在 `mcs_servers.toml` 给那台补上 `rcon.password`（见 4.1）。管理命令必须走 RCON，没有降级路径 |
+| 「⚠️ 服务器配置读不了：…」 | `mcs_servers.toml` / `mcs_audiences.toml` 不存在或有语法/校验错误 | 报错里带原始原因，照着改；先跑 `--list-targets`（目标）和 `--list-audiences`（群关联）看详细 |
+| 「❌ 未生效：名单里仍没有 X」 | 命令发出去了，但服务端没执行 | 看日志里那行 warning 的 **RCON 回执原文**——常见是服务端根本没启用 `whitelist` 命令、被权限插件接管、或本条的 `whitelist.command` 前缀写错了（见 4.2 第 3 条） |
+| 「⚠️ 读不到服务端当前的白名单，add 命令没有发出去」 | 连改动前的名单都读不出来，bot **一条命令都没发**（不知道名单里有什么就不敢下手） | 跑 `tools\mc_check.py --whitelist` 看 RCON **原文**——多半是 `whitelist list` 的输出解析不了，照下面的「空名单哨兵」处理 |
+| 「⚠️ 命令已发送（未能验证）」 | 命令确实发出去了，只是**反查**（改完再读一次名单）读不懂，判不出成没成 | 去服务端 `whitelist list` 亲眼确认。⚠️ 这条**不代表命令已经生效**，只是「发了，不知道结果」 |
 | 完全没有任何回复 | 消息没被 @ 到 / 不在群里 | 同 F10 |
 | 回的是「未知命令」用法提示 | 命令格式不对 | 用法提示里会列出当前触发词 |
 
@@ -364,6 +511,9 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
   - **同名不同大小写可能变成两条独立记录**。离线 UUID 由名字字面量算出（区分大小写），`Vul` 和 `vul` 是两个不同的人；在线模式下它们会被解析到同一个账号、只会有一条。bot 两种都认：`remove vul` 会把所有同名不同拼写的条目**一并移除**，并在回复里列出删了哪几条。
 - **基岩版玩家（Floodgate/Geyser）**：白名单里带 `.` 前缀（`.Steve`），玩家名正则不允许 `.`，所以**加不进去**，得去服务端控制台手动加。
 - **玩家名规则**：只接受 `字母 / 数字 / 下划线`，1~16 位（Java 版规则）。写成别的会被判非法并回用法——这条正则同时也是防注入的关键，不宜放宽。
+- **空名单哨兵**：服务端对「白名单是空的」用的是**另一句文案**（vanilla 的 `commands.whitelist.none`），而且**整句没有冒号**。机器人按「第一个冒号」切前缀的解析方式会把它当成「格式不认识」，后果不只是查不到 —— `add` / `remove` 的**前置读**也拿不到结果，bot 会直接放弃、**一条命令都不发**。所以 `mc.py` 里专门认了一组哨兵句（`_EMPTY_WHITELIST_REPLIES`），**整句比对**、忽略大小写与颜色码。目前只有 en_us 那句（`There are no whitelisted players`，2026-09-21 在 Bingo 26.2 上抓的原文）。
+  - **认不出来的照旧报「未能解析」**，不会误判成「空名单」——所以漏了一句只会让功能不工作，不会给出错误答案。
+  - 服务端若设了别的语言（或插件改写过），跑 `tools\mc_check.py --whitelist` 看 RCON **原文**，把那句逐字加进 `plugins_napcat/_shared/mc.py` 的 `_EMPTY_WHITELIST_REPLIES` 即可。**别**改成「没冒号就算空名单」：命令前缀写错时的回执同样没冒号，那样会把「前缀写错」误报成「白名单是空的」。
 
 ---
 
@@ -376,7 +526,7 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
   - 白名单命令的回复文案与用法提示在 `plugins_napcat/mcs/mc_admin.py` 的 `_build_message()` / `_usage()`；命令解析与执行在 `plugins_napcat/_shared/mcadmin.py`。
 - **改触发词**：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（不用改代码）。归属逻辑在 `plugins_napcat/_shared/triggers.py`：`locate()` 定归属并带回位置，`detect()` 是它的薄包装，`strip_keyword()` 把触发词剥掉取载荷（`@bot 服务器 mc bingo` → `bingo`）——它剥的是该插件的**全部**触发词，所以多写几个触发词也能解析对。
 - **改管理员**：`.env` 的 `MC_ADMIN_QQ`（逗号分隔 QQ 号，**留空 = 关闭该功能**）。鉴权在 `plugins_napcat/_shared/admin.py`。
-- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`。不带参数 = 并发探测**全部**目标，逐台给结论；加 `--target <服名>` 只看一台；加 `--list-targets` 只读配置、不联网（新加的子服没生效先跑这个）；加 `--self-test` 只跑解析自测、不联网；加 `--whitelist` 只看服务端白名单，只读不改。退出码 0 正常 / 1 有目标不正常 / 2 用法错误。
+- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`。不带参数 = 并发探测**所选群关联**的全部目标，逐台给结论；加 `--target <服名>` 只看一台；加 `--audience <关联名>` 换一条群关联的视角（默认第一条）；加 `--list-targets` 只读配置、不联网（新加的子服没生效先跑这个）；加 `--list-audiences` 只读群关联、不联网（新加的群不响应先跑这个）；加 `--self-test` 只跑解析自测、不联网；加 `--whitelist` 只看服务端白名单，只读不改。退出码 0 正常 / 1 有目标不正常 / 2 用法错误。
 - **续期 oopz JWT（每月一次）**：`OOPZ_JWT_TOKEN` 约 31 天过期。症状：@统计 无回复、播报显示「查询失败」。重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
 - **改间隔/目标群**：改 `.env` 后重启 bot。
 - **看日志**：`logs/napcat_bot.log`（注意 PowerShell 用 `-Encoding UTF8` 读）。

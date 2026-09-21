@@ -1,7 +1,11 @@
 """多服务器目标表：mcs_servers.toml 的解析、校验与名字解析。
 
+**只管「有哪些服务器」这一件事。** 「哪个 QQ 群看哪几台」在 _shared/mcaudiences.py
+（mcs_audiences.toml），它用 `ServerBook.scoped()` 把这里的全量表投影成一个子视图。
+白名单归属（发给哪台、什么命令前缀）也随群关联走，不再是全局一份。
+
 **为什么不塞进 mc.py**：mc.py 的单服假设（一个 host/port/rcon）要逐目标化，而
-「有哪些目标、叫什么、白名单归谁管」这件事本身与 MC 协议无关。把配置层和协议层
+「有哪些目标、叫什么」这件事本身与 MC 协议无关。把配置层和协议层
 分开，前者就能在没有任何网络的情况下完整自测（tools/mc_check.py 的自测块 10/11）。
 
 和 mc.py 一样放 _shared：本模块**不得** import nonebot、不得调 get_driver()，
@@ -21,8 +25,8 @@
 import os
 import tomllib
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 
 # 目标角色。决定的不多，但有一条很关键：代理不出在线名单。
@@ -32,21 +36,47 @@ KIND_STANDALONE = "standalone"
 KINDS = (KIND_PROXY, KIND_BACKEND, KIND_STANDALONE)
 
 # 各表允许出现的键。多一个都报错——见模块 docstring 第 3 条。
-_TOP_KEYS = frozenset({"whitelist", "defaults", "targets"})
-_WHITELIST_KEYS = frozenset({"target", "command"})
-_DEFAULT_KEYS = frozenset({"timeout", "rcon_timeout", "primary"})
+# whitelist / defaults.primary 曾经在这里，2026-09-21 搬到 mcs_audiences.toml 的
+# 每条 [[audience]] 里（它们要按群区分，不能再是全局一份）。下面两条迁移报错负责
+# 把「还留着旧键」这件事说清楚 —— 不能只靠 _reject_unknown，那只会说「不认识的键」。
+_TOP_KEYS = frozenset({"defaults", "targets"})
+_DEFAULT_KEYS = frozenset({"timeout", "rcon_timeout"})
 _TARGET_KEYS = frozenset(
     {"id", "name", "kind", "group", "host", "port", "rcon", "aliases", "timeout", "rcon_timeout"}
 )
 _RCON_KEYS = frozenset({"port", "password"})
 
+_MOVED_WHITELIST_KEYS = frozenset({"whitelist"})
+_MOVED_DEFAULT_KEYS = frozenset({"primary"})
+
+# 这两句会被**打给群里看**（mc_stats / mc_admin 的配置读不了分支会回显原文），
+# 所以要短。详细说明在 mcs_audiences.toml.example 和 DEPLOY.md。
+_MOVED_HINT = (
+    "mcs_servers.toml 里的 {key} 已经搬到 mcs_audiences.toml 的每条 [[audience]] 里了"
+    "（它要按 QQ 群区分，不能再是全局一份）。\n"
+    "把 {write} 写进对应那条 [[audience]]，然后删掉这里的 {key}。\n"
+    "群号也从 .env 的 MC_ALLOWED_GROUPS 搬进 [[audience]].groups；"
+    "模板见 mcs_audiences.toml.example。"
+)
+_MOVED_WHITELIST_HINT = _MOVED_HINT.format(
+    key="[whitelist] 段",
+    write='whitelist = { target = "bingo", command = "whitelist" }',
+)
+_MOVED_PRIMARY_HINT = _MOVED_HINT.format(
+    key="[defaults].primary",
+    write='primary = "gtnh"',
+)
+
 _DEFAULT_TIMEOUT = 5.0
 _DEFAULT_RCON_TIMEOUT = 5.0
+# 「群里打 whitelist，RCON 里发什么」的命令前缀。留在这里当缺省值：
+# ServerBook.scoped() 要给投影出来的子视图填一个默认命令，而那个默认值天然是
+# 「vanilla 的 whitelist」。真正生效的那份在每条 [[audience]] 的 whitelist.command。
 _DEFAULT_COMMAND = "whitelist"
 
 
 class ServerConfigError(Exception):
-    """mcs_servers.toml 不合法，且不能带着它继续跑。"""
+    """mcs_servers.toml / mcs_audiences.toml 不合法，且不能带着它继续跑。"""
 
 
 @dataclass(frozen=True)
@@ -129,6 +159,8 @@ class ServerBook:
     """一份加载完的目标表。"""
 
     targets: tuple[ServerTarget, ...] = ()
+    # 下面三项只在**投影出来的子视图**里有意义（见 scoped）。全量表里它们恒为空：
+    # 「白名单发给谁」和「本群默认看哪台」都是群关联的属性，不是服务器清单的。
     whitelist_target: str = ""
     whitelist_command: str = _DEFAULT_COMMAND
     # 「主服」的 id。留空 = 用 targets[0]。
@@ -139,13 +171,54 @@ class ServerBook:
     def get(self, target_id: str) -> ServerTarget | None:
         return self._by_id.get(target_id)
 
+    def scoped(
+        self,
+        ids: Sequence[str],
+        *,
+        primary: str = "",
+        whitelist_target: str = "",
+        whitelist_command: str = _DEFAULT_COMMAND,
+    ) -> "ServerBook":
+        """按一组 id 投影出**子视图**，用于「某个 QQ 群关联的服务器」。
+
+        返回的是另一个 ServerBook，不是新类型：resolve / targets_primary_first /
+        whitelist_owner / primary_target 全部原样复用，群关联因此不需要另写一套
+        名字解析 —— 两份实现一定会漂，而漂的方式是「同一台服在两个群里认得出/认不出」。
+
+        **`_by_id` 必须重建，不能沿用 self._by_id**。get() / whitelist_owner /
+        primary_target 全查它；漏了不报错，只是 whitelist_owner 返回 None，
+        群里表现为「查询正常、白名单说不可用」，而 primary_target 因为退回
+        targets[0] 碰巧还是对的 —— 最难发现的那种。_by_id 里**只有本视图的目标**，
+        所以关联外的服名 resolve 会如实返回「未知」（这正是隔离赖以成立的东西）。
+
+        warnings 留空、不继承 self.warnings：全量那份（端口冲突等）在启动日志和
+        --list-targets 里各打一次就够，继承过来会让每条关联都重复一遍别人的问题。
+        只有某条关联才说得通的警告由 mcaudiences 生成，进 Audience.warnings。
+        """
+        picked: list[ServerTarget] = []
+        for target_id in ids:
+            target = self.get(target_id)
+            if target is None:
+                # 正常路径到不了这里：mcaudiences 会先对着全量表校验一遍 id。
+                # 真到了说明校验被绕过了，宁可炸也不要投影出一个少了一台的视图。
+                raise ServerConfigError(f"目标 {target_id!r} 不在目标表里，无法投影")
+            picked.append(target)
+        return ServerBook(
+            targets=tuple(picked),
+            whitelist_target=whitelist_target,
+            whitelist_command=whitelist_command,
+            primary=primary,
+            warnings=(),
+            _by_id={t.id: t for t in picked},
+        )
+
     @property
     def primary_target(self) -> ServerTarget | None:
         """主服：汇总里排最前，也是「只支持单目标」的场景下的默认目标。
 
-        配置里写 `[defaults] primary = "bingo"` 指定；不写就是列表第一个。
-        用显式键而不是约定「第一个」，是因为顺序还承担着展示职责（--list-targets
-        按配置顺序打印），让两者绑在一起会互相牵制。
+        在**子视图**里由 `[[audience]].primary` 指定（`scoped(primary=...)` 填进来）；
+        不写就是本视图的第一个。用显式键而不是约定「第一个」，是因为顺序还承担着
+        展示职责（--list-targets 按配置顺序打印），让两者绑在一起会互相牵制。
         """
         if self.primary:
             found = self._by_id.get(self.primary)
@@ -155,7 +228,11 @@ class ServerBook:
 
     @property
     def whitelist_owner(self) -> ServerTarget | None:
-        """白名单命令发给哪台。没配 [whitelist].target 时返回 None（功能关闭）。"""
+        """白名单命令发给哪台。本视图没指定时返回 None（本群不管白名单）。
+
+        查的是**本视图**的 _by_id，所以子视图只会命中自己关联到的那几台 ——
+        社团群的管理员因此碰不到建筑群的白名单目标。
+        """
         return self._by_id.get(self.whitelist_target) if self.whitelist_target else None
 
     @property
@@ -164,7 +241,7 @@ class ServerBook:
 
         「主服」这个键的含义就是「默认先看哪台」，所以汇总和播报里它得在最前面。
         配置顺序**不**参与这件事 —— 它只负责 --list-targets 的打印次序，两者刻意
-        分开（见 mcs_servers.toml.example 里对 primary 的说明），否则调打印顺序会
+        分开（见 mcs_audiences.toml.example 里对 primary 的说明），否则调打印顺序会
         顺手改掉群里的展示顺序。
         """
         first = self.primary_target
@@ -276,17 +353,26 @@ def parse_book(text: str) -> ServerBook:
     except tomllib.TOMLDecodeError as exc:
         raise ServerConfigError(f"mcs_servers.toml 语法错误：{exc}") from exc
 
+    # 旧键的存在性检查必须在 _reject_unknown **之前**：_TOP_KEYS 收窄之后，
+    # [whitelist] 会先被当成「不认识的键」拦下，而那句话完全没告诉人该搬去哪 ——
+    # 用户照着它改只会把段名删掉，白名单功能静默消失。
+    # 按「键存在」判而不是「值非空」：空表 `[whitelist]`（或 primary = ""）同样是
+    # 没搬完的痕迹，留着它只会让人以为那个键还在生效。
+    if _MOVED_WHITELIST_KEYS & set(doc):
+        raise ServerConfigError(_MOVED_WHITELIST_HINT)
+
     _reject_unknown(doc, _TOP_KEYS, "mcs_servers.toml")
 
     defaults = doc.get("defaults", {})
     if not isinstance(defaults, dict):
         raise ServerConfigError("[defaults] 必须是一个表")
+    if _MOVED_DEFAULT_KEYS & set(defaults):
+        raise ServerConfigError(_MOVED_PRIMARY_HINT)
     _reject_unknown(defaults, _DEFAULT_KEYS, "[defaults]")
     base_timeout = _as_float(defaults.get("timeout", _DEFAULT_TIMEOUT), "[defaults].timeout")
     base_rcon_timeout = _as_float(
         defaults.get("rcon_timeout", _DEFAULT_RCON_TIMEOUT), "[defaults].rcon_timeout"
     )
-    primary = _as_text(defaults.get("primary", ""), "[defaults].primary")
 
     raw_targets = doc.get("targets", [])
     if not isinstance(raw_targets, list) or not raw_targets:
@@ -378,35 +464,10 @@ def parse_book(text: str) -> ServerBook:
 
     _check_port_collisions(targets, warnings)
 
-    whitelist = doc.get("whitelist", {})
-    if not isinstance(whitelist, dict):
-        raise ServerConfigError("[whitelist] 必须是一个表")
-    _reject_unknown(whitelist, _WHITELIST_KEYS, "[whitelist]")
-    whitelist_target = _as_text(whitelist.get("target", ""), "[whitelist].target")
-    command = _as_text(whitelist.get("command", ""), "[whitelist].command") or _DEFAULT_COMMAND
-
-    if whitelist_target:
-        owner = by_id.get(whitelist_target)
-        if owner is None:
-            raise ServerConfigError(
-                f"[whitelist].target 指向不存在的目标 {whitelist_target!r}；"
-                f"可用的 id：{'、'.join(by_id)}"
-            )
-        if not owner.rcon_enabled:
-            warnings.append(
-                f"[whitelist].target 指向 {owner.name}，但它没配 rcon.password，白名单命令发不出去"
-            )
-
-    if primary and primary not in by_id:
-        raise ServerConfigError(
-            f"[defaults].primary 指向不存在的目标 {primary!r}；可用的 id：{'、'.join(by_id)}"
-        )
-
+    # 白名单归属与主服都随群关联走了（见 _MOVED_* 那两条迁移报错），全量表里留空。
+    # 需要它们的场景一律走 scoped() 投影出来的子视图。
     return ServerBook(
         targets=tuple(targets),
-        whitelist_target=whitelist_target,
-        whitelist_command=command,
-        primary=primary,
         warnings=tuple(warnings),
         _by_id=by_id,
     )
@@ -468,24 +529,19 @@ def book_path() -> Path:
     暴露出来是为了能**打给人看**：排查「新加的子服为什么没生效」时，
     「你到底读的哪个文件」是第一顺位的问题 —— 编辑错文件（比如改了仓库根目录那份
     而部署跑的是别处的副本）看起来和"配置没生效"一模一样。
+
+    另一份配置（mcs_audiences.toml）的路径在 mcaudiences.audiences_path()，
+    同样可覆盖（`MCS_AUDIENCES_TOML`）。
     """
     override = os.environ.get("MCS_SERVERS_TOML", "").strip()
     return Path(override) if override else _DEFAULT_PATH
 
 
-@lru_cache(maxsize=1)
-def default_book() -> ServerBook:
-    """惰性加载 mcs_servers.toml（可用 MCS_SERVERS_TOML 环境变量改路径）。
-
-    和 mc.py 原来的 `_cfg()` 同样是懒加载、同样**不可以在 import 期调用**：
-    tools/mc_check.py 得先把 .env 灌进 os.environ 再调用，import 期读会踩时序坑。
-    改完配置可调 default_book.cache_clear() 重置。
-
-    解析失败时抛 ServerConfigError（lru_cache 不缓存异常，所以每次调用都会重试
-    读盘——这是刻意的：配置写错了应当每次都能看到同一条报错，而不是被缓存成一个
-    陈旧的成功结果）。
-    """
-    return load_book(book_path())
+# 这里**刻意没有** default_book()。加载入口只有一个：
+# _shared/mcaudiences.py 的 default_config()，它一次读两个文件、只缓存一次。
+# 留一个带 lru_cache 的 default_book() 在旁边，就会出现「清了 book 没清 audiences」
+# 的中间态（两个缓存各自记着不同时刻的配置），而症状是「改完配置重启，群里一半新
+# 一半旧」。全量表本身仍然随时可用：load_book(book_path())，不缓存。
 
 
 def round_budget(book: ServerBook) -> tuple[float, float, float]:
