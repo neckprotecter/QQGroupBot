@@ -333,6 +333,61 @@ def _assemble_report(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- 白名单名单
+
+@dataclass(frozen=True)
+class WhitelistListRow:
+    """多台白名单里的一台。
+
+    刻意只吃**纯数据**，不吃 mcadmin.AdminResult：`_shared/mcadmin.py` 顶层
+    `from nonebot.log import logger`，本模块 import 它就把 nonebot 拖进那条必须在
+    `nonebot.init()` 之前跑通的路（tools/mc_check.py 的自测）—— 与 mcdelta 放
+    _shared 是同一条硬约束。
+    """
+
+    name: str
+    names: tuple[str, ...] | None = None  # None = 这台的名单没读到
+    note: str = ""  # 没读到的原因（进块内，与「当前没有玩家」不是一回事）
+
+
+def render_whitelist_list(
+    rows: Sequence[WhitelistListRow], *, total_names: int
+) -> tuple[str, bool]:
+    """本群多台白名单服一次列出。返回 `(文案, 是否被截断)`。
+
+    排版与总览/播报同一套（`【服名】` + 两空格缩进），因为群里 `@bot mc` 就长这样，
+    同一台机器人的几种输出不该各写各的。
+
+    走同一个 `name_budget()` 与 `_fit()`：3 台 × 50 个名字正好是 MAX_LEN 会踩线的
+    规模，而 `truncate()` 切的是尾部 —— 切掉的正是最后几台的名单，消息看着完全正常。
+    所以被截断必须**返回**给调用方去打 warning（渲染层不许记日志，与 format_events /
+    render_report 同一约定）。
+    """
+    total = sum(len(r.names) for r in rows if r.names)
+    head = f"📋 MC 玩家白名单（{len(rows)} 台服）：" if len(rows) > 1 else "📋 MC 玩家白名单："
+
+    def build(budget: int) -> str:
+        lines = [head]
+        for row in rows:
+            if row.names is None:
+                # 这台读不到**不影响其余台**照常列出：部分成功必须报出来，
+                # 整条回「执行失败」会把已经查到的两台一起丢掉。
+                lines.append(f"【{row.name}】⚠️ {row.note or '名单没读到'}")
+                continue
+            lines.append(f"【{row.name}】（{len(row.names)} 人）")
+            shown = row.names[:budget]
+            lines.extend(f"  • {n}" for n in shown)
+            if len(row.names) > len(shown):
+                lines.append(f"  …还有 {len(row.names) - len(shown)} 人")
+        return "\n".join(lines)
+
+    budget = name_budget(total_names, len(rows))
+    # 「有没有被截断」按理想额度先渲染一遍判断，**不**去看 _fit 的返回值：_fit 认输时
+    # 返回的是 truncate 过的短文本，长度反而正常，照长度判断会一律报「没截断」。
+    clipped = len(build(budget)) > MAX_LEN
+    return _fit(build, budget), clipped
+
+
 # ---------------------------------------------------------------- 进服提醒
 
 # 一轮内进服人数达到这个数就合并成一条，避免刷屏

@@ -30,9 +30,12 @@
 #   primary   可选。本群默认先看哪台（总览里排最前）。必须写在本条的 targets 里。
 #             不写 = 本条的第一个。注意它和「targets 的顺序」是两回事：顺序只决定
 #             --list-targets 的打印次序。
-#   whitelist 可选，整段省略 = 本群不管白名单。是一张表：
-#               target  = 命令发给哪台（必须是本条的 targets 之一）
-#               command = RCON 里实际发的前缀，见下面第 3 条
+#   whitelist 可选，整段省略 = 本群不管白名单。是**一组表**（每台白名单服一项）：
+#               第 N 项.target  = 命令发给哪台（必须是本条的 targets 之一）
+#               第 N 项.command = 这一台的 RCON 前缀，可省（缺省 "whitelist"），
+#                                 见下面第 3 条
+#             单表写法（whitelist = { ... }）从 P6 起**直接报错**：一个群可以管多台服，
+#             而每台的前缀可能不同，一份表说不清。报错里带了可照抄的改法。
 #   watch     可选，缺省 false。true = 本条的 groups 收**进服提醒**（有人进服就报）。
 #   report    可选，缺省 false。true = 本条的 groups 收**定时播报**（默认每小时一次）。
 #             两个开关都只管「发不发」，**收件人恒为本条的 groups**，没有第二个地方
@@ -56,9 +59,29 @@ groups  = [<群号>]                       # 多个群共享同一条关联就�
 targets = ["gtnh", "bingo", "backstabbed"]
 primary = "gtnh"                         # 不带服名的 @查询 默认看它，总览里也排最前
 
-# 白名单管理：命令发给哪台、用什么前缀。整段删掉 = 这个群不能用 whitelist 命令
+# 白名单管理：**一组表，每台白名单服一项**。整段删掉 = 这个群不能用 whitelist 命令
 # （群里会回「本群没有指定白名单服」）。
-whitelist = { target = "bingo", command = "whitelist" }
+#
+# 只有一台时是这样（command 可省，省了就是 "whitelist"）：
+whitelist = [{ target = "bingo", command = "whitelist" }]
+#
+# 代理上线后是这样（两台各带自己的前缀，顺序 = 配置里的书写顺序）：
+#   whitelist = [
+#     { target = "bingo" },                                   # 子服：插件自带 whitelist
+#     { target = "proxy", command = "globalwhitelist" },       # 代理：Global Whitelist
+#   ]
+#
+# ⚠️ 多写一台 = **同一个人能改的服务器多一台**。管理员是 .env 的 MC_ADMIN_QQ 里的
+#    QQ 号，鉴的是「人」、**不分服**，所以这里每加一项，那个人的权限就跟着变大一圈，
+#    而任何输出里都不会体现这件事。加之前先想一遍该不该给。
+#
+# 群里怎么点名：命令里**服名写在最后**，一次只打一台。
+#   @bot whitelist add Steve bingo     → 加到 bingo
+#   @bot whitelist remove Steve        → 只有一台时可以省服名
+#   @bot whitelist list                → 不点名 = 一次列出本群全部白名单服
+#   @bot whitelist list bingo          → 只看那一台
+# 多台时不写服名会被要求点名，**没有「默认那台」的回退** —— 猜错就是改错服务器的
+# 白名单。改动命令（add / remove）一律只影响点名的这一台；想批量改，一条条来。
 
 # 推送开关：不写 = 不推送。想让这个群收进服提醒 / 定时播报就把对应的那行改成 true。
 watch   = true
@@ -84,7 +107,7 @@ targets = []
 
 
 # ------------------------------------------------------------
-# 填这份文件时容易踩的四个坑
+# 填这份文件时容易踩的五个坑
 # ------------------------------------------------------------
 #
 # 1. 一个群只能出现在一条 [[audience]] 里
@@ -99,7 +122,7 @@ targets = []
 #    而 --list-targets 和启动日志都会正常列出它。所以加载时会专门警告
 #    「XXX 没被任何群关联」，--list-audiences 里也有单独一段。看到就补 targets。
 #
-# 3. whitelist.command 必须与服务端插件注册的命令一字不差
+# 3. whitelist 里每一台的 command 必须与服务端插件注册的命令一字不差
 #    写错的表现是每次操作都回 Unknown command、群里报「未生效」，而且**不报错**。
 #      vanilla / NekoList   → whitelist
 #      Global Whitelist     → globalwhitelist    ← 代理上线后多半是这个
@@ -110,11 +133,22 @@ targets = []
 #      命令前缀 = 机器人通过 RCON 发给服务端的词（就是这个字段）
 #    今天两者恰好都叫 whitelist。代理上线后必然分叉：群里照样打 whitelist，
 #    而 RCON 里要发 globalwhitelist。
+#    **多台时逐台都要对**：一台写错只影响那一台，而群里点它的名时才回「未生效」，
+#    不点名的那几台一直好好的 —— 只看「list 正常」是发现不了的。--whitelist 会
+#    逐台把前缀打出来，对着它核一遍。
 #
 # 4. 要用代理管白名单，代理得在这条的 targets 里
-#    whitelist.target 必须是**本条 targets** 之一（不是「全量表里有就行」）。
+#    whitelist 里每一项的 target 都必须是**本条 targets** 之一（不是「全量表里有就行」）。
 #    代理通常不属于任何群自己看的那几台，所以群组就绪后要给每条要用白名单的
 #    [[audience]] 都把 "proxy" 加进 targets —— 否则加载时就报错，不会等到群里发命令才炸。
+#    加了 targets 还要**在 whitelist 里加一项** { target = "proxy", command = "globalwhitelist" }：
+#    只进 targets 只是「这个群查得到它」，白名单那边还得单独声明。
+#
+# 5. 多写一台白名单服 = 同一个人能改的服务器多一台
+#    管理员是 .env 的 MC_ADMIN_QQ 里的 QQ 号，鉴的是「人」、**不分服**。所以
+#    whitelist 里每多一项，那个号能改的白名单就多一份 —— 这是**权限扩大**，
+#    但它不会出现在任何输出里（命令、日志、--list-audiences 都只报「发往 N 台」）。
+#    加项之前先确认这个人本来就该管那台服。
 #
 # 另外：进服提醒与定时播报**已经不看 .env 里的群了**。MC_WATCH_GROUP /
 # MC_REPORT_GROUP 这两个变量作废，留着会被当成残留报一条警告；「哪个群收」改由本条

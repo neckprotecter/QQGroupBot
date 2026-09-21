@@ -35,8 +35,11 @@ VERBS: tuple[str, ...] = ("add", "remove", "list")
 PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 
 # parse_command 的失败原因（机器可读，调用方据此出不同文案）
+# 这里**只有**解析层真会返回的三种。「服名写到了动词前面」不在其中：那一层只看词序，
+# 判断「这个 token 是不是本群一台服的名字」需要配置视图，所以它在 mc_admin 里查
+# （parse_command 只把动词前的 token 原样交出去）。
 ERR_USAGE = "usage"  # 没找到子命令
-ERR_LIST_ARGS = "list_args"  # list 后面跟了参数
+ERR_LIST_ARGS = "list_args"  # list 后面跟了不止一个参数
 ERR_NAME = "bad_name"  # 名字缺失或不合法
 
 
@@ -44,6 +47,15 @@ ERR_NAME = "bad_name"  # 名字缺失或不合法
 class AdminCommand:
     verb: str  # "add" | "remove" | "list"
     player: str = ""  # 只有 add / remove 有
+    # 群里点名的**服名原文**（动词之后最后一个 token），空 = 没点名。
+    # 它**不是** target id：这一层只做语法，认不认得出来由持有配置视图的一方做
+    # （ServerBook.pick_whitelist），所以这里不校验它。
+    server: str = ""
+    # 动词**之前**的 token（原样、没小写）。这一层刻意不认识它们 —— 触发词就在里面，
+    # 一律报错会误伤「帮我 whitelist add Steve」这种说话习惯。原样交出来是为了让有
+    # ServerBook 的调用方能拦下「服名写错位置」（whitelist bingo add Steve）——
+    # 那种写法在 P6 之前是**静默丢掉 bingo** 再把命令发往缺省那台。
+    pre_verb: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,9 +87,18 @@ class AdminResult:
 
 
 def parse_command(text: str) -> tuple[AdminCommand | None, str]:
-    """解析 `whitelist add <玩家名>` / `whitelist remove <玩家名>` / `whitelist list`。
+    """解析 `whitelist [服名] add|remove <玩家名> [服名]` / `whitelist [服名] list`。
 
     返回 (命令, 失败原因)；成功时原因为 ""。
+
+    **服名写在末尾**（P6 起的 B 方案）：动词之后的 token 里，最后一个当服名，其余
+    join 起来当玩家名。这个切法**无歧义**，因为玩家名正则不允许空格 —— 两个以上
+    token 时第一个一定是玩家名、最后一个一定是服名，不需要靠「猜哪个像服名」。
+    只有一个 token 时它是玩家名（add/remove 的服名可省，多台时由调用方要求点名）。
+
+    动词之前的 token 一律收进 pre_verb 交给调用方：那里本来是**静默丢弃**的
+    （`whitelist bingo add Steve` 里的 bingo 会被扔掉、命令照发往缺省那台），
+    P6 把「发给哪台」交给它决定之后，再丢掉就等于改错服。
     """
     tokens = (text or "").split()
     if not tokens:
@@ -92,16 +113,25 @@ def parse_command(text: str) -> tuple[AdminCommand | None, str]:
 
     verb = tokens[pos].lower()
     rest = tokens[pos + 1 :]
+    head = tuple(tokens[:pos])
 
     if verb == "list":
-        return (None, ERR_LIST_ARGS) if rest else (AdminCommand("list"), "")
+        # list 没有玩家名，所以唯一的那个 token 就是服名（`whitelist list bingo`）。
+        # 两个以上才说不清 —— 用法文案负责告诉他正确的写法。
+        if len(rest) > 1:
+            return None, ERR_LIST_ARGS
+        return AdminCommand("list", server=rest[0] if rest else "", pre_verb=head), ""
 
-    # 多出来的 token 会被 join 进来，从而过不了正则——「whitelist add Steve please」
-    # 和「whitelist add Steve; stop」都落在 ERR_NAME 上。
-    player = " ".join(rest)
+    if not rest:
+        return None, ERR_NAME
+    server = rest[-1] if len(rest) >= 2 else ""
+    # 多出来的 token 会被 join 进来，从而过不了正则——「whitelist add Steve please extra」
+    # 和「whitelist add Steve; stop」都落在 ERR_NAME 上（后者的 `stop` 被当服名、
+    # `Steve;` 过不了正则）。
+    player = " ".join(rest[:-1]) if len(rest) >= 2 else rest[0]
     if not PLAYER_NAME_RE.match(player):
         return None, ERR_NAME
-    return AdminCommand(verb, player), ""
+    return AdminCommand(verb, player, server, head), ""
 
 
 def whitelist_matches(payload: str, name: str) -> list[str] | None:
@@ -199,8 +229,9 @@ async def run_whitelist_command(
     已经是目标状态时只花 1 个。这是管理员手动触发的低频操作，不在轮询里，值得。
     并发仍然安全：mc.rcon_command 在该目标的锁上串行，两个管理员不会把响应串在一起。
 
-    白名单只发往**一个**目标（本条群关联的 `whitelist.target`）——代理层白名单是
-    网络级的一份，逐子服各改一遍只会让几份名单漂移。
+    **每次只打一台**（P6 的 B 方案：一条群关联可以声明多台白名单服，但命令里点名
+    的那一台才收命令）。一条命令同时改多台 = 一次误操作同时改坏几台服的白名单，
+    收益与风险不成比例；要看多台的现状用 list（读操作，由调用方并发发起）。
     """
     listed = f"{command} list"
 

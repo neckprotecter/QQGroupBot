@@ -209,7 +209,7 @@ name      = "社团群"                                   # 只在运维看的�
 groups    = [123456789]                                # 必填非空；群号 int / str 都认
 targets   = ["gtnh", "bingo", "backstabbed"]           # 顺序 = 总览顺序；可为空
 primary   = "gtnh"                                     # 不带服名的 @查询 默认看它
-whitelist = { target = "bingo", command = "whitelist" } # 整段省略 = 本群不管白名单
+whitelist = [{ target = "bingo" }]                     # 一组表，每台白名单服一项（见 9.12）
 ```
 
 ### 9.3 复用了 ServerBook，而不是新造一套视图
@@ -218,14 +218,16 @@ whitelist = { target = "bingo", command = "whitelist" } # 整段省略 = 本群�
 只是多了一个 `scoped()`：
 
 ```python
-book.scoped(ids, primary=..., whitelist_target=..., whitelist_command=...) -> ServerBook
+# P6 起：whitelist 是**一组路由**（每台白名单服一条，各带自己的命令前缀）
+book.scoped(ids, primary=..., whitelist=[WhitelistRoute(...), ...]) -> ServerBook
 ```
 
 投影出的子 book 里**只有本关联的目标**，所以：
 
 - 关联外的服名 `resolve()` 不出结果 —— 「建筑群打 `gtnh` 回『没有叫 gtnh 的服』」
   是投影本身的性质，**不靠调用方自觉过滤**。隔离因此不可能被某条分支忘掉。
-- `whitelist_owner` / `primary_target` / `targets_primary_first` 全部原样复用，零重复代码。
+- `primary_target` / `targets_primary_first` / `pick_whitelist` 全部原样复用，零重复代码。
+  （`whitelist_owner` 这个单数属性在 P6 被**删掉**了，理由见 9.12。）
 
 ⚠️ **`scoped()` 必须同时重建 `_by_id`**，这是本次最容易踩的坑：漏了它 `get()` 会全返回
 `None`，症状是「查询正常、白名单却总说不可用」，而 `primary_target` 因为退回
@@ -297,11 +299,18 @@ DEPLOY 的 F10 整节就是教人 grep 它。
 不再在命令层硬编码 `"whitelist"`。这原本排在 P6，提前做的理由是：**把它挪进关联、
 却让命令层继续写死，就等于造了一个「被接受但被忽略」的配置键** —— 配置、日志、诊断
 三处都会显示新前缀，而实际发出去的老是 `whitelist`。改的人会以为自己已经改好了。
-本工程一直在防的就是这类东西，所以宁可现在接上（今天 `command` 就是 `whitelist`，
-所以行为零变化），也不要带着一个会撒谎的键进 P6。
+本工程一直在防的就是这类东西，所以宁可现在接上（当时 `command` 就是 `whitelist`，
+所以行为零变化），也不要带着一个会撒谎的键进 P6。**P6 证明这个提前做是对的**：
+白名单从「一个目标」变成「一组路由」时，`command` 只是个形参，一行没改就变成了逐台前缀。
 
 钉住它的自测只能读源码（`run_whitelist_command` 要活的 RCON，跑不起来）：
 断言那个函数体内不再出现 `"whitelist ` 字面量、且签名里有 `command` 参数。
+P6 补了另一半：**三条**命令（前置读 / 变更 / 反查）都得用这个前缀，所以新增用例断言
+`command="globalwhitelist"` 时发出去的三条全是 `globalwhitelist ...` —— 只看变更那一条的话，
+「前置读硬编码 whitelist list」这种改法照样能过，而那会让配了 Global Whitelist 的那台
+每次都读不懂名单、命令一条都发不出去。回复文案那一半同理由源码钉住
+（`_build_body` 体内没有 `"whitelist ` 字面量），否则命令发对了、提示里给的却是
+服务端不存在的命令。
 
 ### 9.9 本期没做的（两条都已在 P7 做掉，见 9.11）
 
@@ -465,3 +474,77 @@ There are no whitelisted players          # Bingo 26.2 实测原文，2026-09-21
 **迁移顺序（本期唯一一个「配错不报错」的坑）**：先给关联加 `watch = true` / `report = true`、
 重启、确认推送照旧，**再**删 `.env` 的两行。反过来做会让提醒静默消失，而群里安安静静和
 「机器人挂了」长得一模一样。
+
+### 9.12 P6：一条群关联管多台服的白名单
+
+**要解决的真实症状**：白名单归属原本是 `whitelist.target` + `whitelist.command` 两个标量
+——一个群只能管**一台**服，且那台用哪个 RCON 前缀写死在同一个表里。代理上线后必然要
+「子服一份 vanilla 白名单 + 代理一份 Global Whitelist（前缀 `globalwhitelist`）」，
+这个形态**写不出来**。
+
+**四个设计决策**（改之前先读）：
+
+1. **服名写在末尾，一次只打一台。** `whitelist add Steve bingo`：动词之后的 token 里
+   **最后一个**当服名、其余 join 起来当玩家名。这个切法**无歧义**，因为玩家名正则
+   `^[A-Za-z0-9_]{1,16}$` 不允许空格 —— 两个以上 token 时第一个一定是玩家名、最后一个
+   一定是服名，不需要「猜哪个像服名」。反过来（服名放第一个）在单 token 时无法自解释。
+   只有一台白名单服时**可以省服名**，这是绝大多数情况（逼人写反而容易写错）。
+   改动命令（`add` / `remove`）一律只打点名的那一台：一条命令同时改多台 = 一次误操作
+   同时改坏几台服的白名单，收益与风险不成比例。
+
+2. **配置只认数组，旧的单表写法直接报错。** `whitelist = [{ target = "bingo" }, ...]`，
+   `command` 可省（缺省 `whitelist`）。报错里带可照抄的改法 —— 沿用当初 `[whitelist]`
+   段搬家那套：一件事只留一种写法，另一种明确报错，**不做兼容**。
+
+3. **`whitelist_owner` 删掉，不留兼容的单数属性。** 写成「返回第一条」会让「配了 3 台、
+   实际只动 1 台」静默发生；写成「只有 1 条时才返回」会对着配了 2 台的群**撒谎**说
+   「本群没有指定白名单服」。删掉之后漏改的调用点直接 `AttributeError`，比静默少查一台
+   强得多。
+
+4. **渲染层不许 import `mcadmin`。** 多台 `list` 的渲染要吃 `WhitelistListRow` 这个
+   **纯数据**行类型，而不是 `AdminResult` —— 因为 `_shared/mcadmin.py` 顶层
+   `from nonebot.log import logger`，`mcrender` import 它就把 nonebot 拖进那条必须在
+   `nonebot.init()` 之前跑通的路（`tools/mc_check.py --self-test`）。
+
+**顺带修掉两个真 bug**（都是「静默做错事」，本工程明令禁止的那一类）：
+
+| bug | 旧行为 | 现在 |
+|---|---|---|
+| `whitelist bingo add Steve` 里的 `bingo` **被静默丢掉**，命令照发往缺省那台 | 点名了 A 服，改了 B 服 | `parse_command` 把动词前的 token 原样交给调用方（`pre_verb`），`mc_admin` 里逐个拿去 `resolve()`，凡是**本群认得出的服名**就拦住并给出改好的整条命令 |
+| `_build_message` 把建议命令**写死**成 `whitelist {verb} {name}` | 配了 `globalwhitelist` 的关联，回复里给的是服务端**不存在**的命令 | 前缀由调用方传 `route.command`；自测用源码钉住「`_build_body` 体内没有 `"whitelist ` 字面量」 |
+
+第一条的判据刻意是「这个名字在本群**解析得出来**」而不是「它是不是服名」：所以
+`帮我 whitelist add Steve` 里的「帮我」不是任何一台服的名字，**不会误伤**；而这条检查
+只会**多报错**、永远不会**做错事**。已知边角（接受，写进了注释）：服名恰好叫触发词本身
+时每条命令都会报错 —— `mcs_servers.toml.example` 末尾本来就禁止用触发词当服名。
+（因此**没有**用 `triggers.strip_keyword`：触发词留在动词之前，末尾式语法不需要它。）
+
+**`pick_whitelist(query)` 的两条规则，顺序不能反：**
+
+1. `query` 为空：0 条 → `NO_ROUTE`；恰好 1 条 → 命中（单台可省服名）；**≥2 条 → `NEED_NAME`**。
+   **没有「默认那台」的回退** —— 多台时猜错 = 改错服务器的白名单。
+2. `query` 非空：先在**本条关联的全部目标**里跑现成的 `resolve()`（NFKC + 唯一前缀 +
+   歧义三态），**再**查它是不是白名单路由。必须先在全部目标里解析：`gtnh` 是本群查得到
+   的服、只是没配白名单，直接回「没有叫 gtnh 的服」是**假话**，照着改名字是白费功夫
+   → 回 `PICK_NOT_WHITELIST` 并带上 `found`，文案说「GTNH 是本群关联的服，但它不是白名单服」。
+
+**多台 `list` 的并发**：`asyncio.gather(..., return_exceptions=True)` 是**硬要求**。
+不写的话一台 `RconAuthError` 会把整批结果连坐丢掉，群友收到「命令执行失败」而那几台其实
+查到了 —— 是「把没发生的事报成发生了」的镜像，同样不许。例外项也**照样转成一行**，
+保证一台都不静默省略。RCON 锁是 per target 的，所以是真并发：整批 ≈ `max(rcon_timeout)`，
+不是求和。单台的路径**完全不经过**这里（走的是与 P6 之前逐字相同的那条），只有 ≥2 台才分块。
+
+**渲染**复用 `name_budget()` / `_fit()`：3 台 × 50 个名字正好会踩 `MAX_LEN`，而
+`truncate()` 切的是尾部 —— 切掉的正是最后几台的**名单**，消息看着完全正常。所以
+`render_whitelist_list` 把「被截断了」**返回**给调用方去打 warning（渲染层不能记日志，
+与 `format_events` / `render_report` 同一约定）。注意 `clipped` **不能**用 `_fit` 的返回值
+长度去判：`_fit` 认输时返回的是 `truncate(build(0))`，长度**反而正常**，照长度判断会
+一律报「没截断」。
+
+**另一个权限盲区**：`MC_ADMIN_QQ` 鉴的是「**人**」、不分服，机制没变，但它的**作用域被
+配置放大了** —— 以前一个群只能动一台，现在 `whitelist` 数组里每多一项，那个号能改的
+白名单就多一份。这是**静默的权限扩大**（命令、日志、`--list-audiences` 都只会说「发往 N 台」），
+所以 `mcs_audiences.toml.example` 的坑 5、DEPLOY 4.2 第 5 条和 README 都专门写了一段。
+
+**迁移（必须做，否则 bot 起不来）**：真配置里那行单表写法要改成数组。
+`parse_audiences` 对旧形态**直接报错**，`ServerConfigError` 会一路冒到 `main`。

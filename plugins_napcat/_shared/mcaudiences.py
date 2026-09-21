@@ -48,6 +48,7 @@ from .mcservers import (
     ServerBook,
     ServerConfigError,
     ServerTarget,
+    WhitelistRoute,
     _as_bool,
     _as_text,
     _reject_unknown,
@@ -102,16 +103,28 @@ class Audience:
 
     @property
     def whitelist_summary(self) -> str:
-        """白名单归属的一句话说明。启动日志与 --list-audiences 共用。"""
-        owner = self.book.whitelist_owner
-        if owner is None:
+        """白名单归属的一句话说明。启动日志与 --list-audiences 共用。
+
+        **单台时逐字沿用 P6 之前的文案**（它被 DEPLOY/README 引用过，且单台是绝大多数
+        情况）；多台才换排版，且**逐台列出命令前缀** —— 一个群里两台服的前缀很可能不同
+        （vanilla 用 whitelist、代理用 globalwhitelist），只说「白名单发往 2 台」等于把
+        「哪台用哪个前缀」这个最容易写错的字段藏起来。
+        """
+        routes = self.book.whitelist_routes
+        if not routes:
             return "不提供白名单管理"
-        if not owner.rcon_enabled:
-            return f"白名单发往 {owner.name}[{owner.id}]，但它没配 rcon.password —— 发不出去"
-        return (
-            f"白名单发往 {owner.name}[{owner.id}]"
-            f"（命令前缀 {self.book.whitelist_command!r}）"
-        )
+
+        def one(route: WhitelistRoute) -> str:
+            if not route.rcon_enabled:
+                return f"{route.name}[{route.id}]（没配 rcon.password —— 发不出去）"
+            return f"{route.name}[{route.id}]（命令前缀 {route.command!r}）"
+
+        if len(routes) == 1:
+            route = routes[0]
+            if not route.rcon_enabled:
+                return f"白名单发往 {route.name}[{route.id}]，但它没配 rcon.password —— 发不出去"
+            return f"白名单发往 {route.name}[{route.id}]（命令前缀 {route.command!r}）"
+        return f"白名单发往 {len(routes)} 台：" + "、".join(one(r) for r in routes)
 
     def summary(self) -> str:
         """一行概览：这条关联覆盖几个群、关联了哪几台服。"""
@@ -258,30 +271,67 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
                     f"本条关联的服务器只有：{'、'.join(ids) or '（空）'}"
                 )
 
+        # 白名单归属：**一组表**，每台白名单服一项，各带自己的命令前缀（可省）。
+        # 先把形态归一化成「项列表」再往下走，下游（警告 / 概要 / 投影）就只见到一种
+        # 形态，不可能各自处理两种而漂开。
         whitelist_raw = raw.get("whitelist")
-        whitelist_target = ""
-        whitelist_command = _DEFAULT_COMMAND
+        whitelist_items: list[dict] = []
         if whitelist_raw is not None:
-            if not isinstance(whitelist_raw, dict):
+            if not isinstance(whitelist_raw, list):
+                # 单表写法（P6 之前唯一的形态）在这里报错而不是兼容它：一件事只留一种
+                # 写法，报错里带上照抄就能改对的动作。与当初 [whitelist] 段搬家同一套做法。
+                # 这段报错会**原样进群**（mc_admin / mc_stats 的「服务器配置读不了：…」），
+                # 所以不能写 markdown：QQ 不渲染 `**`，群里看到的会是连星号一起的原文。
                 raise ServerConfigError(
-                    f'{where}.whitelist 必须是一个表，例如 whitelist = {{ target = "bingo" }}'
+                    f"{where}.whitelist 现在必须是一组表（表数组），每台白名单服一项："
+                    f'whitelist = [{{ target = "bingo" }}, '
+                    f'{{ target = "proxy", command = "globalwhitelist" }}]。'
+                    f"单表写法已不再接受 —— 一个群可以管多台服，命令前缀也是逐台不同的"
                 )
-            _reject_unknown(whitelist_raw, _WHITELIST_KEYS, f"{where}.whitelist")
-            whitelist_target = _as_text(
-                whitelist_raw.get("target", ""), f"{where}.whitelist.target"
-            )
-            whitelist_command = (
-                _as_text(whitelist_raw.get("command", ""), f"{where}.whitelist.command")
-                or _DEFAULT_COMMAND
-            )
-            if whitelist_target and whitelist_target not in ids:
+            if not whitelist_raw:
                 raise ServerConfigError(
-                    f"{where}.whitelist.target 指向 {whitelist_target!r}，"
-                    f"但它不在本条的 targets 里；本条关联的服务器只有：{'、'.join(ids) or '（空）'}"
+                    f"{where}.whitelist 是空数组。空数组 = 一台白名单服都没有，"
+                    f"和「整个键删掉」逐字等价；要么删掉这个键，要么写清发往哪台："
+                    f'whitelist = [{{ target = "bingo" }}]'
                 )
+            for index, item in enumerate(whitelist_raw, start=1):
+                if not isinstance(item, dict):
+                    raise ServerConfigError(
+                        f"{where}.whitelist 第 {index} 项必须是一个表，实际是 {item!r}"
+                    )
+                whitelist_items.append(item)
+
+        whitelist_routes: list[WhitelistRoute] = []
+        for index, item in enumerate(whitelist_items, start=1):
+            item_where = f"{where}.whitelist 第 {index} 项"
+            _reject_unknown(item, _WHITELIST_KEYS, item_where)
+            target_id = _as_text(item.get("target", ""), f"{item_where}.target")
+            command = (
+                _as_text(item.get("command", ""), f"{item_where}.command") or _DEFAULT_COMMAND
+            )
+            if not target_id:
+                # 「只写了 command 没写 target」等于这项不存在。警告而不是报错（见
+                # _audience_warnings），但**只丢这一项** —— 合法的那些照常生效。
+                continue
+            if target_id not in ids:
+                # 「不在本条 targets 里」而不是「不在全量表里」：把建筑群的白名单服写成
+                # 社团群的是配错，不是「顺便也能用」—— 那个群里根本打不出这台服的名字。
+                raise ServerConfigError(
+                    f"{item_where}.target 指向 {target_id!r}，但它不在本条的 targets 里；"
+                    f"本条关联的服务器只有：{'、'.join(ids) or '（空）'}"
+                )
+            if any(r.target.id == target_id for r in whitelist_routes):
+                raise ServerConfigError(
+                    f"{item_where}.target {target_id!r} 在本条的 whitelist 里出现了两次；"
+                    f"同一台服只能有一条白名单路由（两条时命令只按第一条发，第二条静默不生效）"
+                )
+            target = book.get(target_id)
+            if target is None:  # 到不了：上面已对着全量表校验过
+                raise ServerConfigError(f"{item_where} 指向不存在的目标 {target_id!r}")
+            whitelist_routes.append(WhitelistRoute(target=target, command=command))
 
         warnings = _audience_warnings(
-            name, ids, whitelist_raw, whitelist_target, book, watch=watch, report=report
+            name, ids, whitelist_items, whitelist_routes, watch=watch, report=report
         )
         audiences.append(
             Audience(
@@ -289,12 +339,7 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
                 groups=tuple(groups),
                 # 投影：本关联的服务器视图。它自己重建 _by_id，所以关联外的服名
                 # 在这里 resolve 不出结果（模块 docstring 第 4 条）。
-                book=book.scoped(
-                    ids,
-                    primary=primary,
-                    whitelist_target=whitelist_target,
-                    whitelist_command=whitelist_command,
-                ),
+                book=book.scoped(ids, primary=primary, whitelist=whitelist_routes),
                 warnings=tuple(warnings),
                 watch=watch,
                 report=report,
@@ -307,9 +352,8 @@ def parse_audiences(text: str, book: ServerBook) -> tuple[Audience, ...]:
 def _audience_warnings(
     name: str,
     ids: list[str],
-    whitelist_raw: object,
-    whitelist_target: str,
-    book: ServerBook,
+    whitelist_items: list[dict],
+    whitelist_routes: list[WhitelistRoute],
     *,
     watch: bool = False,
     report: bool = False,
@@ -319,6 +363,9 @@ def _audience_warnings(
     刻意**不**重复全量表里那些（端口冲突、某个目标没配 rcon 密码）：全量那份在启动
     日志和 --list-targets 里各打一次就够，每条关联再抄一遍只会把日志冲成噪音，
     而噪音正是 DEPLOY 教人看日志尾巴排查时最不想有的东西。
+
+    `whitelist_items` 是归一化后的**原始项**（含被丢弃的那些），`whitelist_routes`
+    是真正生效的路由。两者都要，才说得清「哪一项被忽略了」。
     """
     warnings: list[str] = []
     if not ids:
@@ -334,19 +381,41 @@ def _audience_warnings(
                 f"「{name}」写了 {on} 但本条没关联任何服务器 —— 推送对它不会有任何输出；"
                 f"targets 填好之后自动生效，不用改这个开关"
             )
-    if whitelist_target:
-        owner = book.get(whitelist_target)
-        # 上面已校验过它一定在 ids 里，所以 owner 不会是 None
-        if owner is not None and not owner.rcon_enabled:
+    # **逐台**一条。写成 `if 第一台 and not rcon_enabled` 那种单数判断的话，「配了 3 台、
+    # 第 2 台没配密码」永远不会被报出来，而群里表现为「那台的命令发出去没反应」。
+    for route in whitelist_routes:
+        if not route.rcon_enabled:
             warnings.append(
-                f"「{name}」的白名单服 {owner.name} 没配 rcon.password，白名单命令发不出去"
+                f"「{name}」的白名单服 {route.name} 没配 rcon.password，白名单命令发不出去"
             )
-    elif isinstance(whitelist_raw, dict) and "command" in whitelist_raw:
-        # 写了命令前缀却没写发给谁 —— 命令前缀写错是本次排第一的坑，这个形态
-        # 一眼看不出来，但它等于「白名单整个没配」。
-        warnings.append(
-            f"「{name}」的 whitelist 只写了 command 没写 target，本条关联不提供白名单管理"
-        )
+
+    # 没写 target 的项：**只丢这一项**，合法的那些照常生效（下面那句会把还活着的列出来）。
+    # 只写 command 的形态一眼看不出来，但它等于「这一项白名单没配」。
+    blanks = [
+        (index, item)
+        for index, item in enumerate(whitelist_items, start=1)
+        if not str(item.get("target", "")).strip()
+    ]
+    if blanks:
+        if whitelist_routes:
+            kinds = "、".join(
+                f"第 {i} 项"
+                + ("只写了 command 没写 target" if "command" in item else "没写 target 也没写 command")
+                for i, item in blanks
+            )
+            warnings.append(
+                f"「{name}」的 whitelist {kinds}，该项被忽略；"
+                f"本群的白名单服只有：{'、'.join(r.name for r in whitelist_routes)}"
+            )
+        elif len(whitelist_items) == 1 and "command" in whitelist_items[0]:
+            warnings.append(
+                f"「{name}」的 whitelist 只写了 command 没写 target，本条关联不提供白名单管理"
+            )
+        else:
+            warnings.append(
+                f"「{name}」的 whitelist 里 {len(blanks)} 项都没写 target，"
+                f"本条关联不提供白名单管理"
+            )
     return warnings
 
 

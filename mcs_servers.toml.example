@@ -50,7 +50,7 @@
 #
 # ⚠️ **[whitelist] 段和 [defaults].primary 已经不在这里了**（2026-09-21 搬走）。
 #    它们要按 QQ 群区分，所以住进了 mcs_audiences.toml 的每条 [[audience]]：
-#       whitelist = { target = "bingo", command = "whitelist" }
+#       whitelist = [{ target = "bingo", command = "whitelist" }]   # 一组表，每台一项
 #       primary   = "gtnh"
 #    在本文件里留下它们会**直接报错**（并告诉你搬去哪），不会静默忽略。
 # ============================================================
@@ -117,10 +117,12 @@ rcon    = { port = 25585, password = "<RCON 密码>" }
 # port  = 25565
 # rcon  = { port = 25575, password = "<Velocircon 的密码>" }
 #
-# # 代理的 rcon 只为白名单服务（它没有 list 命令）。在 mcs_audiences.toml 里把该关联的
-# # whitelist.target 改成 "proxy"，command 改成插件实际命令（Global Whitelist 是
-# # globalwhitelist）。⚠️ 代理也必须在**每条**要用白名单的 [[audience]].targets 里，
-# # 否则那条关联的 whitelist.target 会校验失败。
+# # 代理的 rcon 只为白名单服务（它没有 list 命令）。要在 mcs_audiences.toml 里**做两件事**：
+# #   1. 把 "proxy" 加进那条 [[audience]].targets（否则白名单项校验不过，加载就报错）
+# #   2. 在它的 whitelist 数组里加一项：
+# #        { target = "proxy", command = "globalwhitelist" }
+# #      command 写插件实际注册的命令（Global Whitelist 是 globalwhitelist）。
+# #      子服那一项**保留不动** —— 代理管的是入服校验，子服自己的白名单还在。
 #
 # # 代理上**不要装 glist 类的插件**。分服名单一律由各子服自己的 RCON 提供，
 # # 代理挂了不该让所有子服的名单一起消失。

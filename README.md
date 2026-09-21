@@ -16,7 +16,7 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 | `@机器人 你好` | 「收到！被动回复链路已打通 🎉」——链路自检 |
 | `@机器人 oopz` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
 | `@机器人 mc [服名]` | 🗺️ Minecraft 在线人数 + 玩家名单。**不带服名 = 本群关联的服的总览**（每个服一小段名单）；带服名 = 该服明细，服名支持 id / 名字 / 别名 / 唯一前缀，认不出或有歧义都会明确回复 |
-| `@机器人 whitelist add/remove <玩家名>`<br>`@机器人 whitelist list` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且本群那条群关联的 `whitelist` 要指到一台配了 RCON 的服） |
+| `@机器人 whitelist add/remove <玩家名> [服名]`<br>`@机器人 whitelist list [服名]` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且本群那条群关联的 `whitelist` 要指到配了 RCON 的服）。服名写在**末尾**；本群只有一台白名单服时可以省，多台时必须点名 |
 
 > 触发词可改：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（逗号分隔，不区分大小写）。一条消息只会被一个插件响应。
 >
@@ -196,7 +196,7 @@ name      = "社团群"
 groups    = [123456789]
 targets   = ["gtnh", "bingo", "backstabbed"]      # 顺序 = @查询 总览里的展示顺序
 primary   = "gtnh"                                # 不带服名的 @查询 默认看它
-whitelist = { target = "bingo", command = "whitelist" }
+whitelist = [{ target = "bingo", command = "whitelist" }]  # **一组表**，每台白名单服一项
 watch     = true                                  # 本群的 groups 收进服提醒
 report    = true                                  # 本群的 groups 收定时播报
 
@@ -223,7 +223,7 @@ targets   = []                                    # 合法：那个群的查询�
 
 ### 管理 MC 玩家白名单
 
-管理员在群里发 `@机器人 whitelist add <玩家名>` 即可把玩家加进服务端白名单，不用登控制台。另有 `whitelist remove <玩家名>`、`whitelist list`。
+管理员在群里发 `@机器人 whitelist add <玩家名>` 即可把玩家加进服务端白名单，不用登控制台。另有 `whitelist remove <玩家名>`、`whitelist list`。一条群关联可以管**多台**白名单服，此时命令里要点名（`whitelist add <玩家名> <服名>`）——只有一台时可以省。
 
 ```powershell
 # .env：只有列在这里的 QQ 号能用管理命令
@@ -231,24 +231,35 @@ MC_ADMIN_QQ=123456789,987654321
 ```
 
 ```toml
-# mcs_audiences.toml：**按群**指定命令发给哪台服、用什么前缀
+# mcs_audiences.toml：**按群**指定命令发给哪几台服、每台用什么前缀
 [[audience]]
 name      = "社团群"
 groups    = [123456789]
-targets   = ["bingo", "backstabbed"]
-whitelist = { target = "bingo", command = "whitelist" }   # 整段省略 = 本群不管白名单
+targets   = ["bingo", "backstabbed", "proxy"]
+# 一组表，每台白名单服一项；command 可省（缺省 "whitelist"）。整段省略 = 本群不管白名单。
+whitelist = [
+  { target = "bingo" },                                   # 子服：插件自带 whitelist
+  { target = "proxy", command = "globalwhitelist" },       # 代理：Global Whitelist
+]
 ```
 
 > ⚠️ `MC_ADMIN_QQ` **留空 = 该功能对所有人关闭**——与其他「留空 = 不限制」的配置相反，这是刻意的：配错的后果是任何人都能改服务端白名单。
 >
-> ⚠️ `whitelist` 是**每条群关联各一份**（不是全局一份）：社团群的管理员碰不到建筑群的白名单。`target` 必须是**本条 `targets`** 之一，`command` **必须与插件注册的命令一字不差**：vanilla / NekoList 是 `whitelist`，Global Whitelist 是 `globalwhitelist`，ProxyWhitelist 是 `pwl`。写错的表现是每次操作都回 `Unknown command`、群里报「未生效」，而且**不报错**。注意群里打的触发词（`.env` 的 `MC_ADMIN_TRIGGER`）和这个前缀是两个不同的轴。
+> 群里怎么点名：命令里**服名写在最后，一次只打一台**。`whitelist add Steve bingo` = 加到 `bingo`；`whitelist list` 不点名 = **一次列出本群全部白名单服**（按 `【服名】` 分块，并发查，一台上线也不影响另一台），`whitelist list bingo` 只看那一台。只有一台白名单服时可以省服名，行为与以前完全一样；**多台时不写服名会被要求点名，没有「默认那台」的回退**——猜错就是改错服务器的白名单。`add` / `remove` 一律只影响点名的那一台。
 >
-> 那条关联没写 `whitelist` → 群里回「⚠️ 本群没有指定白名单服」；写了但那台没配
-> `rcon.password` → 回「⚠️ 白名单服 X 没配 RCON 密码」。
+> ⚠️ `whitelist` 是**每条群关联各一份**（不是全局一份）：社团群的管理员碰不到建筑群的白名单。数组里每一项的 `target` 必须是**本条 `targets`** 之一，`command` **必须与插件注册的命令一字不差**：vanilla / NekoList 是 `whitelist`，Global Whitelist 是 `globalwhitelist`，ProxyWhitelist 是 `pwl`。写错的表现是每次操作都回 `Unknown command`、群里报「未生效」，而且**不报错**。多台时**逐台**都要对，一台写错只有点名它的命令才会出问题。注意群里打的触发词（`.env` 的 `MC_ADMIN_TRIGGER`）和这个前缀是两个不同的轴。
+>
+> ⚠️ **多写一台白名单服 = 同一个人能改的服务器多一台**。`MC_ADMIN_QQ` 鉴的是「人」、**不分服**，所以加项之前先确认这个人本来就该管那台服——这是权限扩大，而它不会出现在任何输出里。
+>
+> 三种「没配好」群里回的话不同，修法也不同，别混：
+> 那条关联没写 `whitelist` → 「⚠️ 本群没有指定白名单服」；写了但那台没配
+> `rcon.password` → 「⚠️ 白名单服 X 没配 RCON 密码」；多台时没点名 →
+> 「⚠️ 本群有 N 台白名单服，命令里要点名发给哪台」。服名认不出、或者那台是本群的服
+> 但**没配白名单**，也各有专门文案（后者**不会**谎称「没这台服」）。
 >
 > 别把两个「白名单」搞混：**群关联**（`mcs_audiences.toml`，限制哪些 QQ 群能用 MC 功能、各看哪几台）和 **MC 玩家白名单**（`whitelist.json`，服务端的玩家准入表，由本功能管理）毫无关系，可以同时生效。`MC_ALLOWED_GROUPS` 是 2026-09-21 之前那套群白名单，已被群关联取代、不再生效。
 >
-> 本功能走 RCON，所以该条的 `whitelist.target` 要指到一台配了 `rcon.password` 的服；且只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`。
+> 本功能走 RCON，所以该项的 `target` 要指到配了 `rcon.password` 的服；且只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`。
 >
 > 名字打什么大小写都行：bot 先读一遍白名单，下发命令时改用服务端记录的那条拼写（`add vul` 服务端存的是 `Vul`，回复里会注明），判定同样忽略大小写。**重复添加和重复移除都会如实回「无需改动」，不会虚报成功。**
 >

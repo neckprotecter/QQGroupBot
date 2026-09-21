@@ -21,6 +21,7 @@ r"""验证 Minecraft 服务器取数链路（SLP + RCON），不启动机器人�
 """
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -147,6 +148,7 @@ def _self_test() -> int:
         ERR_LIST_ARGS,
         ERR_NAME,
         ERR_USAGE,
+        AdminCommand,
         parse_command,
         plan_mutation,
         settle,
@@ -155,30 +157,49 @@ def _self_test() -> int:
         whitelist_matches,
     )
     from plugins_napcat._shared.schedule import seconds_until_slot
-    from plugins_napcat._shared.mcservers import ServerConfigError, parse_book, round_budget
+    from plugins_napcat._shared.mcservers import (
+        PICK_AMBIGUOUS,
+        PICK_NEED_NAME,
+        PICK_NOT_WHITELIST,
+        PICK_NO_ROUTE,
+        PICK_OK,
+        PICK_UNKNOWN,
+        ServerConfigError,
+        WhitelistRoute,
+        parse_book,
+        round_budget,
+    )
     from plugins_napcat._shared.triggers import detect, primary_keyword
 
-    # MC 白名单命令解析用例：(说明, 输入, 期望动词, 期望玩家名, 期望失败原因)。
-    # 失败用例的动词/玩家名都是 None（parse_command 返回 None, 原因）。
-    _CMD_CASES: list[tuple[str, str, str | None, str | None, str]] = [
-        ("基本 add", "whitelist add Steve", "add", "Steve", ""),
-        ("基本 remove", "whitelist remove Steve", "remove", "Steve", ""),
-        ("list（不带参数）", "whitelist list", "list", "", ""),
-        ("大小写不敏感", "WHITELIST Add Steve", "add", "Steve", ""),
-        ("前缀噪音不影响解析", "帮我 whitelist add Steve", "add", "Steve", ""),
+    # MC 白名单命令解析用例：(说明, 输入, 期望动词, 期望玩家名, 期望服名, 期望失败原因)。
+    # 失败用例的动词/玩家名/服名都是 None（parse_command 返回 None, 原因）。
+    _CMD_CASES: list[tuple[str, str, str | None, str | None, str | None, str]] = [
+        ("基本 add", "whitelist add Steve", "add", "Steve", "", ""),
+        ("基本 remove", "whitelist remove Steve", "remove", "Steve", "", ""),
+        ("list（不带参数）", "whitelist list", "list", "", "", ""),
+        ("大小写不敏感", "WHITELIST Add Steve", "add", "Steve", "", ""),
+        ("前缀噪音不影响解析", "帮我 whitelist add Steve", "add", "Steve", "", ""),
+        # P6：服名写在末尾。两个 token 以上时最后一个当服名、其余当玩家名 —— 玩家名
+        # 正则不允许空格，所以这个切法无歧义，不必猜「哪个像服名」。
+        ("服名放末尾", "whitelist add Steve bingo", "add", "Steve", "bingo", ""),
+        ("list 点名一台", "whitelist list bingo", "list", "", "bingo", ""),
+        ("服名放末尾（remove）", "whitelist remove Steve backstab", "remove", "Steve", "backstab", ""),
         # 空白（含 \n）只当分隔符，真正拼进 RCON 的是正则校验过的名字
-        ("换行只当分隔符", "whitelist add\nSteve", "add", "Steve", ""),
-        ("缺子命令", "whitelist", None, None, ERR_USAGE),
-        ("缺玩家名", "whitelist add", None, None, ERR_NAME),
-        ("名字里有空格", "whitelist add Steve please", None, None, ERR_NAME),
-        ("注入第二条命令", "whitelist add Steve; stop", None, None, ERR_NAME),
-        ("路径式名字", "whitelist add ../Steve", None, None, ERR_NAME),
-        ("非 ASCII 名字", "whitelist add 玩", None, None, ERR_NAME),
-        ("超长名字（17 位）", "whitelist add aaaaaaaaaaaaaaaaa", None, None, ERR_NAME),
-        ("动词不在白名单", "whitelist kick Steve", None, None, ERR_USAGE),
-        ("list 不接受参数", "whitelist list Steve", None, None, ERR_LIST_ARGS),
-        ("空文本", "", None, None, ERR_USAGE),
-        ("无关文本", "你好", None, None, ERR_USAGE),
+        ("换行只当分隔符", "whitelist add\nSteve", "add", "Steve", "", ""),
+        ("缺子命令", "whitelist", None, None, None, ERR_USAGE),
+        ("缺玩家名", "whitelist add", None, None, None, ERR_NAME),
+        # 三个 token：玩家名 = "Steve please"（过不了正则），服名 = extra。
+        # 两个 token 的 "add Steve please" 现在是合法的「发给 please 服」——服名认不认得
+        # 出来由调用方判（ServerBook.pick_whitelist），这一层只做语法。
+        ("名字里有空格", "whitelist add Steve please extra", None, None, None, ERR_NAME),
+        ("注入第二条命令", "whitelist add Steve; stop", None, None, None, ERR_NAME),
+        ("路径式名字", "whitelist add ../Steve", None, None, None, ERR_NAME),
+        ("非 ASCII 名字", "whitelist add 玩", None, None, None, ERR_NAME),
+        ("超长名字（17 位）", "whitelist add aaaaaaaaaaaaaaaaa", None, None, None, ERR_NAME),
+        ("动词不在白名单", "whitelist kick Steve", None, None, None, ERR_USAGE),
+        ("list 最多一个服名", "whitelist list a b", None, None, None, ERR_LIST_ARGS),
+        ("空文本", "", None, None, None, ERR_USAGE),
+        ("无关文本", "你好", None, None, None, ERR_USAGE),
     ]
 
     # 白名单包含判定：(说明, 输出原文, 查的名字, 期望)
@@ -338,18 +359,37 @@ def _self_test() -> int:
     print()
 
     print("== MC 白名单命令解析自测 ==")
-    # (说明, 输入, 期望动词, 期望玩家名, 期望失败原因)
-    for desc, raw, verb, player, err in _CMD_CASES:
+    # (说明, 输入, 期望动词, 期望玩家名, 期望服名, 期望失败原因)
+    for desc, raw, verb, player, server, err in _CMD_CASES:
         cmd, got_err = parse_command(raw)
         got_verb = cmd.verb if cmd else None
         got_player = cmd.player if cmd else None
-        ok = (got_verb, got_player, got_err) == (verb, player, err)
+        got_server = cmd.server if cmd else None
+        ok = (got_verb, got_player, got_server, got_err) == (verb, player, server, err)
         failed += not ok
         print(f"   {'PASS' if ok else 'FAIL'}  {desc}")
         if not ok:
             print(f"         输入: {raw!r}")
-            print(f"         期望: verb={verb!r} player={player!r} err={err!r}")
-            print(f"         实际: verb={got_verb!r} player={got_player!r} err={got_err!r}")
+            print(f"         期望: verb={verb!r} player={player!r} server={server!r} err={err!r}")
+            print(
+                f"         实际: verb={got_verb!r} player={got_player!r} "
+                f"server={got_server!r} err={got_err!r}"
+            )
+
+    # P6：动词**之前**的 token 原样交给调用方。这是那个「静默丢弃」bug 的墓碑 ——
+    # 改之前 `whitelist gtnh add Steve` 里的 gtnh 被扔掉、命令照发往缺省那台。
+    cmd, _ = parse_command("whitelist gtnh add Steve")
+    ok = cmd is not None and cmd.server == "" and cmd.pre_verb == ("whitelist", "gtnh")
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  动词前的 token 收进 pre_verb（服名位置写错时调用方才能拦）")
+    if not ok:
+        print(f"         实际: server={getattr(cmd, 'server', None)!r} pre_verb={getattr(cmd, 'pre_verb', None)!r}")
+
+    # 短构造（只有 verb/player）必须仍然有效：调用方与自测里到处这么用
+    cmd = AdminCommand("add", "Steve")
+    ok = cmd.server == "" and cmd.pre_verb == ()
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  AdminCommand 新增字段有默认值（短构造不破）")
     print()
 
     print("== MC 白名单名单解析自测（parse_whitelist_names / whitelist_contains）==")
@@ -882,6 +922,24 @@ port = 25565
             ["--audience", "社团群", "--whitelist"],
             ("whitelist", "", "社团群"),
         ),
+        # --target 对 --whitelist 是**收窄**（只看那一台）。这个分支原本排在
+        # --whitelist 之后，于是 `--whitelist --target bingo` 被静默当成「列出全部」——
+        # 命令看着成功了，只是没按你说的收窄，而且没有任何提示。
+        (
+            "--whitelist + --target 收窄到一台",
+            ["--whitelist", "--target", "bingo"],
+            ("whitelist", "bingo", ""),
+        ),
+        (
+            "--whitelist 裸写服名也收窄",
+            ["--whitelist", "bingo"],
+            ("whitelist", "bingo", ""),
+        ),
+        (
+            "--whitelist + --audience + --target 三个一起",
+            ["--audience", "社团群", "--whitelist", "--target", "bingo"],
+            ("whitelist", "bingo", "社团群"),
+        ),
         ("自测优先于实机探测", ["--self-test", "--target", "x"], ("self-test", "", "")),
         ("不带参数时关联名留空 = 由 _live 自己挑默认那条", ["bingo"], ("live", "bingo", "")),
         # ↓ 这些是本次真正要防的：它们都**不能**变成实机探测
@@ -1106,6 +1164,82 @@ port = 25565
     print(f"   {'PASS' if ok else 'FAIL'}  「没关联服」与「没开通」是两句不同的话")
     print()
 
+    # ------------- 多台白名单服的 list 渲染（`whitelist list` 不点名时）-------------
+    # 与总览/播报共用 _fit 的意义就在这一块：3 台 × 50 个名字正好踩 MAX_LEN，而
+    # truncate 切的是尾部 —— 切掉的正是最后几台的**名单**，消息看着完全正常。
+    # 渲染层不能记日志，所以「截断了」只能靠第二个返回值传出去给调用方吼一声。
+    print("== 多台白名单 list 渲染自测 ==")
+    from plugins_napcat._shared.mcrender import WhitelistListRow, render_whitelist_list
+
+    rows = [
+        WhitelistListRow("Bingo", ("阿伟", "小明")),
+        WhitelistListRow("GTNH", ("Steve",)),
+        WhitelistListRow("谁是杀手", ("乙", "丙", "丁")),
+    ]
+    text, clipped = render_whitelist_list(rows, total_names=6)
+    ok = (
+        not clipped
+        and "（3 台服）" in text
+        and all(f"【{r.name}】" in text for r in rows)
+        and all(n in text for r in rows for n in r.names)
+        and "【GTNH】（1 人）" in text
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  三台按顺序各一块、每台人数正确、无截断（{len(text)} 字）")
+    if not ok:
+        print(f"         实际: {text!r}")
+
+    # 一台读不到**不影响其余台**：整条回「执行失败」会把已经查到的两台一起丢掉，
+    # 而那是「把没发生的事报成没发生」—— 与把没发生的报成发生同样不准。
+    text, _ = render_whitelist_list(
+        [
+            WhitelistListRow("Bingo", ("阿伟",)),
+            WhitelistListRow("GTNH", None, "没配 RCON 密码，这台的名单读不到"),
+            WhitelistListRow("谁是杀手", ("乙",)),
+        ],
+        total_names=2,
+    )
+    ok = "阿伟" in text and "乙" in text and "没配 RCON 密码" in text and "【GTNH】⚠️" in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  一台读不到 → 那台一行说明，其余台照常列出")
+    if not ok:
+        print(f"         实际: {text!r}")
+
+    # 「三台都读不到」与「三台都是空名单」必须是两句不同的话：混成一句的话，全崩
+    # 会被读成「服务器上一个人都没有」，而空名单才是真的没人。
+    down = render_whitelist_list([WhitelistListRow("Bingo", None, "连不上")], total_names=0)[0]
+    empty = render_whitelist_list([WhitelistListRow("Bingo", ())], total_names=0)[0]
+    ok = down != empty and "连不上" in down and "（0 人）" in empty
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  「名单没读到」与「名单为空」不是同一句话")
+    if not ok:
+        print(f"         读不到: {down!r}\n         空名单: {empty!r}")
+
+    # 单台（兜底路径）沿用旧表头：群里单台时那句是 @bot mc 一直以来的样子
+    text, _ = render_whitelist_list([WhitelistListRow("Bingo", ("阿伟",))], total_names=1)
+    ok = text.startswith("📋 MC 玩家白名单：") and "台服" not in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单台时沿用旧表头（不带「N 台服」）")
+
+    long_names = tuple(f"Player_{i:02d}_" + "x" * 30 for i in range(50))
+    rows = [WhitelistListRow(f"子服{i}", long_names) for i in range(3)]
+    text, clipped = render_whitelist_list(rows, total_names=150)
+    ok = (
+        clipped
+        and len(text) <= MAX_LEN
+        # 服名一个都不能少：它们是被截断时最该留下的东西（人名可以少几个，
+        # 「哪几台查到了」不行）。
+        and all(f"【子服{i}】" in text for i in range(3))
+    )
+    failed += not ok
+    print(
+        f"   {'PASS' if ok else 'FAIL'}  3 台 × 50 个长名字 → 不超长、服名全在、如实报告截断"
+        f"（{len(text)} 字 ≤ {MAX_LEN}，clipped={clipped}）"
+    )
+    if not ok:
+        print(f"         实际尾部: {text[-160:]!r}")
+    print()
+
     # ---------------- 块 15：mcs_audiences.toml 解析与校验 ----------------
     # 这是「一个群看哪几台服」的唯一来源。它坏了的表现是**群里的行为悄悄变样**：
     # 拼错的键（groups 写成 group）会让那个群永远收不到 MC 回复，而日志里一条线索
@@ -1118,15 +1252,20 @@ port = 25565
 
     _full = parse_book(_SRV_REAL)  # 全量表：proxy / bingo / backstabbed / gtnh
 
-    # 贴近真实：社团群看代理 + 两台子服 + 独立服，白名单发给代理，两个推送开关都开；
-    # 建筑群的组服还没搭，targets = [] 且不开推送，群号用字符串写（两种写法都要认）
+    # 贴近真实：社团群看代理 + 两台子服 + 独立服，白名单发给代理与 Bingo 两台
+    # （代理用 Global Whitelist 的前缀 globalwhitelist，Bingo 省掉 command 用默认值），
+    # 两个推送开关都开；建筑群的组服还没搭，targets = [] 且不开推送，群号用字符串写
+    # （两种写法都要认）
     _AUD_REAL = """
 [[audience]]
 name      = "社团群"
 groups    = [11111111]
 targets   = ["proxy", "bingo", "backstabbed", "gtnh"]
 primary   = "bingo"
-whitelist = { target = "proxy", command = "globalwhitelist" }
+whitelist = [
+  { target = "proxy", command = "globalwhitelist" },
+  { target = "bingo" },
+]
 watch     = true
 report    = true
 
@@ -1150,17 +1289,23 @@ targets = []
         failed += not ok
         print(f"   {'PASS' if ok else 'FAIL'}  群号归一化成字符串（整数与字符串写法都认）")
 
-        # 白名单归属与命令前缀从**本条关联**读出来 —— 这正是它从全量表搬走的原因
+        # 白名单路由（哪几台 + 各自的命令前缀）从**本条关联**读出来 —— 这正是它从
+        # 全量表搬走的原因。顺序 = 配置里的书写顺序，前缀逐台独立（第二台省了 command）。
+        routes = club.book.whitelist_routes
         ok = (
-            club.book.whitelist_owner is not None
-            and club.book.whitelist_owner.id == "proxy"
-            and club.book.whitelist_command == "globalwhitelist"
+            [r.target.id for r in routes] == ["proxy", "bingo"]
+            and [r.command for r in routes] == ["globalwhitelist", "whitelist"]
         )
         failed += not ok
         print(
-            f"   {'PASS' if ok else 'FAIL'}  白名单归属与命令前缀从本条关联读出"
-            f"（{getattr(club.book.whitelist_owner, 'id', None)} / {club.book.whitelist_command!r}）"
+            f"   {'PASS' if ok else 'FAIL'}  白名单路由与逐台前缀从本条关联读出"
+            f"（{[(r.target.id, r.command) for r in routes]}）"
         )
+        # 全量表里没有白名单这回事（`primary` 同理）—— 写进 docstring 就要钉住，
+        # 否则「全量表也能查到白名单服」会变成一条没人验证过的承诺。
+        ok = _full.whitelist_routes == ()
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  全量表（parse_book）里没有白名单路由")
 
         ok = club.book.primary_target is not None and club.book.primary_target.id == "bingo"
         failed += not ok
@@ -1252,19 +1397,52 @@ targets = []
         (
             "whitelist.target 不在本条 targets 里",
             '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
-            'whitelist={target="bingo"}\n',
+            'whitelist=[{target="bingo"}]\n',
             "不在本条的 targets 里",
         ),
+        # 单表写法（P6 之前的唯一形态）现在**必须报错**，且报错要带可照抄的改法。
+        # 静默当成一台会让「配了两台的群其实只有一台在管」无声发生。
         (
-            "whitelist 不是表",
-            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nwhitelist="proxy"\n',
-            "必须是一个表",
+            "whitelist 写成单表（旧写法）",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
+            'whitelist={target="gtnh"}\n',
+            "一组表",
         ),
         (
-            "whitelist 里有未知键",
-            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
-            'whitelist={target="gtnh",cmd="x"}\n',
+            "whitelist 写成字符串",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nwhitelist="proxy"\n',
+            "一组表",
+        ),
+        (
+            "whitelist 是空数组",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nwhitelist=[]\n',
+            "空数组",
+        ),
+        (
+            "whitelist 数组元素不是表",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\nwhitelist=["gtnh"]\n',
+            "第 1 项必须是一个表",
+        ),
+        (
+            "whitelist 第 2 项里有未知键",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh","bingo"]\n'
+            'whitelist=[{target="gtnh"},{target="bingo",cmd="x"}]\n',
             "不认识的键",
+        ),
+        # 同一台服配两项 = 它有两个前缀，下命令时用哪个无从判断 —— 报错而不是取第一个。
+        (
+            "whitelist 里同一台服出现两次",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
+            'whitelist=[{target="gtnh"},{target="gtnh",command="x"}]\n',
+            "出现了两次",
+        ),
+        # 第二条是**第 2 项**坏：错误里必须点名第 2 项，否则「两台里坏了一台」时
+        # 看日志会以为是第一台（诊断成本翻倍）。
+        (
+            "whitelist 第 2 项的 target 不在本条 targets 里",
+            '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
+            'whitelist=[{target="gtnh"},{target="bingo"}]\n',
+            "第 2 项",
         ),
         # 布尔键只认 TOML 的真布尔。字符串真值必须**报错**：静默当真会让这个群莫名
         # 收到推送，静默当假就是「配置写了没生效」，两种都正是本工程最防的那类键。
@@ -1308,40 +1486,109 @@ targets = []
             failed += 1
             print(f"   FAIL  {desc}：应报错却通过了")
 
-    # command 省略 → 用默认前缀；whitelist.target 留空串 = 本群不管白名单（合法）
+    # command 逐台独立（省略 → 默认前缀）；whitelist.target 留空串 = 本群不管白名单（合法）
     auds = parse_audiences(
-        '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
-        'whitelist={target="gtnh"}\n'
+        '[[audience]]\nname="a"\ngroups=[1]\ntargets=["bingo","proxy"]\n'
+        'whitelist=[{target="proxy"},{target="bingo",command="globalwhitelist"}]\n'
         '[[audience]]\nname="b"\ngroups=[2]\n'
-        '[[audience]]\nname="c"\ngroups=[3]\ntargets=["gtnh"]\nwhitelist={target=""}\n',
+        '[[audience]]\nname="c"\ngroups=[3]\ntargets=["gtnh"]\nwhitelist=[{target=""}]\n',
         _full,
     )
-    ok = auds[0].book.whitelist_command == "whitelist"
+    a_routes = auds[0].book.whitelist_routes
+    ok = [(r.target.id, r.command) for r in a_routes] == [
+        ("proxy", "whitelist"),
+        ("bingo", "globalwhitelist"),
+    ]
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  whitelist.command 省略 → 默认 {auds[0].book.whitelist_command!r}")
-    ok = auds[1].book.whitelist_owner is None and auds[2].book.whitelist_owner is None
+    print(
+        f"   {'PASS' if ok else 'FAIL'}  command 逐台独立、省略用默认、顺序=书写顺序"
+        f"（{[(r.target.id, r.command) for r in a_routes]}）"
+    )
+    ok = auds[1].book.whitelist_routes == () and auds[2].book.whitelist_routes == ()
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  没写 whitelist / target 留空串 → 本群不管白名单")
+
+    # 这一句同时进**启动日志**和 `--list-audiences`，是「这台服的白名单发给谁」的唯一
+    # 可见来源。单台必须**逐字**沿用 P6 之前的文案（绝大多数群是单台，DEPLOY 引用过它）；
+    # 多台必须逐台列出前缀 —— 只说「发往 2 台」等于把最容易写错的那个字段藏起来。
+    ok = auds[1].whitelist_summary == "不提供白名单管理"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  没配白名单 → 摘要直说「不提供白名单管理」")
+    got = parse_audiences(
+        '[[audience]]\nname="a"\ngroups=[1]\ntargets=["bingo"]\nwhitelist=[{target="bingo"}]\n',
+        _full,
+    )[0].whitelist_summary
+    ok = got == "白名单发往 Bingo[bingo]（命令前缀 'whitelist'）"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单台摘要逐字沿用旧文案（{got}）")
+
+    multi_summary = parse_audiences(
+        '[[audience]]\nname="a"\ngroups=[1]\ntargets=["bingo","backstabbed"]\n'
+        'whitelist=[{target="bingo"},{target="backstabbed"}]\n',
+        _full,
+    )[0].whitelist_summary
+    ok = (
+        multi_summary.startswith("白名单发往 2 台：")
+        and "Bingo[bingo]（命令前缀 'whitelist'）" in multi_summary
+        # 第二台没配 rcon.password（backstabbed 在全量表里就没有）—— 摘要里必须说出来，
+        # 否则它和一台好服长得一模一样，而群里每次命令都会回「发不出去」。
+        and "没配 rcon.password" in multi_summary
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  多台摘要逐台列前缀并点名没配密码的那台（{multi_summary}）")
     # 只写 command 不写 target：等于白名单整个没配，形态一眼看不出来，必须给警告
     auds = parse_audiences(
         '[[audience]]\nname="a"\ngroups=[1]\ntargets=["gtnh"]\n'
-        'whitelist={command="globalwhitelist"}\n',
+        'whitelist=[{command="globalwhitelist"}]\n',
         _full,
     )
-    ok = auds[0].book.whitelist_owner is None and any("只写了 command" in w for w in auds[0].warnings)
+    ok = auds[0].book.whitelist_routes == () and any("只写了 command" in w for w in auds[0].warnings)
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  只写 command 没写 target → 不给白名单 + 一条警告")
     if not ok:
         print(f"         实际警告: {auds[0].warnings}")
+    # 部分项只写 command：**只丢那一项**，合法的照常生效，且警告要点名被丢的是第几项、
+    # 并且把还活着的列出来 —— 否则「两台里有一项没生效」只能靠人去数配置。
+    auds = parse_audiences(
+        '[[audience]]\nname="a"\ngroups=[1]\ntargets=["bingo","gtnh"]\n'
+        'whitelist=[{target="bingo"},{command="globalwhitelist"}]\n',
+        _full,
+    )
+    routes = auds[0].book.whitelist_routes
+    hit = [w for w in auds[0].warnings if "第 2 项" in w and "只写了 command" in w]
+    ok = (
+        [r.target.id for r in routes] == ["bingo"]
+        and len(hit) == 1
+        and "本群的白名单服只有：Bingo" in hit[0]
+        and "第 1 项" not in hit[0]
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  多台里只坏一项 → 合法的仍生效，警告点名第 2 项")
+    if not ok:
+        print(f"         实际路由: {[r.target.id for r in routes]}  实际警告: {auds[0].warnings}")
     # 白名单服没配 rcon 密码：能加载，但命令发不出去（backstabbed 在全量表里就没配）
     auds = parse_audiences(
         '[[audience]]\nname="a"\ngroups=[1]\ntargets=["backstabbed"]\n'
-        'whitelist={target="backstabbed"}\n',
+        'whitelist=[{target="backstabbed"}]\n',
         _full,
     )
     ok = any("没配 rcon.password" in w for w in auds[0].warnings)
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  白名单服没配 rcon.password → 警告（命令发不出去）")
+    # **逐台**报：两台里只有一台没配密码时，警告必须只点那一台。写成「只看第一台」的话
+    # 这条测试照样过（Bingo 有密码 → 没警告），所以断言里必须同时出现「有警告」和
+    # 「警告里不含另一台的名字」两半。
+    auds = parse_audiences(
+        '[[audience]]\nname="a"\ngroups=[1]\ntargets=["bingo","backstabbed"]\n'
+        'whitelist=[{target="bingo"},{target="backstabbed"}]\n',
+        _full,
+    )
+    hit = [w for w in auds[0].warnings if "没配 rcon.password" in w]
+    ok = len(hit) == 1 and "谁是杀手" in hit[0] and "Bingo" not in hit[0]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  两台里只坏一台 → 警告只点那一台（不含另一台）")
+    if not ok:
+        print(f"         实际警告: {auds[0].warnings}")
 
     # 开了推送却没有服可盯：**警告而不是报错**。它不是「被忽略的配置键」—— 我们读懂了
     # 它，并且明确说出它为什么没有输出；而硬报错会让整台 bot 起不来（ServerConfigError
@@ -1485,6 +1732,108 @@ watch   = true
         failed += 1
         print("   FAIL  scoped() 遇到不存在的 id 应报错却通过了")
 
+    # 投影层的两道防御：路由不在本视图 / 同一台服两条路由。两者都到不了（mcaudiences
+    # 已经对着全量表校验过），但真到了的话后果是「投影出一个少了白名单服的视图」和
+    # 「同一台服用两个前缀、命令只按第一条发」—— 都是静默的，所以宁可炸。
+    _bingo = _full.get("bingo")
+    for desc, ids, routes in (
+        ("路由不在本次投影的 targets 里", ["gtnh"], (WhitelistRoute(target=_bingo),)),
+        (
+            "同一台服两条白名单路由",
+            ["bingo"],
+            (WhitelistRoute(target=_bingo), WhitelistRoute(target=_bingo, command="x")),
+        ),
+    ):
+        try:
+            _full.scoped(ids, whitelist=routes)
+        except ServerConfigError:
+            print(f"   PASS  scoped() 拦住「{desc}」")
+        else:
+            failed += 1
+            print(f"   FAIL  scoped() 应拦住「{desc}」却通过了")
+
+    # ---- 「这条命令发给哪台」：pick_whitelist 的六态。B 方案（服名放末尾）的正确性
+    # 全靠这一层：认错一台 = 改错服务器的白名单，而且群里不会有任何迹象。
+    club_routes = club.book.whitelist_routes
+    ok = [r.target.id for r in club_routes] == ["proxy", "bingo"]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  社团群的白名单路由是两台（{ [r.target.id for r in club_routes] }）")
+
+    # 不点名 + 多台 = 必须点名。**没有「默认那台」的回退**：猜错就是改错服。
+    pick = club.book.pick_whitelist("")
+    ok = pick.reason == PICK_NEED_NAME and pick.candidates == ("proxy", "Bingo")
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  两台不点名 → 要点名（候选 {pick.candidates}）")
+
+    # 点名**第二台**：写成「只认第一条」的实现会让这台永远选不中，而第一台照常能用
+    # —— 单台用例全绿、只有真去点第二台的人才发现。这条就是为它存在的。
+    pick = club.book.pick_whitelist("Bingo")
+    ok = pick.ok and pick.route.target.id == "bingo" and pick.route.command == "whitelist"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  点名第二台命中（{pick.route.target.id if pick.ok else pick.reason}）")
+
+    # 前缀：复用的是 resolve() 那套（NFKC + 别名 + 唯一前缀），不是另写一份比对
+    pick = club.book.pick_whitelist("prox")
+    ok = pick.ok and pick.route.target.id == "proxy" and pick.route.command == "globalwhitelist"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  唯一前缀命中，且带出这一台自己的前缀"
+          f"（{pick.route.command if pick.ok else pick.reason}）")
+
+    # 「b」同时是 bingo 和 backstabbed（含它的别名 backstab）的前缀 —— 候选里出现的是
+    # **服名**（谁是杀手）不是 id，因为这两个候选就是要拿给群里的人照着打的。
+    pick = club.book.pick_whitelist("b")
+    ok = pick.reason == PICK_AMBIGUOUS and set(pick.candidates) == {"Bingo", "谁是杀手"}
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  歧义服名 → 列出候选（{pick.reason} {pick.candidates}）")
+
+    # 本群**没有**这台服：能查的都列出来，否则「打错一个字」和「这台不归本群」分不出来
+    pick = club.book.pick_whitelist("nope")
+    ok = pick.reason == PICK_UNKNOWN and set(pick.candidates) == {
+        "proxy",
+        "Bingo",
+        "谁是杀手",
+        "gtnh",
+    }
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  不认识的服名 → 列出本群能查的（{pick.candidates}）")
+
+    # 本群**有**这台服、只是没配白名单。这条最容易写错：直接回「没有叫 gtnh 的服」是
+    # **假话**（gtnh 就在本群的 targets 里、@bot mc gtnh 能查到），照着改名字是白费功夫。
+    pick = club.book.pick_whitelist("gtnh")
+    ok = (
+        pick.reason == PICK_NOT_WHITELIST
+        and pick.found is not None
+        and pick.found.id == "gtnh"
+        and pick.candidates == ("proxy", "Bingo")
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  是本群的服但不是白名单服 → 不谎称「没这台服」"
+          f"（found={getattr(pick.found, 'id', None)}）")
+
+    # 别名也走同一条路（backstabbed 有别名 backstab）
+    pick = club.book.pick_whitelist("backstab")
+    ok = pick.reason == PICK_NOT_WHITELIST and pick.found.id == "backstabbed"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  别名同样认出来（{getattr(pick.found, 'id', None)}）")
+
+    # 单台：可以不点名，且**不能用多台的规则要求它点名**（逼人写反而容易写错）
+    one = _full.scoped(["bingo"], whitelist=(WhitelistRoute(target=_bingo),))
+    pick = one.pick_whitelist("")
+    ok = pick.reason == PICK_OK and pick.route.target.id == "bingo"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单台时不点名直接命中（{pick.reason}）")
+
+    pick = _full.scoped(["gtnh"]).pick_whitelist("")
+    ok = pick.reason == PICK_NO_ROUTE and not pick.ok
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  一台白名单服都没有 → NO_ROUTE（{pick.reason}）")
+
+    # 跨关联隔离：建筑群的视图里连 proxy 都不存在，更不可能把它当白名单服
+    pick = arch.book.pick_whitelist("proxy")
+    ok = pick.reason == PICK_UNKNOWN
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  建筑群点名社团群的服 → 未知（隔离）")
+
     # 命令前缀**必须来自配置**，不许在命令层写死 "whitelist"。
     # 写死的后果是：代理上线后把 whitelist.command 改成 globalwhitelist **毫无效果**，
     # 而配置、日志、诊断三处都会显示新值 —— 这正是「接受了但忽略掉」的配置键，
@@ -1504,6 +1853,98 @@ watch   = true
     print(f"   {'PASS' if ok else 'FAIL'}  白名单命令前缀不硬编码（由配置传入命令层）")
     if not ok:
         print(f"         硬编码的行: {hard}")
+
+    # 同一条约束的**文案那一半**：回复里那句「照着这条命令去服务端查」也不能写死。
+    # 这里坏掉的表现特别隐蔽 —— 命令真的发对了（前缀走的是 route.command），只有
+    # **提示文案**给出服务端不存在的命令，而那句话正是群友下一步照着做的动作指引。
+    #
+    # mcs/mc_admin.py **不能 import**（mcs/__init__.py 会拉起持有 matcher 的 mc_reporter，
+    # 那需要 nonebot.init()），所以只能当文本读。这也是它和 _shared/mcadmin.py 分家的原因。
+    mcsrc = (ROOT / "plugins_napcat" / "mcs" / "mc_admin.py").read_text(encoding="utf-8")
+
+    def _block(src: str, head: str) -> str:
+        """抠出一个顶层函数（到下一个顶层 def / **async** def 为止）。
+
+        两个前缀都要找：这个文件里下一个就是 `async def _list_rows`，只找 `\\ndef `
+        会一路切到几百行之后的 `handle_admin`，于是把它的日志文案也算进「函数体内」。
+        """
+        rest = src[src.index(head) + len(head) :]
+        ends = [i for i in (rest.find("\ndef "), rest.find("\nasync def ")) if i >= 0]
+        return rest[: min(ends)] if ends else rest
+
+    body = _block(mcsrc, "def _build_body(")
+    hard = [
+        line.strip()
+        for line in body.splitlines()
+        if '"whitelist ' in line or "'whitelist " in line
+    ]
+    ok = not hard and "command" in _block(mcsrc, "def _build_message(")
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  回复文案里的命令前缀也不硬编码（由 route.command 传入）")
+    if not ok:
+        print(f"         硬编码的行: {hard}")
+
+    # 「先认服、再下发」是语义，不是实现细节：顺序反过来就会先执行再报「认不出服名」——
+    # 那就是**改了服才说不认识它**。用源码位置比较钉住，因为没有更早的层次能拦住它。
+    # 锚点取 handle_admin 里那句完整的下发调用：`_list_rows` 里还有一句同名的（多台
+    # list 用），拿函数名去比会被它抢先命中。
+    pick_at = mcsrc.index("pick_whitelist(cmd.server)")
+    run_at = mcsrc.index("await run_whitelist_command(cmd, route.target, command)")
+    ok = pick_at < run_at
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  mc_admin 里「认服名」在「下发命令」之前")
+
+    # 六态里除 OK 外每一态都必须有自己的文案分支：漏掉一态不会报错，它会掉进函数末尾
+    # 的兜底里回「本群没有指定白名单服」—— 而那是一句**假话**（本群配了），照着它去
+    # 改配置永远改不对。所以把「每一态都被提到」钉住，新增态时这里会先红。
+    reply = _block(mcsrc, "def _pick_reply(")
+    missing = [k for k in ("PICK_NEED_NAME", "PICK_UNKNOWN", "PICK_AMBIGUOUS", "PICK_NOT_WHITELIST") if k not in reply]
+    ok = not missing
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  pick 的每一态都有文案分支（没接到的会谎称「本群没配」）")
+    if not ok:
+        print(f"         缺: {missing}")
+
+    # 异常原文不许进群，只进日志。已经踩过一次：群里那条「连不上 MC 服务器（RCON）：
+    # [WinError 1225] 远程计算机拒绝网络连接。」后面半截是给人看日志的，群里那位既
+    # 读不懂也做不了什么。两条 tombstone 钉的是**具体的旧形态**（写不成泛化的「不许用
+    # exc」——那既不好写也不好读）。
+    leak = [p for p in ("（RCON）：", "认证失败：{exc}") if p in mcsrc]
+    ok = not leak
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  群里的 RCON 报错不带异常原文（原文只进日志）")
+    if not ok:
+        print(f"         还在: {leak}")
+
+    # QQ **不渲染 markdown**：`**加粗**` 会连星号一起原样打出来。这个也踩过一次 ——
+    # 群友看到的是「服名要写在**最后**」。所以扫一遍**回复文案**：跳过 docstring 和
+    # 整行注释（那些是给读代码的人看的），只扫能发到 QQ 群的模块（oopz 那边走另一个
+    # 客户端，不在其列）。扫的是源码文本，以后新加的文案自动被覆盖。
+    # 认字符串的办法是「这一行里有引号」，所以 `2**31` 这种运算符不会被误判。
+    qq_files = (
+        "mcs/mc_admin.py",
+        "mcs/mc_stats.py",
+        "mcs/mc_reporter.py",
+        "mcs/__init__.py",
+        "_shared/mcrender.py",
+        "_shared/mcaudiences.py",
+        "_shared/mcservers.py",
+        "hello/__init__.py",
+    )
+    bold = []
+    for rel in qq_files:
+        src = (ROOT / "plugins_napcat" / rel).read_text(encoding="utf-8")
+        stripped = re.sub(r'"""(?:.|\n)*?"""', "", src)
+        for lineno, line in enumerate(stripped.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if "**" in line and ('"' in line or "'" in line):
+                bold.append(f"{rel}:{lineno}")
+    ok = not bold
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  群回复文案里没有 markdown 加粗（QQ 会连星号一起打出来）")
+    if not ok:
+        print(f"         {bold}")
     print()
 
     # ---------------- 块 17：跨文件警告 ----------------
@@ -1600,7 +2041,7 @@ watch   = true
     # 命令前缀写错时服务端的真实回执（同样没有冒号，见块 12 那组案例）
     _JUNK = "Unknown or incomplete command. See below for errornosuchcmd list<--[HERE]"
 
-    async def _run_fake(replies, verb, player=""):
+    async def _run_fake(replies, verb, player="", command="whitelist"):
         """跑一条命令，RCON 换成按顺序吐 replies 的假货。返回 (结果, 实际发出去的命令)。"""
         sent: list[str] = []
 
@@ -1611,7 +2052,9 @@ watch   = true
         origin = _mca.rcon_command
         _mca.rcon_command = fake
         try:
-            res = await _mca.run_whitelist_command(_mca.AdminCommand(verb, player), _tgt)
+            res = await _mca.run_whitelist_command(
+                _mca.AdminCommand(verb, player), _tgt, command
+            )
         finally:
             _mca.rcon_command = origin
         return res, sent
@@ -1654,6 +2097,29 @@ watch   = true
     ok = "mutation_sent" in _body and "命令没有发出去" in _body
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  群内文案区分「没发出去」与「发了但未能验证」")
+    if not ok:
+        print(f"         实际: {_body[:200]!r}")
+
+    # ⑤ command 形参逐台传到底：**三条**命令（前置读 / 变更 / 反查）都得用它。
+    #    只看变更那一条的话，「前置读硬编码 whitelist list」这种改法照样过 ——
+    #    而那会让配了 Global Whitelist 的那台每次都读不懂名单，命令一条都发不出去。
+    res, sent = asyncio.run(
+        _run_fake(
+            [_EMPTY_WL, "Added Steve", "There are 1 whitelisted players: Steve"],
+            "add",
+            "Steve",
+            command="globalwhitelist",
+        )
+    )
+    ok = (
+        res.ok is True
+        and sent == ["globalwhitelist list", "globalwhitelist add Steve", "globalwhitelist list"]
+        and not any("whitelist list" in c and "globalwhitelist" not in c for c in sent)
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  command 形参逐台传到底（三条命令都是 globalwhitelist）")
+    if not ok:
+        print(f"         发出去的: {sent}")
     print()
 
     print("== 玩家进出对账自测（reconcile 纯函数）==")
@@ -2304,12 +2770,19 @@ async def _live(query: str = "", audience: str = "") -> int:
     return 1
 
 
-async def _whitelist(audience: str = "") -> int:
+async def _whitelist(audience: str = "", query: str = "") -> int:
     """只读地看一眼服务端白名单，确认解析对不对。
 
-    **白名单归属是按群关联区分的**：发给哪台服、用什么命令前缀都写在
+    **白名单归属是按群关联区分的**：发给哪几台服、每台用什么命令前缀都写在
     `[[audience]].whitelist` 里，所以这条命令必须站在某条关联上跑（默认第一条）。
     不站在关联上就问不出「这个群的白名单发给谁」——那正是本次改造要解决的问题。
+
+    `query` 收窄到其中一台（`--target bingo` 或裸写 `bingo`）。**走的是同一个
+    `pick_whitelist`**，不在这里另写一套名字比对：脚本对使用者的承诺是「脚本里跑得通
+    的写法，群里打出来也一定跑得通」，自己再实现一遍就等于把承诺兑现两遍，而两份
+    一定会漂。
+
+    逐台**串行**：诊断输出要稳定、可读、顺序与配置一致，不为省几秒把顺序交给 gather。
 
     刻意**不发** add / remove：诊断脚本会真实改动服务端，而它没有任何清理逻辑——
     脚本中途挂掉，whitelist.json 就被留在谁也不知道的状态。要测写入，去群里用一次
@@ -2318,51 +2791,95 @@ async def _whitelist(audience: str = "") -> int:
     from plugins_napcat._shared.mc import RconError, rcon_command
     from plugins_napcat._shared.mcaudiences import audiences_path
     from plugins_napcat._shared.mcadmin import parse_whitelist_names
+    from plugins_napcat._shared.mcservers import (
+        PICK_AMBIGUOUS,
+        PICK_NEED_NAME,
+        PICK_NOT_WHITELIST,
+    )
 
     book, picked, code = _pick_audience(audience)
     if book is None:
         return code
 
-    owner = book.whitelist_owner
-    if owner is None:
+    routes = book.whitelist_routes
+    if not routes:
         print(f"关联「{picked.name}」没有指定白名单服：该群的白名单管理不可用。")
-        print(f"   在 {audiences_path()} 里给这条 [[audience]] 加：")
-        print('   whitelist = { target = "<目标 id>", command = "<插件命令>" }')
+        print(f"   在 {audiences_path()} 里给这条 [[audience]] 加（**一组表**，每台服一项）：")
+        print('   whitelist = [{ target = "<目标 id>", command = "<插件命令>" }]')
         print("   （群里会回「本群没有指定白名单服」）")
         return 1
-    if not owner.rcon_enabled:
-        print(f"关联「{picked.name}」的白名单服 {owner.id} 没配 rcon.password：")
-        print("   命令发不出去，也就没有名单可看。（群里会回「白名单服 X 没配 RCON 密码」）")
+
+    if query:
+        pick = book.pick_whitelist(query)
+        if not pick.ok:
+            # 每一态的修法都不一样，一条笼统的「认不出这个服名」会让人往错的方向改。
+            print(f"== --target {query!r} 没认出来：{pick.reason} ==")
+            if pick.reason == PICK_NEED_NAME or pick.reason == PICK_AMBIGUOUS:
+                print(f"   本群的白名单服：{'、'.join(pick.candidates)}")
+            elif pick.reason == PICK_NOT_WHITELIST and pick.found is not None:
+                print(f"   {pick.found.name} 是本群关联的服，但它不是白名单服。")
+                print(f"   本群的白名单服只有：{'、'.join(pick.candidates)}")
+            else:
+                names = "、".join(t.name for t in book.targets) or "（一台都没有）"
+                print(f"   本群能查的是：{names}（id / 名字 / 别名 / 唯一前缀都认）")
+            return 2
+        routes = (pick.route,)
+        print(f"== --target {query!r} → 收窄到 {pick.route.name} [{pick.route.id}] ==")
+        print()
+
+    ok_count = 0
+    for index, route in enumerate(routes, start=1):
+        if len(routes) > 1:
+            print(f"---- 第 {index}/{len(routes)} 台 ----")
+        if not route.rcon_enabled:
+            print(f"== 白名单目标：{route.name} [{route.id}] ==")
+            print("   [!!] 没配 rcon.password：命令发不出去，也就没有名单可看。")
+            print("        （群里会回「白名单服 X 没配 RCON 密码」）")
+            print()
+            continue
+
+        # 命令前缀来自这一台的 route.command，**不是**硬编码的 "whitelist"。
+        # 代理上线后多半是 globalwhitelist，这里跟着配置走才能看出真实命令对不对。
+        command = f"{route.command} list"
+        print(f"== 白名单目标：{route.name} [{route.id}] {route.rcon_addr} ==")
+        print(f"   RCON 命令前缀（本条关联里这一台的 whitelist.command）：{route.command!r}")
+        print("   群里打的是触发词（.env 的 MC_ADMIN_TRIGGER），与它无关 —— 代理上线后")
+        print("   必然是「群里打 whitelist、RCON 里发 globalwhitelist」这种分叉。")
+        print()
+
+        try:
+            raw = await rcon_command(route.target, command)
+        except RconError as exc:
+            print(f"== RCON `{command}` 失败 ==\n   [!] {type(exc).__name__}: {exc}")
+            print()
+            continue
+
+        print(f"== RCON `{command}` 原始输出 ==")
+        print(f"   原文: {raw!r}")
+        print()
+        print("== 解析结果 ==")
+        names = parse_whitelist_names(raw)
+        if names is None:
+            print("   [!!] 判不出来（输出为空，或没有冒号说明格式被改写过）。")
+            print("        不是故障——但本服的加白命令会回「未能验证」而不是「已添加」。")
+            print()
+            continue
+        print(f"   共 {len(names)} 人")
+        print(f"   {names[:20]}{' …' if len(names) > 20 else ''}")
+        print()
+        ok_count += 1
+
+    if len(routes) > 1:
+        print(f"== 汇总：{len(routes)} 台中 {ok_count} 台正常 ==")
+        print()
+    if ok_count != len(routes):
+        print("== 结论 ==")
+        # 单台时不写「1 台没读到」：只有一台的时候「哪台」没有信息量，反而像是漏报了别的。
+        if len(routes) > 1:
+            print(f"   [!!] {len(routes) - ok_count} 台没读到（原因见上）。")
+        else:
+            print("   [!!] 这台没读到（原因见上）。")
         return 1
-
-    # 命令前缀来自本条的 whitelist.command，**不是**硬编码的 "whitelist"。
-    # 代理上线后多半是 globalwhitelist，这里跟着配置走才能看出真实命令对不对。
-    command = f"{book.whitelist_command} list"
-    print(f"== 白名单目标：{owner.name} [{owner.id}] {owner.rcon_addr} ==")
-    print(f"   命令前缀（本条关联的 whitelist.command）：{book.whitelist_command!r}")
-    print(f"   群里打的是触发词（.env 的 MC_ADMIN_TRIGGER），与它无关 —— 代理上线后")
-    print("   必然是「群里打 whitelist、RCON 里发 globalwhitelist」这种分叉。")
-    print()
-
-    try:
-        raw = await rcon_command(owner, command)
-    except RconError as exc:
-        print(f"== RCON `{command}` 失败 ==\n   [!] {type(exc).__name__}: {exc}")
-        return 1
-
-    print(f"== RCON `{command}` 原始输出 ==")
-    print(f"   原文: {raw!r}")
-    print()
-
-    names = parse_whitelist_names(raw)
-    print("== 解析结果 ==")
-    if names is None:
-        print("   [!!] 判不出来（输出为空，或没有冒号说明格式被改写过）。")
-        print("        不是故障——但本服的加白命令会回「未能验证」而不是「已添加」。")
-        return 1
-    print(f"   共 {len(names)} 人")
-    print(f"   {names[:20]}{' …' if len(names) > 20 else ''}")
-    print()
     print("== 结论 ==")
     print("   [OK] 解析正常，白名单命令可以正常判定成败。")
     print("   注意：本脚本只能看到 whitelist.json 的内容，看不出服务端有没有开")
@@ -2569,10 +3086,11 @@ _USAGE = (
     "   --self-test            只跑解析自测，不联网\n"
     "   --list-targets         打印 mcs_servers.toml 解析出的目标，不联网\n"
     "   --list-audiences       打印 mcs_audiences.toml 的每条群关联，不联网\n"
-    "   --target <服名>        只实机探测这一个目标\n"
-    "   --whitelist            只读地看一眼服务端白名单\n"
+    "   --target <服名>        只实机探测这一个目标；配 --whitelist 时收窄到那一台\n"
+    "   --whitelist            只读地看一眼服务端白名单（本条关联的全部白名单服，\n"
+    "                          逐台列出；一台时就是那一台）\n"
     "   --audience <关联名>    站在哪条群关联的视角上（默认第一条；影响 --target\n"
-    "                          能认出的服名，以及 --whitelist 发给哪台服）\n"
+    "                          能认出的服名，以及 --whitelist 发给哪几台服）\n"
     "   （不带参数）           实机探测所选关联的全部目标"
 )
 
@@ -2626,10 +3144,11 @@ def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
         return "list-targets", "", ""
     if "--list-audiences" in argv:
         return "list-audiences", "", ""
-    if "--whitelist" in argv:
-        return "whitelist", "", picked
 
     # --target 的服名走和群里同一套解析，所以脚本能跑通的写法群友也一定能用。
+    # **在判动作之前算**：--target 对 `--whitelist` 也有意义（收窄到那一台），
+    # 放在 --whitelist 分支之后的话 `--whitelist --target bingo` 会被静默当成
+    # 「列出全部」—— 命令看着成功了，只是没按你说的收窄。
     explicit = "--target" in argv or any(a.startswith("--target=") for a in argv)
     query = _value("--target") if explicit else ""
     if not explicit:
@@ -2642,6 +3161,9 @@ def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
     if explicit and not query.strip():
         print(f"== --target 后面要跟一个服名（例如 --target bingo）==\n{_USAGE}")
         return None
+
+    if "--whitelist" in argv:
+        return "whitelist", query, picked
     return "live", query, picked
 
 
@@ -2657,7 +3179,7 @@ def main() -> int:
     if action == "list-audiences":
         return _list_audiences()
     if action == "whitelist":
-        return asyncio.run(_whitelist(audience))
+        return asyncio.run(_whitelist(audience, query))
     return asyncio.run(_live(query, audience))
 
 

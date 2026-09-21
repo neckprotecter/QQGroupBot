@@ -60,7 +60,7 @@ _MOVED_HINT = (
 )
 _MOVED_WHITELIST_HINT = _MOVED_HINT.format(
     key="[whitelist] 段",
-    write='whitelist = { target = "bingo", command = "whitelist" }',
+    write='whitelist = [{ target = "bingo", command = "whitelist" }]',
 )
 _MOVED_PRIMARY_HINT = _MOVED_HINT.format(
     key="[defaults].primary",
@@ -155,14 +155,76 @@ class Resolution:
 
 
 @dataclass(frozen=True)
+class WhitelistRoute:
+    """白名单的一条路由：命令发给**哪台**服、RCON 里发**什么前缀**。
+
+    一条群关联可以有 N 条（P6）。`target` 一定是**本视图**里的目标：由 scoped() 校验，
+    所以关联外的服既不会出现在候选里，也 pick 不到 —— 隔离靠投影，不靠调用方自觉
+    （与 ServerBook.scoped 里 `_by_id` 必须重建是同一条原则）。
+
+    前缀随路由走而不是随关联走：代理上线后子服用 `whitelist`、代理用 `globalwhitelist`，
+    同一个群里两台的前缀就是不一样的。
+    """
+
+    target: ServerTarget
+    command: str = _DEFAULT_COMMAND
+
+    # 转发属性：调用方原先读 owner.name / owner.id / owner.rcon_enabled / owner.rcon_addr，
+    # 转发之后那些行不用逐字改，「一个 → 一组」的 diff 才看得清。
+    @property
+    def name(self) -> str:
+        return self.target.name
+
+    @property
+    def id(self) -> str:
+        return self.target.id
+
+    @property
+    def rcon_enabled(self) -> bool:
+        return self.target.rcon_enabled
+
+    @property
+    def rcon_addr(self) -> str:
+        return self.target.rcon_addr
+
+
+# pick_whitelist 的结果码。六态互斥，且**每一态群里都必须有话可说** —— 触发词一旦被
+# 认领，静默比报错更坏（见 mcs/mc_admin.py 的模块 docstring）。
+PICK_OK = "ok"  # 命中一条路由
+PICK_NO_ROUTE = "no_route"  # 本群压根没配白名单服
+PICK_NEED_NAME = "need_name"  # 有好几台，命令里必须点名
+PICK_UNKNOWN = "unknown"  # 认不出这个服名
+PICK_AMBIGUOUS = "ambiguous"  # 服名有歧义
+PICK_NOT_WHITELIST = "not_whitelist"  # 认得出这台服，但它不是白名单服
+
+
+@dataclass(frozen=True)
+class WhitelistPick:
+    """一次「这条命令发给哪台」的解析结果。"""
+
+    reason: str
+    query: str = ""
+    route: WhitelistRoute | None = None
+    # 歧义候选 / 本群可选的服名清单 / 本群全部白名单服名，三处共用（都是给人看的服名）
+    candidates: tuple[str, ...] = ()
+    # PICK_NOT_WHITELIST 专用：那台确实存在、只是不在白名单路由里。有这个字段才可能
+    # 说出「GTNH 是本群的服，但本群的白名单服是 Bingo」——否则只能骗人说「没这台服」。
+    found: ServerTarget | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.route is not None
+
+
+@dataclass(frozen=True)
 class ServerBook:
     """一份加载完的目标表。"""
 
     targets: tuple[ServerTarget, ...] = ()
-    # 下面三项只在**投影出来的子视图**里有意义（见 scoped）。全量表里它们恒为空：
+    # 下面两项只在**投影出来的子视图**里有意义（见 scoped）。全量表里它们恒为空：
     # 「白名单发给谁」和「本群默认看哪台」都是群关联的属性，不是服务器清单的。
-    whitelist_target: str = ""
-    whitelist_command: str = _DEFAULT_COMMAND
+    # whitelist_routes 的顺序就是配置里的书写顺序（诊断打印按它排）。
+    whitelist_routes: tuple[WhitelistRoute, ...] = ()
     # 「主服」的 id。留空 = 用 targets[0]。
     primary: str = ""
     warnings: tuple[str, ...] = ()
@@ -176,20 +238,23 @@ class ServerBook:
         ids: Sequence[str],
         *,
         primary: str = "",
-        whitelist_target: str = "",
-        whitelist_command: str = _DEFAULT_COMMAND,
+        whitelist: Sequence[WhitelistRoute] = (),
     ) -> "ServerBook":
         """按一组 id 投影出**子视图**，用于「某个 QQ 群关联的服务器」。
 
         返回的是另一个 ServerBook，不是新类型：resolve / targets_primary_first /
-        whitelist_owner / primary_target 全部原样复用，群关联因此不需要另写一套
+        pick_whitelist / primary_target 全部原样复用，群关联因此不需要另写一套
         名字解析 —— 两份实现一定会漂，而漂的方式是「同一台服在两个群里认得出/认不出」。
 
-        **`_by_id` 必须重建，不能沿用 self._by_id**。get() / whitelist_owner /
-        primary_target 全查它；漏了不报错，只是 whitelist_owner 返回 None，
-        群里表现为「查询正常、白名单说不可用」，而 primary_target 因为退回
+        **`_by_id` 必须重建，不能沿用 self._by_id**。get() / pick_whitelist /
+        primary_target 全查它；漏了不报错，只是白名单路由一台都 pick 不出来，
+        群里表现为「查询正常、白名单说本群没配」，而 primary_target 因为退回
         targets[0] 碰巧还是对的 —— 最难发现的那种。_by_id 里**只有本视图的目标**，
         所以关联外的服名 resolve 会如实返回「未知」（这正是隔离赖以成立的东西）。
+
+        白名单路由**故意不做第二份索引**（不像 _by_id 那样建 `_whitelist_by_id`）：
+        P5 那次「scoped 忘了重建索引 → 白名单静默不可用」的教训就是「多一份必须记得
+        重建的东西」造成的。每群至多几台，pick_whitelist 直接线性扫 whitelist_routes。
 
         warnings 留空、不继承 self.warnings：全量那份（端口冲突等）在启动日志和
         --list-targets 里各打一次就够，继承过来会让每条关联都重复一遍别人的问题。
@@ -203,10 +268,26 @@ class ServerBook:
                 # 真到了说明校验被绕过了，宁可炸也不要投影出一个少了一台的视图。
                 raise ServerConfigError(f"目标 {target_id!r} 不在目标表里，无法投影")
             picked.append(target)
+        in_view = {t.id for t in picked}
+        routes: list[WhitelistRoute] = []
+        seen: set[str] = set()
+        for route in whitelist:
+            if route.target.id not in in_view:
+                # 同样到不了：mcaudiences 已校验过 target 在本条 targets 里。
+                raise ServerConfigError(
+                    f"白名单路由 {route.target.id!r} 不在本次投影的目标里，无法投影"
+                )
+            if route.target.id in seen:
+                # 重复的后果是「同一个群给一台服用两个前缀」，而命令只会按第一条发出去 ——
+                # 又一处「配了却不生效」，所以在投影这一步就拦住。
+                raise ServerConfigError(
+                    f"白名单路由 {route.target.id!r} 重复：同一台服只能有一条白名单路由"
+                )
+            seen.add(route.target.id)
+            routes.append(route)
         return ServerBook(
             targets=tuple(picked),
-            whitelist_target=whitelist_target,
-            whitelist_command=whitelist_command,
+            whitelist_routes=tuple(routes),
             primary=primary,
             warnings=(),
             _by_id={t.id: t for t in picked},
@@ -227,13 +308,49 @@ class ServerBook:
         return self.targets[0] if self.targets else None
 
     @property
-    def whitelist_owner(self) -> ServerTarget | None:
-        """白名单命令发给哪台。本视图没指定时返回 None（本群不管白名单）。
+    def whitelist_targets(self) -> tuple[ServerTarget, ...]:
+        """本视图的白名单服，只要目标不要前缀（诊断脚本打印用）。"""
+        return tuple(r.target for r in self.whitelist_routes)
 
-        查的是**本视图**的 _by_id，所以子视图只会命中自己关联到的那几台 ——
-        社团群的管理员因此碰不到建筑群的白名单目标。
+    def pick_whitelist(self, query: str = "") -> WhitelistPick:
+        """「这条白名单命令发给哪台」。**白名单归属的唯一解析入口**，群消息与诊断脚本共用。
+
+        两条规则，顺序不能反：
+
+        1. **query 为空**：0 条路由 → NO_ROUTE；恰好 1 条 → 命中（单台可以省略服名，
+           这是绝大多数情况的写法）；≥2 条 → NEED_NAME。**没有「默认那台」这种回退** ——
+           多台时猜错的后果是改错服务器的白名单。
+        2. **query 非空**：先在本条关联的**全部**目标里跑现成的 resolve()（NFKC + 唯一
+           前缀 + 歧义三态），认出是哪台之后再看它是不是白名单路由。不能只在本视图的
+           白名单路由里解析：`gtnh` 是这个群查得到的服、只是没配白名单，直接回
+           「没有叫 gtnh 的服」是**假话**（群里 `@bot mc gtnh` 明明查得到它），照着这句
+           去改配置名字是白费功夫。所以那种情况回 NOT_WHITELIST 并带上 found。
         """
-        return self._by_id.get(self.whitelist_target) if self.whitelist_target else None
+        raw = (query or "").strip()
+        routes = self.whitelist_routes
+        if not raw:
+            if len(routes) == 1:
+                return WhitelistPick(PICK_OK, route=routes[0])
+            if not routes:
+                return WhitelistPick(PICK_NO_ROUTE)
+            return WhitelistPick(PICK_NEED_NAME, candidates=tuple(r.name for r in routes))
+
+        res = self.resolve(raw)
+        if res.ambiguous:
+            return WhitelistPick(PICK_AMBIGUOUS, query=raw, candidates=res.candidates)
+        if not res.ok:
+            return WhitelistPick(
+                PICK_UNKNOWN, query=raw, candidates=tuple(t.name for t in self.targets)
+            )
+        for route in routes:  # 线性扫描：不引入第二份必须记得重建的索引
+            if route.target.id == res.target.id:
+                return WhitelistPick(PICK_OK, query=raw, route=route)
+        return WhitelistPick(
+            PICK_NOT_WHITELIST,
+            query=raw,
+            found=res.target,
+            candidates=tuple(r.name for r in routes),
+        )
 
     @property
     def targets_primary_first(self) -> tuple[ServerTarget, ...]:

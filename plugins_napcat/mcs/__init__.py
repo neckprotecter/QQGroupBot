@@ -84,7 +84,8 @@ async def _log_targets() -> None:
 
     # 触发词（群里打的）与命令前缀（RCON 里发的）是两个不同的轴，代理上线后必然
     # 分叉：群里仍打 `whitelist`，RCON 里要发 `globalwhitelist`。前缀错了的表现是
-    # 每次操作都回 Unknown command、群里报「未生效」，所以 whitelist_summary 里写出来了。
+    # 每次操作都回 Unknown command、群里报「未生效」，所以 whitelist_summary **逐台**
+    # 把前缀写出来了 —— 多台时一台写错只会影响那一台，只看「list 能出结果」发现不了。
 
     _log_push_targets(config, "watch", "进服提醒")
     _log_push_targets(config, "report", "定时播报")
