@@ -6,12 +6,32 @@
 - 域过滤、频道名映射、批量昵称解析
 - 公共常量（消息长度上限 / 群推送在 plugins_napcat/_shared/）
 """
+from __future__ import annotations
+
 import asyncio
 import os
+from typing import TYPE_CHECKING
 
 from nonebot.log import logger
 
-from oopz_sdk import OopzBot
+if TYPE_CHECKING:
+    from oopz_sdk import OopzBot
+
+# oopz SDK **默认随 requirements.txt 装上**（`oopz-sdk @ file:./vendor/Oopzbot-SDK`），
+# 但**装不装是部署的人可以选的**：只要 MC 功能、不要 oopz 时，把那行注释掉就不装它。
+# 所以这里不是顶层 `from oopz_sdk import OopzBot` —— 那样缺 SDK 时
+# `load_plugins("plugins_napcat")` 会在导入这棵树时就 ImportError，**连着 MC 功能一起
+# 起不来**，而 MC 跟 oopz 毫无关系。
+# 改成运行期探测：缺了就只停 oopz 这两处（@oopz 查询、定时播报/进频道欢迎），
+# 并且**明说**（群里回一句、日志吼一声），不是静默失效 —— 静默会让「没装 SDK」
+# 看起来像「凭据过期」或「机器人坏了」，排查方向全错。
+try:
+    import oopz_sdk
+except Exception as _exc:  # ModuleNotFoundError，也可能是 SDK 自身依赖缺失
+    oopz_sdk = None
+    _SDK_ERROR: str | None = f"{type(_exc).__name__}: {_exc}"
+else:
+    _SDK_ERROR = None
 
 # 可选：限定统计范围。逗号分隔的 area_id 或域名，缺省时统计全部已加入的域。
 # 例：OOPZ_TARGET_AREAS=奇妙小房间
@@ -24,9 +44,39 @@ _TARGET_AREAS = [
 # 单次 oopz 查询整体超时（秒），避免把回复/播报拖过时限
 _QUERY_TIMEOUT = 20
 
+# 三条凭据缺一不可（OOPZ_PRIVATE_KEY / OOPZ_APP_VERSION 有默认值，不算门槛）
+_REQUIRED_CREDENTIALS = ("OOPZ_DEVICE_ID", "OOPZ_PERSON_UID", "OOPZ_JWT_TOKEN")
+
 # oopz REST 客户端单例（懒加载，复用连接；失败自动重建）
 _oopz_bot: OopzBot | None = None
 _oopz_lock: asyncio.Lock | None = None
+
+
+def sdk_available() -> bool:
+    """oopz SDK 装了没（它默认随依赖装上；见 DEPLOY.md 第 3 节）。**没装不影响 MC 功能**。"""
+    return oopz_sdk is not None
+
+
+def sdk_error() -> str | None:
+    """SDK 导入失败的原始原因，**只进日志、不进群**（同 MC 那边的规矩）。"""
+    return _SDK_ERROR
+
+
+def disabled_reason() -> str | None:
+    """oopz 功能当前不可用的原因（可直接拼进群回复）；一切正常时返回 None。
+
+    两种情况**分开说**：没装 SDK 和装了但凭据没配。修法完全不同（前者是 pip
+    install，后者是跑 tools/oopz_login.py），混成一句话会把人指到错的方向。
+    返回的是**半句**（不带「oopz …」前缀、不带句号），好让调用方按自己的前缀拼。
+    """
+    if oopz_sdk is None:
+        return (
+            "本机未安装 oopz_sdk（它随 requirements.txt 默认装，这台的部署特意跳过了；"
+            "要用 oopz 就 pip install ./vendor/Oopzbot-SDK 然后重启）"
+        )
+    if not all(os.environ.get(k) for k in _REQUIRED_CREDENTIALS):
+        return "凭据未配置（先在终端运行 tools/oopz_login.py，再重启机器人）"
+    return None
 
 
 def _config_from_env() -> "OopzConfig":
@@ -47,11 +97,11 @@ def _config_from_env() -> "OopzConfig":
 
 
 async def _get_client() -> OopzBot | None:
-    """取 oopz 客户端（懒初始化）。缺少凭据返回 None。"""
+    """取 oopz 客户端（懒初始化）。SDK 缺失或凭据不全时返回 None。"""
     global _oopz_bot, _oopz_lock
     if _oopz_bot is not None:
         return _oopz_bot
-    if not all(os.environ.get(k) for k in ("OOPZ_DEVICE_ID", "OOPZ_PERSON_UID", "OOPZ_JWT_TOKEN")):
+    if disabled_reason() is not None:
         return None
     if _oopz_lock is None:
         _oopz_lock = asyncio.Lock()
@@ -59,7 +109,10 @@ async def _get_client() -> OopzBot | None:
         if _oopz_bot is not None:
             return _oopz_bot
         try:
-            bot = OopzBot(_config_from_env())
+            # 走 oopz_sdk.OopzBot 而不是裸名：这个类**只在 SDK 装好时才存在**，
+            # 而上面的 disabled_reason() 已经保证了那一点（顶层用它做注解会被
+            # `from __future__ import annotations` 变成字符串，不会在此处求值）。
+            bot = oopz_sdk.OopzBot(_config_from_env())
             # 只启 REST：bot.start() 会去连 WebSocket，纯查询用不到
             await bot.rest.start()
             _oopz_bot = bot

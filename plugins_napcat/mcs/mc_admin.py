@@ -6,7 +6,7 @@
   2. 管理员 QQ 号（_shared/admin.py，MC_ADMIN_QQ）—— **留空 = 谁都不许用**
   3. 本群有没有白名单服（本条关联的 whitelist 数组，空 = 不管白名单）
   4. 命令解析（动词白名单 + 玩家名正则 + 服名位置）
-  5. 「发给哪台」（ServerBook.pick_whitelist）+ 那台的 rcon.password
+  5. 「发给哪台」（ServerBook.pick_whitelist）+ 那台的通道（RCON 密码或群组接口）
 
 第 3 与第 5 步查的都是**本群那条关联**的服务器视图，不是全局：社团群的管理员因此
 碰不到建筑群的白名单目标。命令前缀（RCON 里发什么词）**逐台**随路由走，一路传进
@@ -38,13 +38,15 @@ from nonebot.log import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegment
 
 from .._shared import admin
-from .._shared.mc import RconAuthError, RconConnectError, RconError
 from .._shared.mcaudiences import audiences_path, default_config
 from .._shared.mcadmin import (
     ERR_LIST_ARGS,
     ERR_NAME,
     AdminCommand,
     AdminResult,
+    WhitelistAuthError,
+    WhitelistError,
+    WhitelistUnreachable,
     parse_command,
     run_whitelist_command,
 )
@@ -72,7 +74,7 @@ mc_admin = on_message(priority=1, block=False)
 
 _DENIED = "🚫 你没有 MC 管理权限，这条命令只有管理员能用。"
 # 「本群没配白名单服」和「配了但发不出去」必须**分开说**：前者要去加 whitelist 数组，
-# 后者要去补 rcon.password —— 一句笼统的「不可用」会让人照着改永远改不对。
+# 后者要去给那台补通道（rcon 或 api）—— 一句笼统的「不可用」会让人照着改永远改不对。
 _NO_WHITELIST = "⚠️ 本群没有指定白名单服，白名单管理不可用。"
 
 # 群回复一律纯文本：**QQ 不渲染 markdown**，`**加粗**` 会连星号一起原样打出来 ——
@@ -80,8 +82,16 @@ _NO_WHITELIST = "⚠️ 本群没有指定白名单服，白名单管理不可�
 # 自测里有一条钉子扫这个目录的字符串（docstring / 整行注释不算），别在回复文案里写 markdown。
 
 
-def _no_password(route: WhitelistRoute) -> str:
-    return f"⚠️ 白名单服 {route.name} 没配 RCON 密码，命令发不出去。"
+def _not_ready(route: WhitelistRoute) -> str:
+    """这台白名单服两条通道都不通。
+
+    文案里**不说死 RCON**：群组服那台走的是对方的 HTTP 接口，写「没配 RCON 密码」
+    会让人去 mcs_servers.toml 里找一个本来就不该有的 rcon 段。
+    """
+    return (
+        f"⚠️ 白名单服 {route.name} 两条通道都没配（既没有 rcon 也没有 api），"
+        f"命令发不出去。"
+    )
 
 
 def _usage(err: str, book: ServerBook | None = None) -> str:
@@ -247,22 +257,36 @@ async def _list_rows(routes: tuple[WhitelistRoute, ...]) -> tuple[WhitelistListR
     """
 
     async def one(route: WhitelistRoute) -> WhitelistListRow:
-        if not route.rcon_enabled:
-            # 单台时这个分支在更前面就拦掉了（文案也更好）；多台时只有这一台缺密码，
-            # 不能因此把其它台的名单一起丢掉。
-            return WhitelistListRow(route.name, None, "没配 RCON 密码，这台的名单读不到")
+        if not route.whitelist_ready:
+            # 单台时这个分支在更前面就拦掉了（文案也更好）；多台时只有这一台两条通道
+            # 都没配，不能因此把其它台的名单一起丢掉。
+            return WhitelistListRow(route.name, None, "两条通道都没配，这台的名单读不到")
         try:
             res = await run_whitelist_command(
                 AdminCommand("list"), route.target, route.command
             )
-        except RconAuthError as exc:  # 是 RconError 子类，必须先接
-            logger.warning("查询 {}[{}] 白名单 RCON 认证失败: {}", route.name, route.id, exc)
-            return WhitelistListRow(route.name, None, "RCON 认证失败")
-        except (RconConnectError, RconError) as exc:
+        except WhitelistAuthError as exc:  # 是 WhitelistError 子类，必须先接
+            logger.warning(
+                "查询 {}[{}] 白名单 {} 认证失败: {}",
+                route.name,
+                route.id,
+                route.channel,
+                exc,
+            )
+            return WhitelistListRow(route.name, None, f"{route.channel} 认证失败")
+        except (WhitelistUnreachable, WhitelistError) as exc:
             # 异常原文只进日志，不进群：`[WinError 1225] 远程计算机拒绝网络连接。` 这类
             # 内容是给看日志的人的，群里那位既读不懂也做不了什么，只是把一行话撑长。
-            logger.warning("查询 {}[{}] 白名单 RCON 失败: {}", route.name, route.id, exc)
-            return WhitelistListRow(route.name, None, f"连不上 {route.name}服务器（RCON）")
+            logger.warning(
+                "查询 {}[{}] 白名单 {} 失败: {}",
+                route.name,
+                route.id,
+                route.channel,
+                exc,
+            )
+            return WhitelistListRow(
+                route.name, None, f"连不上 {route.name}服务器（{route.channel}）"
+            )
         except Exception as exc:  # 兜底：绝不让异常逃逸成「少了一台」
             logger.error("查询 {} 的白名单失败: {}", route.name, exc)
             return WhitelistListRow(route.name, None, "查询失败，详情见机器人日志")
@@ -397,43 +421,49 @@ async def handle_admin(bot: Bot, event: MessageEvent):
         return
     route = pick.route
 
-    if not route.rcon_enabled:
+    if not route.whitelist_ready:
         logger.warning(
-            "「{}」的白名单服 {}[{}] 没配 rcon.password，命令发不出去",
+            "「{}」的白名单服 {}[{}] 既没配 rcon 也没有接口，命令发不出去",
             audience.name,
             route.name,
             route.id,
         )
-        await _reply(bot, group_id, _no_password(route))
+        await _reply(bot, group_id, _not_ready(route))
         return
 
     # 命令前缀随**这一台**走，不硬编码：代理上线后群里照样打 whitelist，
     # 而 RCON 里要发 globalwhitelist。日志里带上它，前缀写错时一眼能看出来。
+    # 接口型目标没有前缀这个概念（路径由 mcbridge 拼死），所以那半句不打印。
     command = route.command
     logger.info(
-        "收到@bot MC 白名单命令：{} {}，来自群 {} 用户 {}；RCON 前缀 {!r} → {}[{}]",
+        "收到@bot MC 白名单命令：{} {}，来自群 {} 用户 {}；{} → {}[{}]{}",
         cmd.verb,
         cmd.player or "-",
         group_id,
         event.get_user_id(),
-        command,
+        route.channel,
         route.name,
         route.id,
+        f"，命令前缀 {command!r}" if not route.target.is_api else "",
     )
     # 多台时错误文案也带服名：同一条命令在不同服上的失败原因可能完全不同，
     # 不带服名的话「连不上」到底是哪台连不上就无从判断。
     label = f"【{route.name}】" if multi else ""
     try:
         result = await run_whitelist_command(cmd, route.target, command)
-    except RconAuthError as exc:  # 是 RconError 子类，必须先接
-        logger.warning("MC 白名单命令 RCON 认证失败: {}", exc)
-        await _reply(bot, group_id, f"{label}😵 RCON 认证失败")
+    except WhitelistAuthError as exc:  # 是 WhitelistError 子类，必须先接
+        logger.warning("MC 白名单命令 {} 认证失败: {}", route.channel, exc)
+        # 接口那条通道 401 的下一步动作是「去要新 token」，说成「认证失败」太笼统
+        hint = "（token 可能被对方轮换了）" if route.target.is_api else ""
+        await _reply(bot, group_id, f"{label}😵 {route.channel} 认证失败{hint}")
         return
-    except (RconConnectError, RconError) as exc:
+    except (WhitelistUnreachable, WhitelistError) as exc:
         # 文案里点名是哪台：单台时 label 是空的，不点名群里就不知道坏的是哪台。
         # 异常原文只进日志，理由同 _list_rows。
-        logger.warning("MC 白名单命令 RCON 失败: {}", exc)
-        await _reply(bot, group_id, f"{label}😵 连不上 {route.name}服务器（RCON）")
+        logger.warning("MC 白名单命令 {} 失败: {}", route.channel, exc)
+        await _reply(
+            bot, group_id, f"{label}😵 连不上 {route.name}服务器（{route.channel}）"
+        )
         return
     except Exception as exc:  # 兜底：绝不让异常逃逸成「群里没反应」
         logger.error("MC 白名单命令异常: {}", exc)

@@ -548,3 +548,97 @@ There are no whitelisted players          # Bingo 26.2 实测原文，2026-09-21
 
 **迁移（必须做，否则 bot 起不来）**：真配置里那行单表写法要改成数组。
 `parse_audiences` 对旧形态**直接报错**，`ServerConfigError` 会一路冒到 `main`。
+
+### 9.13 P9：接入对方群组服的 HTTP 接口（第三条取数通道）
+
+**要解决的真实症状**：SZUcraft 那套群组服（Velocity + 六个子服）**既给不了 SLP 也给不了
+RCON** —— 子服只在 docker 网络 `mcnet` 里，游戏端口没发布；代理那台只有一个内网 HTTP 口。
+对方装了自己的 Velocity 插件 `szucraft-bridge`（四个端点与认证写法记在 `DEPLOY.md` 4.1；
+对方那几份原始文档 `对接/` 2026-09-22 已按用户要求删除，那里面只有一处我们没别处记的
+东西 —— 接口还认 `X-Auth-Token` 和 `?token=`，已补进 DEPLOY.md）。
+所以有了**第三条通道**：一次 `GET /status` 就带每个子服的人数与名单，`/whitelist` 增删查
+白名单（代理层 `PreLoginEvent` 拦截，不经 RCON、不要游戏内权限）。
+
+**八个设计决策**（改之前先读）：
+
+1. **同源合并：一份 `/status` 喂多台目标。** 子服写 `source = "<代理的 id>"`，
+   `fetch_snapshots` 按 hub 分组、**每台 hub 一个 `asyncio.ensure_future` 任务**，
+   子协程 `await` 同一份结果 —— N 台子服只发 1 次 HTTP。子服自己**一个包都不发**
+   （除非它另填了 `host`，见第 4 条）。
+2. **`ServerTarget.hub` 在解析期回填「那台目标本身」**（不是 id），并且**要同步换进
+   `by_id`** —— `ServerBook.get/scoped` 查的就是它。这样取数层能在**任意子集**里工作：
+   `fetch_snapshots([bingo])`（缓存里只有子服过期了、或者某个群只关联了子服）也知道
+   去问谁的接口。原先打算「关联里写了 source 却没写 hub 就报配置错」，**放弃** ——
+   只关联子服的群是合法的，那不是配置错误，是取数层的活儿。
+3. **两条通道互斥，都在解析期报错。** `api`×`rcon`（都能取名单、都能改白名单，同时
+   存在就没法说清走哪条）、`api`×`source`（都是「数据从哪来」）、以及本轮**新加的**
+   `source`×`rcon`。最后这条最隐蔽：两条路**各自都自洽**，只是各说各话 —— 在线名单
+   来自 hub 的接口，而白名单命令走本机 RCON，于是「机器人说已添加，人还是进不去」
+   （代理层的白名单才是进服校验那一道）。取数层自己发现不了，只能解析期拦。
+4. **接口型目标的 `host`/`port` 是可选的，填了有额外价值。** 同源合并**丢掉了独立
+   交叉校验**（人数和名单来自同一份 JSON，以前是 SLP 人数 × RCON 名单互相对账）。
+   补法是：填了 `host` 就并发做一次 SLP，对不上时**按 SLP 报**并明说「接口那份数据可疑」，
+   所以 `McSnapshot` 多了 `count_source`（`slp` / `api`）和 `names_source`
+   （`rcon` / `slp-sample` / `api` / `none`）。SLP 失败不算故障，只说一句「复查没做成」。
+5. **失败性质复用 `SLP_UNREACHABLE` / `SLP_UNPARSEABLE`，只加一个 `API_AUTH`。**
+   那两个常量其实是一套**性质**分类（连不上 vs 连上了但内容不对）而不只是 SLP 的，
+   接口的失败正好落在上面；唯独 401 两边都套不上 —— 它的下一步动作是**去要新 token**，
+   报成「连不上了」会把人赶去查防火墙和隧道，方向全错。
+
+   **hub 取不到时退回 `fetch_snapshot(hub)`（纯 SLP）**，子服如实报「数据来源 X 的接口
+   这次没取到」—— 一个 token 过期不该让整个群组看起来掉线（那会触发一轮假的掉线提醒）。
+
+6. **接口失败要落到目标上，不能只落在 hub 上。** `_api_snapshot` 里对非 proxy 目标会
+   把「名单不完整」那半句丢掉（代理没有分服名单不是故障），但**人数对不上那半句必须留**
+   —— 自测 ③ 一开始就是被这里吞掉的（`接口 2 人 / SLP 7 人` 报成了「来源 slp，无备注」）。
+   总览那一行（全群组人数）恰恰是唯一能看到对不上的地方。
+
+7. **白名单层做成「通道无关」。** `run_whitelist_command` 的「先读后写 + 反查」逻辑两条
+   通道**完全一样**，所以错误族搬到了 `_shared/mcadmin.py`：`WhitelistError` 三个子类
+   （`Unreachable` / `AuthError` / `DataError`）+ `_translate()`，`RconAuthError` 和
+   `BridgeAuthError` 都翻成「凭证不对」。调用方只看这个族，文案里说「RCON」还是「接口」
+   由 `route.channel` 决定（`WhitelistRoute.channel`，与给诊断用的 `transport` 分开：
+   前者进群文案要最短，后者要写全来源）。
+
+   **接口那条通道多一条铁律：不信回执，只信反查。** 对方的 `ok` 在不同版本里含义不同
+   （老版把「已经在了」的幂等 add 报成 `ok=false`），所以判定成败一律看**重新读一遍名单**
+   —— 与 RCON 那条完全一致。自测里「回执 ok=true 但反查没命中 → 报未生效」就是钉这个。
+
+8. **`enabled=false` 必须说出来。** 对方可以把代理层的白名单拦截整体关掉（接口照常工作、
+   名单照常增删，但**谁都能进服**）。这是本工程最忌讳的「配了却不生效」那一类，所以
+   `--whitelist` 把这种目标单列出来并**退出码 1**，`--api` 也照打。
+
+**顺带两处**：`round_budget` 从 3 元组改成 4 元组（`slp, rcon, api, budget`）——
+打印出来的算式必须**加得起来**（`SLP 5s + RCON 5s ×2 + 接口 0s = 最坏 15s`），早先少了
+接口那一项，一配接口型目标小计就和算式对不上，看着像算错。`--api` 是新增的**独立动作者**
+（不是 `--live` 的开关）：只打 `/health`、`/status`（逐子服一行 + 「接口里有、我们没挂」
+的那几台）、`/whitelist` 的原文，一个 SLP 包都不发。
+
+**自测**（`--self-test`，离线、打桩 `_slp_probe` / `fetch_status` / `fetch_whitelist`）：
+块 19 有 9 条接口取数 + 7 条接口白名单 + 2 条 `--whitelist` 接口台，另有 4 条 `--api`
+的 argv 用例和 1 条 `source`×`rcon` 拒绝用例。全部走假接口，不联网。
+
+**运维上的两条已知限制**：
+
+- **隧道是临时的。** 对方把 8080 只发到它自己主机的 `127.0.0.1`，所以机器人这边必须
+  `ssh -L 8080:127.0.0.1:8080` 转过来（`-p 222`，账号 `mcbot` 只能转发、shell 是 nologin）。
+  它不是常驻服务：机器重启或网络抖动之后要**重新拉**，症状是「接口连不上」（**不是 401**
+  —— 401 是 token 的事）。机器人将来做成容器加进 `mcnet` 后直接用 `http://velocity:8080`，
+  这条隧道和两个回环口都能撤。
+- **token 是密码**，和 RCON 密码一起躺在 `mcs_servers.toml`（已 gitignore）。
+  对方那几份原始文档（`对接/`）2026-09-22 已删 —— 它们**没进过 `.gitignore`**，当初
+  是靠「提交时手动排除」挡着的，这也是删掉它们的一个理由：那种保护全靠人记得。
+
+**真配置（2026-09-22 已写完并验过）**：`szu`（`kind = "proxy"` + `api`，另填 `host`/`port`
+做 SLP 复查）、`bingo` / `backstabbed` / `survival`（生电）/ `creative`（创造）/
+`lobby`（大厅）五台 `source = "szu"`，`source_key` 用对方 `velocity.toml` 里的服名
+（`/status` 实测有 `backstabbed`、`bingo`、`creative`、`limbo`、`lobby`、`survival`）。
+白名单那一项**指向 `szu`**，不再指向子服。
+
+`lobby` 是**用户后来单独点名要挂的**，挂之前先跟他说清了代价：玩家从代理进来先落在
+lobby，于是进服提醒会先来一条「加入 大厅」、再在 `/server bingo` 时来一条「换服 Bingo」
+（以前只有后一条）。他接受。`limbo` **仍然不挂** —— 那是掉线/切换的中转，不是给人玩的。
+
+那条「代理总数 vs 子服之和」的尾注对**接口型代理**是静默的（`mcrender._footnote` 里的
+`r.target.api is None`），这正是挂不挂 lobby 都不影响它出不出提示的原因：接口会把**全部**
+子服列出来而我们只挂关心的几台，「有人在 lobby」永远让合计对不上。

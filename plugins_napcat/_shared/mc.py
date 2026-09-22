@@ -21,6 +21,17 @@ hide-online-players=true 时直接为空、插件还能往里塞广告，绝不�
 （EssentialsX 的 /list 根本没有冒号）。用「名字个数 vs SLP 人数」交叉校验，
 就不必去解析那些文案里的数字——任何语言、任何格式改动导致的解析失败，都会
 自动降级成「名单不完整」，而不是基于残缺名单推出一堆假的进服事件。
+
+**第三条通道：群组服的 HTTP 接口**（_shared/mcbridge.py），只给「群组里那几台」用。
+它的形状和上面两条都不同 —— **一次请求给出整组的数据**，所以：
+
+- 人数和名单**出自同一份响应**，上面那条「两个独立来源交叉校验」对它不成立。
+  补回来的办法是：接口型目标**能填 host/port 就填**，填了就用 SLP 再问一次人数，
+  和接口的对一遍（对不上就如实报「接口数据可疑」）。不填就只能信接口。
+- 所以 Snapshot 多了一个 `count_source`：人数到底是谁给的。以前这个问题不存在
+  （答案永远是 SLP），现在它是「这个数字可不可信」的线索之一。
+- 子服（`source` 指回某台 hub）**不发任何请求**，数据从 hub 那一份响应里切出来。
+  见 fetch_snapshots。
 """
 import asyncio
 import contextlib
@@ -33,6 +44,8 @@ from dataclasses import dataclass, field
 
 from mcstatus import JavaServer
 
+from . import mcbridge
+from .mcbridge import BridgeAuthError, BridgeError, BridgeStatus, BridgeUnreachable
 from .mcservers import ServerTarget
 
 # SLP 失败的两种性质完全不同的原因，分开是为了**文案不把人指错方向**：
@@ -45,6 +58,12 @@ from .mcservers import ServerTarget
 #                 但玩家列表还没就绪。报「不可达」会让人去查防火墙，方向全错。
 SLP_UNREACHABLE = "unreachable"
 SLP_UNPARSEABLE = "unparseable"
+
+# 失败性质里的第三种：**凭证不对**（接口 401）。前两种 SLP_* 其实是一套「性质」分类
+# 而不只是 SLP 的（连不上 vs 连上了但内容不对），所以接口的失败也落在它们上面；
+# 唯独 401 两边都套不上 —— 它既不是网络问题也不是内容问题，下一步动作是**去要新
+# token**，报成「连不上了」会让人去查防火墙和隧道，方向全错。
+API_AUTH = "api-auth"
 
 # 判据是「异常类型」而不是文案：文案是库的实现细节，会随版本变。
 _CONN_ERRORS = (
@@ -98,7 +117,12 @@ class McSnapshot:
     max_players: int | None = None
     names: list[str] = field(default_factory=list)
     names_complete: bool = False
-    names_source: str = "none"  # "rcon" | "slp-sample" | "none"
+    names_source: str = "none"  # "rcon" | "slp-sample" | "api" | "none"
+    # count 是哪条通道给的：`"slp"` 或 `"api"`。以前这个问题没有第二答案（SLP 是
+    # 人数唯一来源），接口进来之后它变成了「这个数字有多可信」的线索 —— 接口型目标
+    # 的人数来自对方插件自己的统计，而我们没法像 SLP 那样从外面独立验一次。
+    # 代理那条尤其要看它：全群组人数是「口径」，子服人数之和是「明细」。
+    count_source: str = "slp"
     latency: float | None = None
     version: str = ""
     error: str = ""  # 取数降级/失败的原因，用于日志与 mc_check 输出
@@ -107,10 +131,11 @@ class McSnapshot:
     # 两次 list 之间玩家可能进出，重发会让「打出来的原文」和「解析用的原文」
     # 不是同一份 —— 排查时最需要对齐的恰恰是这两者。
     raw_list: str = ""
-    # 失败的**性质**，取值见 SLP_UNREACHABLE / SLP_UNPARSEABLE / ""（没失败）。
-    # 文案层必须按它分支：两者给用户的下一步动作完全相反 ——
-    # 「连不上」去查网络和端口，「应答无法解析」去查服务端是不是还在启动。
-    # 光看 reachable 分不出来（两者都是 False），所以这个字段不能靠 error 文案反推。
+    # 失败的**性质**，取值见 SLP_UNREACHABLE / SLP_UNPARSEABLE / API_AUTH / ""（没失败）。
+    # 文案层必须按它分支：三者给用户的下一步动作互不相同 ——
+    # 「连不上」去查网络和端口，「应答无法解析」去查服务端是不是还在启动，
+    # 「凭证不对」去要新 token（查网络纯属白费功夫）。
+    # 光看 reachable 分不出来（三者都是 False），所以这个字段不能靠 error 文案反推。
     error_kind: str = ""
 
 
@@ -253,9 +278,10 @@ async def _close(target_id: str) -> None:
 
 
 async def close_all() -> None:
-    """关掉所有目标的连接。进程收尾用。"""
+    """关掉所有目标的连接（RCON 长连接 + 接口那条 HTTP 连接池）。进程收尾用。"""
     for target_id in list(_conns):
         await _close(target_id)
+    await mcbridge.close_all()
 
 
 async def prune(keep_ids: set[str]) -> list[str]:
@@ -283,7 +309,9 @@ async def _open(target: ServerTarget) -> _Conn:
         raise RconConnectError(f"{target.name} 未配置 RCON 密码")
     try:
         async with asyncio.timeout(target.rcon_timeout):
-            reader, writer = await asyncio.open_connection(target.host, spec.port)
+            # 用 rcon_host 而不是 target.host：SLP 和 RCON 可以不在一个地址上
+            # （RCON 走隧道/内网、SLP 走公网端口，见 RconSpec.host）
+            reader, writer = await asyncio.open_connection(target.rcon_host, spec.port)
     except asyncio.TimeoutError as exc:
         raise RconConnectError(
             f"连接 RCON {target.rcon_addr} 超时（{target.rcon_timeout:g}s，"
@@ -462,12 +490,32 @@ def parse_whitelist_names(payload: str) -> list[str] | None:
 
 # ---------------------------------------------------------------- 取数
 
-async def fetch_snapshot(target: ServerTarget) -> McSnapshot:
-    """探测一个目标，返回快照。任何失败都体现在返回值里，不抛异常。"""
-    # 1) SLP：在线状态与人数的唯一来源
-    status = None
-    slp_error = ""
-    slp_kind = SLP_UNREACHABLE
+@dataclass
+class _SlpProbe:
+    """一次 SLP 探测的原始结果。
+
+    单独抽出来是因为**接口型目标也要用它**：它不走 fetch_snapshot 那整条流程（那是
+    「SLP 定人数 + RCON 取名单」的流程），但需要 SLP 给接口报的人数做一次独立交叉
+    校验 —— 那是接口型目标唯一能验接口有没有算错的办法（见模块 docstring）。
+    """
+
+    ok: bool
+    count: int = 0
+    max_players: int | None = None
+    latency: float | None = None
+    version: str = ""
+    # 已经滤掉无名条目的 sample，fetch_snapshot 的降级路径直接用它
+    sample: list[str] = field(default_factory=list)
+    error: str = ""
+    error_kind: str = ""
+
+
+async def _slp_probe(target: ServerTarget) -> _SlpProbe:
+    """对目标做一次 SLP。**不抛异常**，失败体现在返回值里。
+
+    失败分两类（见 SLP_UNREACHABLE / SLP_UNPARSEABLE）：连不上 vs 答了但答不对。
+    两类给用户的下一步动作完全相反，所以这里连**文案**都分开给好，调用方不必再拼。
+    """
     try:
         # 不用 lookup()/async_lookup()：那会走 dnspython 的 SRV 查询，对
         # 127.0.0.1 纯属浪费，还引入「链式写法要 await 两次」的坑。
@@ -476,30 +524,49 @@ async def fetch_snapshot(target: ServerTarget) -> McSnapshot:
         server = JavaServer(target.host, target.port, timeout=target.timeout)
         status = await server.async_status(tries=1)
     except Exception as exc:
-        slp_error = _describe_slp_failure(exc)
         # 连不上 vs 答了但答不对，两种失败的排查方向相反，别混成一句话。
-        if not isinstance(exc, _CONN_ERRORS):
-            slp_kind = SLP_UNPARSEABLE
+        kind = SLP_UNREACHABLE if isinstance(exc, _CONN_ERRORS) else SLP_UNPARSEABLE
+        label = "SLP 连不上" if kind == SLP_UNREACHABLE else "SLP 应答无法解析"
+        return _SlpProbe(
+            ok=False, error=f"{label}（{_describe_slp_failure(exc)}）", error_kind=kind
+        )
 
-    if status is None:
+    players = status.players
+    return _SlpProbe(
+        ok=True,
+        count=int(players.online or 0),
+        max_players=players.max,
+        latency=getattr(status, "latency", None),
+        version=getattr(getattr(status, "version", None), "name", "") or "",
+        sample=[p.name for p in (players.sample or []) if getattr(p, "name", "")],
+    )
+
+async def fetch_snapshot(target: ServerTarget) -> McSnapshot:
+    """探测一个**自己取数**的目标（SLP 型 / RCON 型），返回快照。任何失败都体现在返回值里。
+
+    接口型目标（`api`）和挂在接口上的子服（`source`）不走这里 —— 它们的数据来自
+    一份共享的接口响应，得由 fetch_snapshots 统一调度（见那里的同源合并）。
+    """
+    # 1) SLP：在线状态与人数的唯一来源（对这条通道而言）
+    probe = await _slp_probe(target)
+    if not probe.ok:
         # SLP 不通就直接判不可达：即便 RCON 还能应答，也不把它当作在线信号，
         # 因为 SLP 是基线锚点（拿不到人数就没法校验名单完整性）。
-        label = "SLP 连不上" if slp_kind == SLP_UNREACHABLE else "SLP 应答无法解析"
         return McSnapshot(
             target_id=target.id,
             reachable=False,
-            error=f"{label}（{slp_error}）",
-            error_kind=slp_kind,
+            error=probe.error,
+            error_kind=probe.error_kind,
         )
 
-    count = int(status.players.online or 0)
+    count = probe.count
     snap = McSnapshot(
         target_id=target.id,
         reachable=True,
         count=count,
-        max_players=status.players.max,
-        latency=getattr(status, "latency", None),
-        version=getattr(getattr(status, "version", None), "name", "") or "",
+        max_players=probe.max_players,
+        latency=probe.latency,
+        version=probe.version,
     )
 
     # 2) RCON 取完整名单。代理层不出名单（Velocity 无原生 glist），
@@ -529,9 +596,8 @@ async def fetch_snapshot(target: ServerTarget) -> McSnapshot:
     #    代理不走这条：它的 sample 是**某一个后端**的随机样本，当成「全群组名单」
     #    是错的，而它本来也不出名单。
     if target.serves_names and len(snap.names) != count:
-        sample = [p.name for p in (status.players.sample or []) if getattr(p, "name", "")]
-        if len(sample) == count:
-            snap.names = sample
+        if len(probe.sample) == count:
+            snap.names = list(probe.sample)
             snap.names_source = "slp-sample"
         else:
             snap.names = []
@@ -546,12 +612,213 @@ async def fetch_snapshot(target: ServerTarget) -> McSnapshot:
         # 代理没有名单不是故障，别写 error —— 判代理是否正常只看 reachable
         snap.error = ""
     elif not snap.names_complete:
-        reason = rcon_error or f"SLP sample 只有 {len(status.players.sample or [])} 条"
+        reason = rcon_error or f"SLP sample 只有 {len(probe.sample)} 条"
         snap.error = f"名单不完整（人数 {count}，拿到 {len(snap.names)}）：{reason}"
     elif rcon_error:
         snap.error = f"已降级用 SLP sample 取名单：{rcon_error}"
 
     return snap
+
+
+# ------------------------------------------------- 接口型目标与它的子服（同源合并）
+
+def _bridge_kind(exc: BaseException) -> str:
+    """把接口的失败翻译成 error_kind —— 文案层按它分支，三类的动作互不相同。"""
+    if isinstance(exc, BridgeAuthError):
+        return API_AUTH  # 去要新 token
+    if isinstance(exc, BridgeUnreachable):
+        return SLP_UNREACHABLE  # 查网络 / 隧道 / 对方服务
+    return SLP_UNPARSEABLE  # 对方的插件版本、路径，或者我们解析过时了
+
+
+def _join_error(*parts: str) -> str:
+    return "；".join(p for p in parts if p)
+
+
+def _api_snapshot(
+    target: ServerTarget,
+    *,
+    api_count: int,
+    names: list[str],
+    slp: _SlpProbe | None,
+    note: str = "",
+) -> McSnapshot:
+    """把「接口给的人数/名单」与「（可选的）SLP 复查」合成一份快照。
+
+    填了 host 的目标会走 SLP 复查，**人数以 SLP 为准**：SLP 是这套取数里的基线锚点，
+    也是接口型目标唯一能从外部独立验一次的数字（接口的人数来自对方插件自己的统计，
+    它说什么就是什么）。接口只提供名单。两者对不上时如实报出来 —— 那正是「对方插件
+    算错了」唯一会被发现的地方。
+
+    SLP 复查没做成（多半是那台没有对外游戏端口、或端口变了）不算失败：退回用接口的
+    人数，但把这件事写进 error，mc_check 一看就知道这个数字为什么没有第二来源。
+
+    接口这条路**没有 SLP sample 那条降级**：子服的名单是代理给的（权威且完整），
+    不完整就是对方的问题，用随机的 sample 去补只会把「对方少报了人」掩盖掉。
+    """
+    count, count_source = api_count, "api"
+    latency: float | None = None
+    max_players: int | None = None
+    version = ""
+    error = note
+
+    if slp is not None:
+        if slp.ok:
+            count, count_source = slp.count, "slp"
+            latency, max_players, version = slp.latency, slp.max_players, slp.version
+            if slp.count != api_count:
+                error = _join_error(
+                    error,
+                    f"接口与 SLP 的人数对不上（接口 {api_count}，SLP {slp.count}）"
+                    f"—— 接口那份数据可疑，已按 SLP 报",
+                )
+        else:
+            error = _join_error(error, f"SLP 复查没做成（{slp.error}），人数只能用接口报的")
+
+    complete = len(names) == count
+    snap = McSnapshot(
+        target_id=target.id,
+        reachable=True,
+        count=count,
+        count_source=count_source,
+        max_players=max_players,
+        names=names,
+        # 名单是接口给的（哪怕这次是空的 —— 0 人在线时本就为空，和 RCON 那条同一条
+        # 约定：通道成功了就算这个来源）。代理不出分服名单，恒 "none"。
+        names_source="api" if target.serves_names else "none",
+        latency=latency,
+        version=version,
+    )
+    snap.names_complete = target.serves_names and complete
+    if not target.serves_names:
+        # 代理的名单不是「不完整」而是「不适用」（同 fetch_snapshot），所以只说名单的
+        # 那半句丢掉。**但 error 不能整个清空** —— 人数对不上正是从代理这条口径上
+        # 看出来的（全群组总数就是它报的），清了等于把唯一能发现对方算错的地方抹掉。
+        snap.error = error
+    elif not snap.names_complete:
+        snap.error = _join_error(error, f"名单不完整（人数 {count}，拿到 {len(names)}）")
+    else:
+        snap.error = error
+    return snap
+
+
+def _api_hub_snapshot(hub: ServerTarget, status: BridgeStatus, slp: _SlpProbe | None) -> McSnapshot:
+    """hub 自己的快照。代理报的是**全群组**人数（口径），不进分服合计 —— 见 serves_names。"""
+    return _api_snapshot(hub, api_count=status.proxy_online, names=[], slp=slp)
+
+
+def _api_sub_snapshot(
+    sub: ServerTarget, hub: ServerTarget, status: BridgeStatus, slp: _SlpProbe | None
+) -> McSnapshot:
+    """子服的快照：从 hub 那份响应里切出自己那一行。"""
+    entry = status.find(sub.source_name)
+    if entry is None:
+        # 找不到是**配置错**，不是「这台挂了」：接口里根本没有这个键。
+        # 两种可能都要说出来，否则人会去查一台好着的子服为什么掉线。
+        candidates = "、".join(status.names) or "一台都没有"
+        return McSnapshot(
+            target_id=sub.id,
+            reachable=False,
+            error=f"{hub.name} 的接口里没有叫 {sub.source_name!r} 的子服（接口里有："
+            f"{candidates}）—— source_key 要填对方 velocity.toml 里的服名；"
+            f"若名字没错，则是那台没在对方的服务端列表里注册",
+            error_kind=SLP_UNPARSEABLE,
+        )
+    return _api_snapshot(sub, api_count=entry.online, names=list(entry.players), slp=slp)
+
+
+@dataclass
+class _HubResult:
+    """一台 hub 的探测结果：它自己的快照 + 那份**整组共用**的接口响应。
+
+    `status is None` = 接口这次没拿到（error 是原因）。子服必须区分这两种情况：
+    接口没拿到时子服一个字都报不出来，得说清是「来源取不到」而不是「你挂了」。
+    """
+
+    snapshot: McSnapshot
+    status: BridgeStatus | None
+    error: BaseException | None
+
+
+async def _fetch_api_group(hub: ServerTarget) -> _HubResult:
+    """探一台 hub：接口响应（整组共用）+ 它自己的快照。**不抛异常。**
+
+    SLP 复查与接口请求**并发**发出：两者互不依赖，串起来只会让一轮变慢
+    （round_budget 的耗时上界就是按「同一轮里并发」算的）。
+    """
+    slp_task = (
+        asyncio.ensure_future(_slp_probe(hub)) if hub.host else None
+    )
+    try:
+        status = await mcbridge.fetch_status(hub.api, hub.timeout)
+    except BridgeError as exc:
+        if slp_task is not None:
+            slp_task.cancel()
+            with contextlib.suppress(BaseException):
+                await slp_task
+        # 接口没了不等于代理没了：SLP 还答得出人数就照常报。代理是群组的门面，
+        # 把它报成「不可达」会让群里以为整个群组挂了，而玩家其实玩得好好的。
+        # 名单本来也不从它取，所以这条降级损失的只是「分服那一份」。
+        snap = await fetch_snapshot(hub)
+        if snap.reachable:
+            snap.error = f"接口取数失败（{exc}）"
+        return _HubResult(snapshot=snap, status=None, error=exc)
+    slp = await slp_task if slp_task is not None else None
+    return _HubResult(
+        snapshot=_api_hub_snapshot(hub, status, slp),
+        status=status,
+        error=None,
+    )
+
+
+async def _fetch_api_one(target: ServerTarget, groups: dict[str, asyncio.Task]) -> McSnapshot:
+    """取一个接口型目标（或它的子服）的快照。`groups` 是 hub.id → 已在飞的任务。"""
+    if target.is_api:
+        return (await groups[target.id]).snapshot
+
+    hub = target.hub
+    if hub is None:
+        # 正常到不了：_check_sources 在解析期就会把 hub 回填好（配了 source 却没有
+        # hub 的目标根本加载不出来）。真到了说明目标不是解析出来的（手工构造），
+        # 这时**必须报错而不是悄悄去问一个猜出来的地址**。
+        return McSnapshot(
+            target_id=target.id,
+            reachable=False,
+            error=f"{target.name} 配了 source = {target.source!r}，但没有解析出对应的 hub",
+            error_kind=SLP_UNPARSEABLE,
+        )
+
+    # 子服自己不发取数请求，但**填了 host 就能顺手做一次 SLP 复查** —— 和 hub 同一条
+    # 理由（人数是接口给的，只有 SLP 能独立验一次）。和 hub 的任务并发等。
+    slp_task = asyncio.ensure_future(_slp_probe(target)) if target.host else None
+    result = await groups[hub.id]
+    slp = await slp_task if slp_task is not None else None
+
+    if result.status is None:
+        return McSnapshot(
+            target_id=target.id,
+            reachable=False,
+            error=f"数据来源 {hub.name} 的接口这次没取到：{result.error}",
+            error_kind=_bridge_kind(result.error),
+        )
+    return _api_sub_snapshot(target, hub, result.status, slp)
+
+
+async def _safe_api_fetch(target: ServerTarget, groups: dict[str, asyncio.Task]) -> McSnapshot:
+    """给 _fetch_api_one 兜底：接口这条路也不能让异常逃出去。
+
+    上层（client.get_snapshots）的契约是「fetch_snapshots 必然每个目标都返回一份快照，
+    不会漏目标」——一个目标漏掉会让汇总悄悄少一个服。所以未知异常也翻译成失败快照。
+    """
+    try:
+        return await _fetch_api_one(target, groups)
+    except Exception as exc:
+        return McSnapshot(
+            target_id=target.id,
+            reachable=False,
+            error=f"探测 {target.name} 时内部出错：{type(exc).__name__}: {exc}",
+            error_kind=SLP_UNPARSEABLE,
+        )
 
 
 async def fetch_snapshots(targets: Sequence[ServerTarget]) -> list[McSnapshot]:
@@ -560,9 +827,46 @@ async def fetch_snapshots(targets: Sequence[ServerTarget]) -> list[McSnapshot]:
     并发而非逐个：一轮的耗时取 max 而不是求和，加子服不会让轮询变慢
     （tools/mc_check.py 的「一轮耗时预算」就是按这个前提算的）。
 
-    fetch_snapshot 自己吞掉所有异常并体现在返回值里，所以 gather 不会因单个目标
-    失败而整体抛错 —— 一台挂掉不影响其余目标的名单。
+    **同源合并**：接口型目标（hub）和它的子服共用**一份** `/status` 响应 ——
+    按 hub 归堆，每台 hub 只发一次请求，子服从那响应里切自己那一行。子服自己
+    **不发任何请求**（它们多半根本没有对外端口）。所以这里先把每台 hub 的任务
+    起起来，子服 await 的是那个已在飞的任务，而不是各查一次。
+
+    每台 hub 的任务都在本批**目标自己**的 hub 里找，不需要拿着一份全量表查表：
+    子服身上带着 hub 对象（ServerTarget.hub）。于是「只探测 bingo 一个」也能正常
+    工作 —— 它会自己去问 szu 的接口。这一点是必要的：缓存是按目标过期的，完全
+    可能只有子服过期而 hub 还在缓存里（见 client.get_snapshots）。
+
+    所有失败都体现在返回值里，不抛异常 —— 一台挂掉不影响其余目标的名单。
     """
     if not targets:
         return []
-    return list(await asyncio.gather(*(fetch_snapshot(t) for t in targets)))
+    groups: dict[str, ServerTarget] = {}
+    for target in targets:
+        if target.is_api:
+            groups.setdefault(target.id, target)
+        elif target.source and target.hub is not None:
+            groups.setdefault(target.hub.id, target.hub)
+    # 先起任务再 gather：子服要 await 的是「已经在飞的那一次请求」，
+    # 若把 fetch 写成普通协程，子服 await 它时才会开始跑，而**每个子服各 await
+    # 一次同一个协程对象**是未定义行为（第二个会拿到 None 或直接报错）。
+    tasks = {
+        hub_id: asyncio.ensure_future(_fetch_api_group(hub))
+        for hub_id, hub in groups.items()
+    }
+    try:
+        return list(
+            await asyncio.gather(
+                *(
+                    _safe_api_fetch(t, tasks)
+                    if (t.is_api or (t.source and t.hub is not None))
+                    else fetch_snapshot(t)
+                    for t in targets
+                )
+            )
+        )
+    finally:
+        # gather 正常返回时它们都已经结束（cancel 是空操作）；异常路径下才真取消，
+        # 免得留下还在飞的请求。
+        for task in tasks.values():
+            task.cancel()

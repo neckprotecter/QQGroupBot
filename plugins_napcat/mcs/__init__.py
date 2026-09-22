@@ -106,9 +106,10 @@ async def _log_targets() -> None:
     # 上界会永远顶着一条与轮询无关的告警 —— 告警被无视之后，真超了也看不出来。
     #
     # round_budget 的**模型**没变，也不该变：探测是 asyncio.gather 并发的，所以取
-    # max 正确，与台数无关。没有 watch 关联时是空 book → (0,0,0) → 不打告警，正确。
+    # max 正确，与台数无关。没有 watch 关联时是空 book → (0,0,0,0) → 不打告警，正确。
+    # 这里的告警只关心总和，所以三项用 * 接住（启动日志不打算式，算式在 --list-targets）。
     watched_ids = [t.id for t in config.flag_targets("watch")]
-    _, _, budget = round_budget(book.scoped(watched_ids))
+    *_, budget = round_budget(book.scoped(watched_ids))
     interval = mc_reporter._WATCH_INTERVAL_SEC
     if budget > interval:
         # _watch_loop 是「跑完再补睡剩余时间」，所以超了**不会重叠**，只是周期被

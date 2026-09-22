@@ -728,6 +728,266 @@ port = 25565
     print(f"   {'PASS' if ok else 'FAIL'}  代理没配 rcon 不报警告（代理本就不出名单）")
     if not ok:
         print(f"         实际警告: {book.warnings}")
+
+    # --- rcon.host：SLP 和 RCON 可以不在一个地址上 ---
+    # 为什么需要它：RCON 只绑内网/回环、由隧道转到本机，而游戏 SLP 走公网端口。
+    # 2026-09-22 对方那台 GTNH 就是这个形状：SLP=203.0.113.10:30004（公网），
+    # RCON=隧道这头的 127.0.0.1:25575。只有一个 host 时这两种地址没法同时表达。
+    _SRV_RCONHOST = """
+[[targets]]
+id = "gtnh"
+kind = "standalone"
+host = "203.0.113.10"
+port = 30004
+rcon = { host = "127.0.0.1", port = 25575, password = "x" }
+
+[[targets]]
+id = "local"
+kind = "standalone"
+host = "10.0.0.9"
+port = 25565
+rcon = { port = 25576, password = "y" }
+
+[[targets]]
+id = "blank"
+kind = "standalone"
+host = "10.0.0.10"
+port = 25565
+rcon = { host = "", port = 25577, password = "z" }
+"""
+    book = parse_book(_SRV_RCONHOST)
+    _by = {t.id: t for t in book.targets}
+    for tid, field, want in (
+        ("gtnh", "rcon_addr", "127.0.0.1:25575"),      # 填了 → 用填的
+        ("gtnh", "rcon_host", "127.0.0.1"),            # mc._open 读的就是这个
+        ("local", "rcon_addr", "10.0.0.9:25576"),      # 没填 → 回退到目标 host
+        ("blank", "rcon_addr", "10.0.0.10:25577"),     # 填空串 → 同样回退（空是正常取值）
+        ("gtnh", "game_addr", "203.0.113.10:30004"),  # SLP 那一侧不受影响
+        ("blank", "rcon_host", "10.0.0.10"),
+    ):
+        got = getattr(_by[tid], field)
+        ok = got == want
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  {tid}.{field} = {got}（期望 {want}）")
+
+    # 「同一 RCON 端口」的警告必须按 host:port 判 —— 只看端口号的话，两台各自
+    # 绑在自己主机上的 25575 会被误报成冲突（加了 rcon.host 之后这条才成立）
+    _srv_sameport = (
+        '[[targets]]\nid="a"\nkind="standalone"\nhost="10.0.0.1"\nport=1\n'
+        'rcon={host="127.0.0.1",port=25575,password="x"}\n'
+        '[[targets]]\nid="b"\nkind="standalone"\nhost="10.0.0.2"\nport=2\n'
+        'rcon={host="10.0.0.2",port=25575,password="y"}\n'
+    )
+    book = parse_book(_srv_sameport)
+    ok = not any("RCON 端口冲突" in w for w in book.warnings)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  不同 host 上的同一 RCON 端口号不算冲突")
+    if not ok:
+        print(f"         实际警告: {book.warnings}")
+
+    # _RCON_KEYS 加了 host 之后，别把别的键也放进来
+    try:
+        parse_book(
+            '[[targets]]\nid="a"\nkind="standalone"\nhost="h"\nport=1\n'
+            'rcon={port=1,password="p",hostname="x"}\n'
+        )
+    except ServerConfigError as exc:
+        ok = "hostname" in str(exc)
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  rcon 表里的未知键仍然报错：{exc}")
+    else:
+        failed += 1
+        print("   FAIL  rcon 表里的未知键 hostname 应报错却没报")
+    print()
+
+    # --- api / source：群组服的 HTTP 接口（2026-09-22 对接 SZUcraft 那套 bridge）---
+    # 形状：代理那条配 api（它一个口就能给出**每个子服**的人数与名单），子服配
+    # source 指回代理那条。子服没有自己的游戏端口可探（内网子服没发布），所以
+    # 接口型 / 挂在接口上的目标，host/port 都是**可选**的。
+    _SRV_API = """
+[[targets]]
+id = "szu"
+name = "主服群"
+kind = "proxy"
+group = "主服群"
+api = { url = "http://127.0.0.1:8080", token = "t" }
+
+[[targets]]
+id = "lobby"
+name = "大厅"
+kind = "backend"
+group = "主服群"
+source = "szu"
+
+[[targets]]
+id = "bingo"
+name = "Bingo"
+kind = "backend"
+group = "主服群"
+source = "szu"
+source_key = "bingo-s2"
+"""
+    book = parse_book(_SRV_API)
+    _by = {t.id: t for t in book.targets}
+    szu, lobby, bingo_api = _by["szu"], _by["lobby"], _by["bingo"]
+    for desc, got, want in (
+        # 接口型代理**仍然不出名单**：它的名单是全群组口径，按分服数会把人数两遍
+        # （各子服的名单里本来就有那些人）。接口能给出名单，是我们**不用**它。
+        ("接口型代理仍按全群组口径（不参与分服计数）", szu.serves_names, False),
+        ("接口型代理白名单可用（走接口，不是 RCON）", szu.whitelist_ready, True),
+        ("接口型代理没有游戏地址", szu.game_addr, "-"),
+        ("接口型目标的取数通道", szu.transport, "接口"),
+        # 子服：数据从 hub 来，自己没有游戏端口，也没有 RCON
+        ("子服的取数通道", lobby.transport, "接口（szu 的子服）"),
+        ("子服（有 source）出名单", lobby.serves_names, True),
+        ("子服没有游戏地址", lobby.game_addr, "-"),
+        ("子服的 source_key 缺省 = id", lobby.source_name, "lobby"),
+        ("子服的 source_key 显式给就用给的", bingo_api.source_name, "bingo-s2"),
+        # 子服没配 RCON、也没配 api → 它**不能**做白名单操作（真实约束，不能放宽）
+        ("子服（无 rcon）白名单不可用", lobby.whitelist_ready, False),
+    ):
+        ok = got == want
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  {desc}：{got!r}（期望 {want!r}）")
+
+    # 挂接口的目标**不该**报「不出玩家名单」——数据来自 hub，不是只靠 SLP 样本。
+    # 代理也不该报（它出不出名单是通道决定的，没配接口是设计如此）。
+    ok = not any("不出玩家名单" in w for w in book.warnings)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口型目标不报「不出玩家名单」")
+    if not ok:
+        print(f"         实际警告: {book.warnings}")
+
+    # 没有游戏地址的目标之间**不该**报端口冲突：game_addr 会一律退化成 "-"，
+    # 不加 host 判断就是一堆「这几台都绑 -」的假冲突，把真冲突埋掉。
+    ok = not any("端口冲突" in w for w in book.warnings)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  无游戏地址的目标之间不报端口冲突")
+    if not ok:
+        print(f"         实际警告: {book.warnings}")
+
+    # 耗时上界：接口型目标只花一次 HTTP（子服不额外花时间，数据已在 hub 那份响应里）
+    _s, _r, _a, _b = round_budget(book)
+    ok = (_s, _r, _a, _b) == (0.0, 0.0, 5.0, 5.0)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口型目标的耗时上界 = {_b:g}s（期望 5 = 一次 HTTP）")
+
+    # 代理不参与 RCON 那项：它的 RCON 只服务白名单、从不发 list
+    _r2 = round_budget(
+        parse_book(
+            '[[targets]]\nid="p"\nkind="proxy"\nhost="h"\nport=1\n'
+            'rcon={port=2,password="x"}\nrcon_timeout=9\n'
+            '[[targets]]\nid="b"\nkind="backend"\nhost="h"\nport=3\n'
+            'rcon={port=4,password="y"}\nrcon_timeout=5\n'
+        )
+    )
+    ok = _r2[1] == 5.0
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  代理的 RCON 不计入耗时上界：{_r2[1]:g}s（期望 5，不是 9）")
+
+    # source 允许**前向引用**（代理段写在后面）。写成顺序敏感的话，调一下段落顺序
+    # 就报「不存在」，而错误信息还会把人指去查一个明明存在的 id。
+    try:
+        parse_book(
+            '[[targets]]\nid="lobby"\nkind="backend"\nsource="szu"\n'
+            '[[targets]]\nid="szu"\nkind="proxy"\n'
+            'api={url="http://h:1",token="t"}\n'
+        )
+    except ServerConfigError as exc:
+        failed += 1
+        print(f"   FAIL  source 前向引用应能加载，却报错：{exc}")
+    else:
+        print("   PASS  source 允许前向引用（代理段写在子服后面也能加载）")
+
+    # 每一种写错都要**报错并说清怎么改**，不能静默降级成「没配 RCON」那种极难查的形态
+    _API_ERRORS: list[tuple[str, str, str]] = [
+        (
+            "api 配在子服上（接口给的是整个群组）",
+            '[[targets]]\nid="a"\nkind="backend"\nhost="h"\nport=1\n'
+            'api={url="http://h:1",token="t"}\n',
+            "proxy",
+        ),
+        (
+            "api 没给 token",
+            '[[targets]]\nid="a"\nkind="proxy"\napi={url="http://h:1"}\n',
+            "api.token",
+        ),
+        (
+            "api.token 是空串",
+            '[[targets]]\nid="a"\nkind="proxy"\napi={url="http://h:1",token=""}\n',
+            "api.token",
+        ),
+        (
+            "api.url 没带协议",
+            '[[targets]]\nid="a"\nkind="proxy"\napi={url="127.0.0.1:8080",token="t"}\n',
+            "http://",
+        ),
+        (
+            "api 和 rcon 同时配（两条通道，说不清走哪条）",
+            '[[targets]]\nid="a"\nkind="proxy"\napi={url="http://h:1",token="t"}\n'
+            'rcon={port=2,password="p"}\n',
+            "互斥",
+        ),
+        (
+            "api 和 source 同时配在同一条上",
+            '[[targets]]\nid="a"\nkind="proxy"\napi={url="http://h:1",token="t"}\n'
+            'source="b"\n',
+            "只能留一个",
+        ),
+        (
+            # 这条比 api+rcon 隐蔽：两条路各自都自洽，只是**各说各话** —— 名单来自
+            # hub 的接口、白名单命令走本机 RCON，于是「机器人说已添加，人还是进不去」。
+            "source 和 rcon 同时配（名单从接口来、白名单却走本机 RCON）",
+            '[[targets]]\nid="a"\nkind="backend"\nsource="szu"\n'
+            'rcon={port=2,password="p"}\n'
+            '[[targets]]\nid="szu"\nkind="proxy"\napi={url="http://h:1",token="t"}\n',
+            "同时配了 source 和 rcon",
+        ),
+        (
+            "source 指向不存在的 id",
+            '[[targets]]\nid="a"\nkind="backend"\nsource="nope"\n',
+            "不存在",
+        ),
+        (
+            "source 指向一台没配 api 的服",
+            '[[targets]]\nid="a"\nkind="backend"\nsource="b"\n'
+            '[[targets]]\nid="b"\nkind="proxy"\nhost="h"\nport=1\n',
+            "没配 api",
+        ),
+        (
+            "source_key 没有 source 陪着",
+            '[[targets]]\nid="a"\nkind="backend"\nsource_key="x"\n',
+            "source_key",
+        ),
+        (
+            "接口型目标只给了 port 没给 host（SLP 要两个一起）",
+            '[[targets]]\nid="a"\nkind="proxy"\nport=25565\n'
+            'api={url="http://h:1",token="t"}\n',
+            "单独出现",
+        ),
+        (
+            "api 表里的未知键",
+            '[[targets]]\nid="a"\nkind="proxy"\napi={url="http://h:1",token="t",port=1}\n',
+            "port",
+        ),
+        (
+            "目标表里的未知键（撞错名字的邻居）",
+            '[[targets]]\nid="a"\nkind="backend"\nhost="h"\nport=1\nsources="b"\n',
+            "sources",
+        ),
+    ]
+    for desc, text, needle in _API_ERRORS:
+        try:
+            parse_book(text)
+        except ServerConfigError as exc:
+            ok = needle in str(exc)
+            failed += not ok
+            print(f"   {'PASS' if ok else 'FAIL'}  {desc}：{exc}")
+            if not ok:
+                print(f"         期望报错里含 {needle!r}")
+        else:
+            failed += 1
+            print(f"   FAIL  {desc} 应报错却没报")
     print()
 
     # ---------------- 块 11：服名 → 目标解析 ----------------
@@ -813,7 +1073,7 @@ port = 25565
     # 必须多台才分得开。
     #   取 max：SLP max(3,5,5)=5 + RCON 5×2 = 15
     #   取和  ：(3+10) + (5+10) + (5+10) = 43
-    _, _, budget3 = round_budget(
+    *_, budget3 = round_budget(
         parse_book(
             """
             [defaults]
@@ -940,6 +1200,17 @@ port = 25565
             ["--audience", "社团群", "--whitelist", "--target", "bingo"],
             ("whitelist", "bingo", "社团群"),
         ),
+        # --api 只看群组接口那一层（不碰 SLP/RCON），所以它和 --target/--audience 一样
+        # 是**独立动作者**而不是 --live 的开关：`--api --target x` 必须还是 api，
+        # 万一退化成 live 就会去连所有服务器的 RCON。
+        ("--api（只看群组接口）", ["--api"], ("api", "", "")),
+        ("--api + --target 收窄", ["--api", "--target", "szu"], ("api", "szu", "")),
+        (
+            "--api + --audience",
+            ["--api", "--audience", "社团群"],
+            ("api", "", "社团群"),
+        ),
+        ("--api 写在后头也照样是 api", ["--target", "szu", "--api"], ("api", "szu", "")),
         ("自测优先于实机探测", ["--self-test", "--target", "x"], ("self-test", "", "")),
         ("不带参数时关联名留空 = 由 _live 自己挑默认那条", ["bingo"], ("live", "bingo", "")),
         # ↓ 这些是本次真正要防的：它们都**不能**变成实机探测
@@ -979,7 +1250,7 @@ port = 25565
         render_detail,
         render_summary,
     )
-    from plugins_napcat._shared.mcservers import ServerTarget
+    from plugins_napcat._shared.mcservers import ApiSpec, ServerTarget
     from plugins_napcat._shared.textlen import MAX_LEN
 
     def _tgt(tid: str, kind: str = "backend", name: str = "") -> ServerTarget:
@@ -1119,6 +1390,29 @@ port = 25565
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  同组子服全在本群关联里且数字对不上 → 照出脚注")
 
+    # ↓ 接口型代理**永不**出这条脚注，哪怕数字对不上、子服也一台不缺。两条理由缺一不可：
+    #   1. 要抓的是 ping-passthrough（代理把自己某一台后端的人数当全群组报）—— 那是
+    #      SLP 才有的毛病；接口给的是代理自己的权威计数，不存在这个成因。
+    #   2. 接口的 /status 会列出**全部**子服，而我们只挂关心的那几台（对方 6 台挂 3 台）。
+    #      只要有人站在没挂的那台里（大厅、limbo 最容易），合计就永远对不上，
+    #      每张总览都会挂一条把人指去查不存在问题的提示。
+    api_proxy = ServerTarget(
+        id="szu", name="主服群", kind="proxy", group="主服群",
+        timeout=5.0, rcon_timeout=5.0,
+        api=ApiSpec(url="http://127.0.0.1:8080", token="t"),
+    )
+    rows = [
+        Row(api_proxy, _snap(count=1)),
+        Row(_tgt("b0", name="子服0"), _snap(count=3, names=["N"] * 3)),
+        Row(_tgt("b1", name="子服1"), _snap(count=4, names=["N"] * 4)),
+    ]
+    text = render_summary(rows, total_names=50, all_targets=[r.target for r in rows])
+    ok = "ping-passthrough" not in text and "全群组 1 人" in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口型代理：数字对不上也不出脚注（口径本来就不该比）")
+    if not ok:
+        print(f"         实际:\n{text}")
+
     # ↓ 本次最该钉住的一条：目标多 + 名字长时**尾注必须活下来**。
     #   原来的写法是渲染完直接 truncate()，切掉尾部 —— 尾注和最后几台服一起消失。
     long_names = [f"Player_{i:02d}_" + "x" * 30 for i in range(12)]
@@ -1194,12 +1488,17 @@ port = 25565
     text, _ = render_whitelist_list(
         [
             WhitelistListRow("Bingo", ("阿伟",)),
-            WhitelistListRow("GTNH", None, "没配 RCON 密码，这台的名单读不到"),
+            WhitelistListRow("GTNH", None, "两条通道都没配，这台的名单读不到"),
             WhitelistListRow("谁是杀手", ("乙",)),
         ],
         total_names=2,
     )
-    ok = "阿伟" in text and "乙" in text and "没配 RCON 密码" in text and "【GTNH】⚠️" in text
+    ok = (
+        "阿伟" in text
+        and "乙" in text
+        and "两条通道都没配" in text
+        and "【GTNH】⚠️" in text
+    )
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  一台读不到 → 那台一行说明，其余台照常列出")
     if not ok:
@@ -1530,9 +1829,9 @@ targets = []
     ok = (
         multi_summary.startswith("白名单发往 2 台：")
         and "Bingo[bingo]（命令前缀 'whitelist'）" in multi_summary
-        # 第二台没配 rcon.password（backstabbed 在全量表里就没有）—— 摘要里必须说出来，
+        # 第二台两条通道都没配（backstabbed 在全量表里就没有）—— 摘要里必须说出来，
         # 否则它和一台好服长得一模一样，而群里每次命令都会回「发不出去」。
-        and "没配 rcon.password" in multi_summary
+        and "两条通道都没配" in multi_summary
     )
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  多台摘要逐台列前缀并点名没配密码的那台（{multi_summary}）")
@@ -1566,24 +1865,24 @@ targets = []
     print(f"   {'PASS' if ok else 'FAIL'}  多台里只坏一项 → 合法的仍生效，警告点名第 2 项")
     if not ok:
         print(f"         实际路由: {[r.target.id for r in routes]}  实际警告: {auds[0].warnings}")
-    # 白名单服没配 rcon 密码：能加载，但命令发不出去（backstabbed 在全量表里就没配）
+    # 白名单服两条通道都没配：能加载，但命令发不出去（backstabbed 在全量表里就没配）
     auds = parse_audiences(
         '[[audience]]\nname="a"\ngroups=[1]\ntargets=["backstabbed"]\n'
         'whitelist=[{target="backstabbed"}]\n',
         _full,
     )
-    ok = any("没配 rcon.password" in w for w in auds[0].warnings)
+    ok = any("两条通道都没配" in w for w in auds[0].warnings)
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  白名单服没配 rcon.password → 警告（命令发不出去）")
-    # **逐台**报：两台里只有一台没配密码时，警告必须只点那一台。写成「只看第一台」的话
-    # 这条测试照样过（Bingo 有密码 → 没警告），所以断言里必须同时出现「有警告」和
+    print(f"   {'PASS' if ok else 'FAIL'}  白名单服两条通道都没配 → 警告（命令发不出去）")
+    # **逐台**报：两台里只有一台没配通道时，警告必须只点那一台。写成「只看第一台」的话
+    # 这条测试照样过（Bingo 有 RCON → 没警告），所以断言里必须同时出现「有警告」和
     # 「警告里不含另一台的名字」两半。
     auds = parse_audiences(
         '[[audience]]\nname="a"\ngroups=[1]\ntargets=["bingo","backstabbed"]\n'
         'whitelist=[{target="bingo"},{target="backstabbed"}]\n',
         _full,
     )
-    hit = [w for w in auds[0].warnings if "没配 rcon.password" in w]
+    hit = [w for w in auds[0].warnings if "两条通道都没配" in w]
     ok = len(hit) == 1 and "谁是杀手" in hit[0] and "Bingo" not in hit[0]
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  两台里只坏一台 → 警告只点那一台（不含另一台）")
@@ -1945,6 +2244,29 @@ watch   = true
     print(f"   {'PASS' if ok else 'FAIL'}  群回复文案里没有 markdown 加粗（QQ 会连星号一起打出来）")
     if not ok:
         print(f"         {bold}")
+
+    # oopz_sdk **默认随 requirements.txt 装上，但装不装由部署的人定**（只用 MC 功能的
+    # 人可以特意不装它）。所以它**不许在模块顶层被 import** —— 那样缺 SDK 时
+    # load_plugins("plugins_napcat") 会在导入这棵树时抛
+    # ImportError，**连着 MC 功能一起起不来**，而 MC 跟 oopz 毫无关系。
+    # 2026-09-22 修的就是这个（改前 `from oopz_sdk import OopzBot` 就明晃晃写在顶层）。
+    # 判据是「行首没有缩进的 import」：带 try 兜住 / TYPE_CHECKING 里的那种是缩进的，
+    # 不会被这里判到。第二条是防这一条变成空断言 —— 把 oopz 支持整个删掉也能过第一条。
+    oopz_src = (ROOT / "plugins_napcat" / "oopz" / "client.py").read_text(encoding="utf-8")
+    top_import = [
+        ln
+        for ln in oopz_src.splitlines()
+        if ln.startswith(("import oopz_sdk", "from oopz_sdk"))
+    ]
+    ok = not top_import
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  oopz_sdk 不在模块顶层被 import（缺它也得能起 MC）")
+    if not ok:
+        print(f"         {top_import}")
+
+    ok = "\n    import oopz_sdk" in oopz_src
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  运行期探测还在（上一条不是靠删掉 oopz 支持过的）")
     print()
 
     # ---------------- 块 17：跨文件警告 ----------------
@@ -2484,7 +2806,10 @@ watch   = true
         and why == ""
         and text.splitlines()[0] == "📣 MC 播报 · 14:32"
         and "【GTNH】在线 3" in text
-        and "【Bingo】在线 0　目前无人" in text
+        and "【Bingo】在线 0" in text
+        # 0 人不再补「目前无人」（2026-09-22 用户要求去掉冗余）。后半句是钉子：
+        # 只要那句话被加回来就红，不然这条断言在两种写法下都过。
+        and "目前无人" not in text
         and "【谁是杀手】😵 不可达" in text
     )
     failed += not ok
@@ -2572,6 +2897,408 @@ watch   = true
     _mr._JOIN_TEMPLATES = _tpl_saved
     print()
 
+    # ---------------- 块 19：接口型目标（同源合并 / SLP 复查 / 三类失败） ----------------
+    # 全部在打桩的接口上跑：真接口只有对方那台有，而这一块要钉的是**我们这边的行为**
+    # （发几次请求、数字从哪来、失败怎么分类），和服务端在不在没关系。
+    #
+    # 三件最容易写错、也最贵的事：
+    #   1. 一份 /status 必须只请求一次（子服各自再请求一次 = 对方日志里 4 条重复访问）
+    #   2. 只探测**一台子服**时也得问到接口（缓存按目标过期，完全可能只有子服过期）
+    #   3. 接口挂了要说清是「来源取不到」，不能让子服看起来像自己挂了
+    print("== 接口型目标自测（假接口）==")
+
+    import plugins_napcat._shared.mc as _mc
+    from plugins_napcat._shared import mcbridge as _br
+
+    _API_TOML = """
+[defaults]
+timeout = 3
+
+[[targets]]
+id   = "szu"
+name = "群组服"
+kind = "proxy"
+host = "10.0.0.1"
+port = 30002
+api  = { url = "http://127.0.0.1:8080", token = "t" }
+
+[[targets]]
+id   = "bingo"
+name = "Bingo"
+kind = "backend"
+source = "szu"
+
+[[targets]]
+id         = "survival"
+name       = "生电"
+kind       = "backend"
+source     = "szu"
+source_key = "surv"
+
+[[targets]]
+id   = "creative"
+name = "创造"
+kind = "backend"
+source = "szu"
+source_key = "creative"
+"""
+    _api_book = parse_book(_API_TOML)
+    _api_targets = list(_api_book.targets)
+
+    def _status(proxy=5, servers=()):
+        return _br.BridgeStatus(
+            proxy_online=proxy,
+            servers=tuple(
+                _br.BridgeServer(name=n, online=o, players=tuple(p))
+                for n, o, p in servers
+            ),
+        )
+
+    def _slp_ok(count, max_players=20):
+        return _mc._SlpProbe(
+            ok=True, count=count, max_players=max_players, latency=3.0, version="1.7.10"
+        )
+
+    _slp_dead = _mc._SlpProbe(ok=False, error="SLP 连不上（打桩）", error_kind=_mc.SLP_UNREACHABLE)
+    _saved_slp, _saved_status = _mc._slp_probe, _br.fetch_status
+
+    def _run_api(targets, *, status=None, error=None, slp=None):
+        """在打桩的接口上跑一轮。返回 (快照列表, 接口被调用的次数)。"""
+        calls: list[str] = []
+
+        async def fake_status(api, timeout):
+            calls.append(api.url)
+            if error is not None:
+                raise error
+            return status
+
+        async def fake_slp(target):
+            return (slp or {}).get(target.id, _slp_dead)
+
+        _mc._slp_probe, _br.fetch_status = fake_slp, fake_status
+        try:
+            snaps = asyncio.run(_mc.fetch_snapshots(list(targets)))
+        finally:
+            _mc._slp_probe, _br.fetch_status = _saved_slp, _saved_status
+        return snaps, calls
+
+    _FULL = _status(
+        proxy=3,
+        servers=[
+            ("bingo", 2, ("Alice", "Bob")),
+            ("surv", 1, ("Carol",)),
+            ("creative", 0, ()),
+        ],
+    )
+
+    # ① 一份响应喂四台：只请求一次，各台切自己那一行（生电/创造靠 source_key 认）
+    snaps, calls = _run_api(_api_targets, status=_FULL, slp={"szu": _slp_ok(3)})
+    by_id = {s.target_id: s for s in snaps}
+    ok = (
+        len(calls) == 1
+        and [s.target_id for s in snaps] == ["szu", "bingo", "survival", "creative"]
+        and by_id["szu"].count == 3
+        and by_id["szu"].count_source == "slp"
+        and not by_id["szu"].names_complete  # 代理不出分服名单：不适用，不是不完整
+        and by_id["szu"].names_source == "none"
+        and (by_id["bingo"].count, by_id["bingo"].names) == (2, ["Alice", "Bob"])
+        and by_id["bingo"].names_complete
+        and by_id["bingo"].names_source == "api"
+        and (by_id["survival"].count, by_id["survival"].names) == (1, ["Carol"])
+        and by_id["creative"].count == 0
+        # 0 人时名单为空但**完整**（0 == 0），和 RCON 那条同一条约定
+        and by_id["creative"].names_complete
+        and by_id["creative"].error == ""
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  一次 /status 喂四台：请求 {len(calls)} 次，各台切自己那一行")
+    if not ok:
+        print(f"         调用={calls}")
+        for s in snaps:
+            print(f"         {s.target_id}: 人数={s.count} 来源={s.count_source} "
+                  f"名单={s.names} 完整={s.names_complete} error={s.error!r}")
+
+    # ② 只探测一台子服 → 照样去问 hub 的接口（hub 不在本批目标里）。
+    #    缓存按目标过期，完全可能只有子服那一条过期；这时若「hub 不在本批就报错」，
+    #    群里会看到一台好着的子服莫名其妙「取不到数据」。
+    snaps, calls = _run_api([_api_book.get("bingo")], status=_FULL, slp={"szu": _slp_ok(3)})
+    ok = len(calls) == 1 and snaps[0].count == 2 and snaps[0].names == ["Alice", "Bob"]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  只探测一台子服：仍然去问 hub（请求 {len(calls)} 次）")
+    if not ok:
+        print(f"         调用={calls} 快照={snaps[0]}")
+
+    # ③ 人数对不上 → 按 SLP 报，并把「接口可疑」写出来。
+    #    这是接口型目标唯一能发现「对方插件把人数算错了」的地方。
+    snaps, _ = _run_api(
+        [_api_book.get("szu")], status=_status(proxy=2), slp={"szu": _slp_ok(7)}
+    )
+    ok = (
+        snaps[0].count == 7
+        and snaps[0].count_source == "slp"
+        and "对不上" in snaps[0].error
+        and "接口 2" in snaps[0].error
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 2 人 / SLP 7 人 → 按 SLP 报并标注接口可疑")
+    if not ok:
+        print(f"         人数={snaps[0].count} 来源={snaps[0].count_source} error={snaps[0].error!r}")
+
+    # ④ 接口 401 → hub 退回 SLP（代理还活着，别报成整个群组挂了），
+    #    子服则如实说「来源取不到」，且**失败性质是「凭证」**，不是「不可达」。
+    snaps, calls = _run_api(
+        _api_targets, error=_br.BridgeAuthError("token 被轮换了"), slp={"szu": _slp_ok(4)}
+    )
+    by_id = {s.target_id: s for s in snaps}
+    ok = (
+        len(calls) == 1
+        and by_id["szu"].reachable
+        and by_id["szu"].count == 4
+        and by_id["szu"].count_source == "slp"
+        and "接口取数失败" in by_id["szu"].error
+        and not by_id["bingo"].reachable
+        and by_id["bingo"].error_kind == _mc.API_AUTH
+        and "数据来源 群组服" in by_id["bingo"].error
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 401：hub 退回 SLP，子服报「来源取不到」且性质＝凭证")
+    if not ok:
+        for s in snaps:
+            print(f"         {s.target_id}: 可达={s.reachable} 人数={s.count} "
+                  f"性质={s.error_kind} error={s.error!r}")
+
+    # ⑤ 接口连不上 → 子服的失败性质是「网络」（下一动作是查网络/隧道/对方服务）
+    snaps, _ = _run_api(_api_targets, error=_br.BridgeUnreachable("connrefused"), slp=None)
+    by_id = {s.target_id: s for s in snaps}
+    ok = (
+        not by_id["szu"].reachable
+        and by_id["szu"].error_kind == _mc.SLP_UNREACHABLE
+        and by_id["bingo"].error_kind == _mc.SLP_UNREACHABLE
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口连不上：hub 和子服的性质都是网络（不是凭证）")
+    if not ok:
+        for s in snaps:
+            print(f"         {s.target_id}: 可达={s.reachable} 性质={s.error_kind} error={s.error!r}")
+
+    # ⑥ 接口里没这台子服（服名写错 / 那台没注册）→ 是**配置错**，要把候选名单给出来
+    snaps, _ = _run_api(
+        [_api_book.get("bingo"), _api_book.get("survival")],
+        status=_status(proxy=1, servers=[("lobby", 1, ("Zed",))]),
+        slp=None,
+    )
+    ok = all(
+        not s.reachable and "接口里有：lobby" in s.error and "source_key" in s.error
+        for s in snaps
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口里没这台子服 → 报配置错并列出候选服名")
+    if not ok:
+        for s in snaps:
+            print(f"         {s.target_id}: {s.error!r}")
+
+    # ⑦ 子服填了 host 也能做 SLP 复查（数据来源同一个响应，但人数仍以 SLP 为准）
+    _sub_host_book = parse_book(
+        _API_TOML.replace(
+            'source = "szu"\n\n[[targets]]\nid         = "survival"',
+            'source = "szu"\nhost   = "10.0.0.2"\nport   = 25566\n\n[[targets]]\nid         = "survival"',
+        )
+    )
+    snaps, _ = _run_api(
+        [_sub_host_book.get("bingo")], status=_FULL, slp={"szu": _slp_ok(3), "bingo": _slp_ok(9)}
+    )
+    ok = snaps[0].count == 9 and "对不上" in snaps[0].error
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  子服填了 host：用 SLP 复查人数（接口 2 / SLP 9 → 按 SLP）")
+    if not ok:
+        print(f"         人数={snaps[0].count} error={snaps[0].error!r}")
+
+    # ⑧ 解析期：api.url 只能填到端口（带路径的写法会被静默忽略 → 必须报错）
+    _url_cases = [
+        ("带 /status", "http://127.0.0.1:8080/status", False),
+        ("只有主机名", "http://bridge:8080", True),
+        ("结尾一个斜杠", "http://127.0.0.1:8080/", True),
+        ("https + 端口", "https://mc.example.com:8443", True),
+    ]
+    _url_bad = []
+    for desc, url, should_pass in _url_cases:
+        text = _API_TOML.replace("http://127.0.0.1:8080", url)
+        try:
+            parse_book(text)
+            got = True
+        except ServerConfigError:
+            got = False
+        if got != should_pass:
+            _url_bad.append(f"{desc}（应{'通过' if should_pass else '报错'}）")
+    ok = not _url_bad
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  api.url 只填到端口：带路径的写法报错，其余放行")
+    if not ok:
+        print(f"         不符合预期：{_url_bad}")
+
+    # ⑨ hub 回填要**同时**进 by_id：投影出来的子视图也得带着 hub，否则「某个群里查
+    #    bingo」会说不出来源（P5 那次 scoped 忘重建索引的同类坑）
+    _scoped = _api_book.scoped(["bingo"])
+    ok = (
+        _api_book.get("bingo").hub is not None
+        and _api_book.get("bingo").hub.id == "szu"
+        and _scoped.get("bingo").hub is not None
+        and _scoped.get("bingo").hub.id == "szu"
+        and _api_book.get("szu").hub is None
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  hub 回填进子服，且全量表与投影视图一致")
+    if not ok:
+        print(f"         全量={_api_book.get('bingo').hub} 投影={_scoped.get('bingo').hub}")
+
+    # ---- 接口白名单（对比块 18 的假 RCON：同一套「先读后写 + 反查」的判定）----
+    # 这一块钉的是**判定逻辑没被通道换掉**：成败一律看反查，接口回执里的 ok/changed
+    # 一个字都不信（它在对方不同版本里含义不同，见 BridgeWriteResult）。
+    from plugins_napcat._shared import mcadmin as _mca
+    from plugins_napcat._shared.mcadmin import AdminCommand as _AC
+    from plugins_napcat._shared.mcadmin import WhitelistAuthError as _WlAuth
+    from plugins_napcat._shared.mcadmin import WhitelistUnreachable as _WlDown
+
+    _wl_target = _api_book.get("szu")
+
+    def _run_wl(verb, player="Steve", *, before=(), after=None, read_error=None, write_error=None):
+        """在打桩的接口上跑一条白名单命令。返回 (结果, 读次数, 下发出去的 (动词, 名字))。"""
+        reads: list[int] = []
+        writes: list[tuple[str, str]] = []
+
+        async def fake_read(api, timeout):
+            if read_error is not None:
+                raise read_error
+            reads.append(1)
+            names = before if len(reads) == 1 else (after if after is not None else before)
+            return _br.BridgeWhitelist(enabled=True, entries=tuple(names))
+
+        async def fake_write(api, timeout, v, name):
+            if write_error is not None:
+                raise write_error
+            writes.append((v, name))
+            return _br.BridgeWriteResult(ok=True, changed=True, whitelist=None)
+
+        _save_r, _save_w = _br.fetch_whitelist, _br.write_whitelist
+        _br.fetch_whitelist, _br.write_whitelist = fake_read, fake_write
+        try:
+            cmd = _AC("list") if verb == "list" else _AC(verb, player)
+            res = asyncio.run(_mca.run_whitelist_command(cmd, _wl_target))
+        finally:
+            _br.fetch_whitelist, _br.write_whitelist = _save_r, _save_w
+        return res, reads, writes
+
+    # ① 空名单是「没人」而不是「判不出来」—— RCON 那边要靠哨兵文案才分得出来，
+    #    接口给的就是个空数组，这条路径必须照旧报 ok。
+    res, reads, writes = _run_wl("list", before=[])
+    ok = res.ok is True and res.names == [] and reads == [1] and writes == []
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 list：空名单 → ok（不是「判不出来」）")
+    if not ok:
+        print(f"         ok={res.ok} names={res.names} 读={len(reads)} 写={writes}")
+
+    # ② add 一个已经在名单里的名字 → 不下发（下发会写出同名不同拼写的重复条目）
+    res, reads, writes = _run_wl("add", "vul", before=["Vul"])
+    ok = res.noop and res.ok is True and writes == [] and res.server_name == "Vul"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 add 已存在 → 不下发，回显服务端拼写 Vul")
+    if not ok:
+        print(f"         noop={res.noop} ok={res.ok} 写={writes} 名字={res.server_name}")
+
+    # ③ add 新名字 → 下发，且反查（第二次读）命中才算成功
+    res, reads, writes = _run_wl("add", "Steve", before=[], after=["Steve"])
+    ok = writes == [("add", "Steve")] and res.ok is True and res.mutation_sent and len(reads) == 2
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 add 新名字 → 下发后反查命中才算成功")
+    if not ok:
+        print(f"         写={writes} ok={res.ok} mutation_sent={res.mutation_sent} 读={len(reads)}")
+
+    # ④ 接口回执说 ok，但反查里没有 → **未生效**。这是本块最关键的一条：
+    #    信回执就等于把「没发生的事报成发生了」，而对方的 ok 语义还换过版本。
+    res, reads, writes = _run_wl("add", "Steve", before=[], after=[])
+    ok = len(writes) == 1 and res.ok is False and res.mutation_sent
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口回执 ok 但反查没命中 → 报未生效（不信回执）")
+    if not ok:
+        print(f"         写={writes} ok={res.ok} mutation_sent={res.mutation_sent}")
+
+    # ⑤ remove 用**服务端记录的拼写**下发（接口返回的条目就是它记着的那个）
+    res, reads, writes = _run_wl("remove", "vul", before=["Vul"], after=[])
+    ok = writes == [("remove", "Vul")] and res.ok is True and res.targets == ["Vul"]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 remove 用服务端拼写下发（vul → Vul）")
+    if not ok:
+        print(f"         写={writes} ok={res.ok} targets={res.targets}")
+
+    # ⑥ 401 → 通道无关的「凭证错」，调用方据此回「接口认证失败（token 可能被轮换）」
+    try:
+        _run_wl("list", read_error=_br.BridgeAuthError("401"))
+        _kind = "没抛"
+    except _WlAuth:
+        _kind = "auth"
+    except Exception as exc:
+        _kind = type(exc).__name__
+    ok = _kind == "auth"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口 401 → WhitelistAuthError（不是「连不上」）")
+    if not ok:
+        print(f"         实际={_kind}")
+
+    # ⑦ 写的时候连不上 → 「不可达」，且**前置读已经做过了**（读成功但写失败）
+    try:
+        _run_wl("add", "Steve", before=[], write_error=_br.BridgeUnreachable("connrefused"))
+        _kind = "没抛"
+    except _WlDown:
+        _kind = "down"
+    except Exception as exc:
+        _kind = type(exc).__name__
+    ok = _kind == "down"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  接口写的时候连不上 → WhitelistUnreachable")
+    if not ok:
+        print(f"         实际={_kind}")
+
+    # ⑧⑨ --whitelist 在接口型目标上的诊断（不是命令判定，是「只读一览 + 该不该报警」）。
+    #    `intercept_off` 是这一段的全部意义：enabled=false 时**名单读得到、返回码也是 1**，
+    #    唯一的信号就是这张表 —— 把它漏掉，一台谁都能进的服会被报成「[OK] 解析正常」。
+    from plugins_napcat._shared.mcservers import WhitelistRoute as _WR
+
+    _route = _WR(target=_wl_target)
+
+    def _run_wlview(enabled, entries):
+        """在打桩的接口上跑一次只读一览。返回 (返回码, intercept_off, 打出来的字)。"""
+        off: list[str] = []
+
+        async def fake_read(api, timeout):
+            return _br.BridgeWhitelist(enabled=enabled, entries=tuple(entries))
+
+        _save = _br.fetch_whitelist
+        _br.fetch_whitelist = fake_read
+        buf, sys.stdout = sys.stdout, _io.StringIO()
+        try:
+            code = asyncio.run(_whitelist_via_api(_route, off))
+        finally:
+            _br.fetch_whitelist = _save
+            text = sys.stdout.getvalue()
+            sys.stdout = buf
+        return code, off, text
+
+    code, off, text = _run_wlview(True, ["Steve", "Vul"])
+    ok = code == 1 and off == [] and "Steve" in text and "enabled（代理层的白名单总开关）: True" in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  --whitelist 接口台：名单读得到 → 算正常，不报警")
+    if not ok:
+        print(f"         码={code} off={off} 文本={text!r}")
+
+    code, off, text = _run_wlview(False, ["Steve"])
+    ok = code == 1 and off == [_route.name] and "enabled（代理层的白名单总开关）: False" in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  enabled=false → 记进 intercept_off（名单在但拦不住人）")
+    if not ok:
+        print(f"         码={code} off={off}")
+
+    print()
+
     print(f"== 自测结果：{'全部通过' if not failed else f'{failed} 项失败'} ==")
     return 1 if failed else 0
 
@@ -2585,9 +3312,12 @@ def _verdict(target, snap) -> tuple[bool, str]:
     SLP 的 sample 也不是全群组名单），拿名单完整性去卡它，会把一台完全正常的代理
     判成故障、并把人指去查一个它本来就不该有的东西。判代理只看 reachable。
     """
-    from plugins_napcat._shared.mc import SLP_UNPARSEABLE
+    from plugins_napcat._shared.mc import API_AUTH, SLP_UNPARSEABLE
 
     if not snap.reachable:
+        # 凭证失效不是「不可达」：服务好得很，是我们进不去，下一动作是去要新 token
+        if snap.error_kind == API_AUTH:
+            return False, "接口不认我们的凭证（401）"
         return False, "应答无法解析" if snap.error_kind == SLP_UNPARSEABLE else "不可达"
     if not target.serves_names:
         return True, f"代理可达，报出全群组 {snap.count} 人"
@@ -2602,9 +3332,21 @@ def _advice(target, snap) -> None:
     只被 `_verdict` 判为 False 的目标调用，所以「代理」那一类到不了这里
     （代理只要可达就算正常），不必在这里再判一次 kind。
     """
-    from plugins_napcat._shared.mc import SLP_UNPARSEABLE
+    from plugins_napcat._shared.mc import API_AUTH, SLP_UNPARSEABLE
 
     if not snap.reachable:
+        if snap.error_kind == API_AUTH:
+            # 401 的下一步动作是「去要新 token」，查网络纯属白费功夫（同 mcrender）
+            print("       群组接口拒绝了我们的 token（401）—— 这不是网络问题。")
+            print("       对方轮换过 token 的话去要一份新的，填进 mcs_servers.toml 的")
+            print("       api.token；隧道和对方服务本身可能好得很。")
+            return
+        if target.is_api or target.source:
+            # 接口这条通道的失败**分三种**，三种的排查方向完全不同（见 mcbridge）
+            print("       接口取数失败：先跑 --api 直接看接口（/health 免鉴权，")
+            print("       所以它能通就说明隧道和服务都在，问题在 token 或路径）。")
+            print("       三条路径的形状见 DEPLOY.md 4.1 的「走群组接口」。")
+            return
         if snap.error_kind == SLP_UNPARSEABLE:
             # 服务端**应答了**，只是回的不算合法状态响应。报「不可达」会把人指去
             # 查防火墙，而真正该看的是「是不是还在启动」。
@@ -2618,7 +3360,11 @@ def _advice(target, snap) -> None:
         return
 
     print("       名单不完整 → 进服提醒会**静默暂停**（不会误报，但也不推消息）：")
-    if not target.rcon_enabled:
+    if target.is_api or target.source:
+        print("       这台走的是群组接口，名单是**对方插件**给的（我们原样报）。")
+        print("       人数和名单条数对不上，就是对方那边报了在线人数却没给全名单 ——")
+        print("       先跑 --api 看接口原文，再看上面那行备注。")
+    elif not target.rcon_enabled:
         print("       该目标没配 rcon.password（mcs_servers.toml）。")
         print("       在线人数 ≤12 时 SLP 的玩家样本本身就是完整名单；超过就必须开 RCON。")
     else:
@@ -2723,8 +3469,18 @@ async def _live(query: str = "", audience: str = "") -> int:
     for target, snap in zip(targets, snaps):
         ok, why = _verdict(target, snap)
         print(f"--- {'[OK]' if ok else '[!!]'} {target.name} [{target.id}] {target.kind} —— {why}")
-        print(f"    SLP   {target.game_addr}")
-        if not target.serves_names:
+        # 三条通道的地址分三种，逐个说清这台靠哪条取数：接口型根本没有游戏端口，
+        # 打一行「SLP -」只会让人以为配漏了 host。
+        print(f"    SLP   {target.game_addr}" if target.host else "    SLP   ——（没有游戏端口）")
+        if target.is_api:
+            print(f"    接口  {target.api.url}（整组共用一份 /status）")
+        elif target.source:
+            hub = target.hub
+            src = f"{hub.name} 的接口" if hub is not None else f"目标 {target.source} 的接口"
+            print(f"    数据  从 {src} 里取（servers[].name = {target.source_name!r}）")
+        if target.is_api or target.source:
+            print("    RCON  ——（走接口，不发 RCON）")
+        elif not target.serves_names:
             print("    RCON  ——（代理不出分服名单，跳过）")
         elif not target.rcon_enabled:
             print("    RCON  ——（没配 rcon.password，跳过）")
@@ -2744,6 +3500,10 @@ async def _live(query: str = "", audience: str = "") -> int:
             print(f"    在线人数  {snap.count} / {snap.max_players}")
             print(f"    延迟      {snap.latency}")
             print(f"    版本      {snap.version or '(未知)'}")
+            # 人数来源只有接口型目标会出现第二答案（接口 or SLP 复查）——它是
+            # 「这个数字有多可信」的线索，所以跟着接口这条通道一起打
+            if target.is_api or target.source:
+                print(f"    人数来源  {snap.count_source}")
             print(f"    名单来源  {snap.names_source}")
             print(f"    名单条数  {len(snap.names)}")
             print(f"    名单完整  {snap.names_complete}")
@@ -2770,6 +3530,130 @@ async def _live(query: str = "", audience: str = "") -> int:
     return 1
 
 
+async def _api(audience: str = "", query: str = "") -> int:
+    """直接看一眼群组接口：/health、/status、/whitelist 三条都打，原文照登。
+
+    和上面的实机探测**不是一回事**，所以另开一条命令：那边问的是「机器人看到的
+    每台服是什么样」，这边问的是「接口到底给了什么」。接口的形状是**对方**实现的，
+    一旦他们改了字段名或路径，那边只会表现成「某几台取不到数据」，看不出是哪一步错的。
+
+    这一条最有用的是最后那行漏挂清单：接口里有、而我们的表里一台都没挂的子服
+    （lobby / limbo 这种）。它们不会出现在任何别的地方 —— 不挂就不会被探测，
+    也就不会报错，只是「在线人数里少了几个人」这种谁都不会注意到的偏差。
+
+    `query` 收窄到某一个接口型目标（按服名解析，和群里同一套名字）。
+    """
+    from plugins_napcat._shared import mcbridge
+    from plugins_napcat._shared.mcaudiences import default_config
+    from plugins_napcat._shared.mcservers import ServerConfigError
+
+    book, picked, code = _pick_audience(audience)
+    if book is None:
+        return code
+
+    hubs = [t for t in book.targets if t.is_api]
+    if query:
+        res = book.resolve(query)
+        if not res.ok:
+            print(f"== 认不出服名 {query!r} ==")
+            print(f"   本条关联的可选：{'、'.join(t.name for t in book.targets)}")
+            return 2
+        if not res.target.is_api:
+            # 认得出但不是接口型：**直说**，别退回「全都探一遍」——那会让人以为
+            # 这台也有接口，而它的数据其实来自 SLP/RCON。
+            transport = res.target.transport
+            print(f"== {res.target.name} [{res.target.id}] 不是接口型目标（{transport}）==")
+            if res.target.source:
+                print(f"   它的数据来自 {res.target.source} 的接口，直接跑 --api 看那一台。")
+            return 2
+        hubs = [res.target]
+    if not hubs:
+        print(f"== 关联「{picked.name}」里没有接口型目标 ==")
+        print("   接口型 = mcs_servers.toml 里配了 api 段的那台（通常是代理）。")
+        print("   本条的 targets：" + ("、".join(t.name for t in book.targets) or "（空的）"))
+        return 1
+
+    # 漏挂清单要拿**全量表**算：一台子服可能属于别的群关联，在别的群里是挂着的，
+    # 那就不算漏。只看本条视图会把「别人挂了」误报成「没人挂」。
+    try:
+        full = default_config().book
+    except ServerConfigError as exc:
+        print(f"== MC 配置读不了 ==\n   [!!] {exc}")
+        return 1
+
+    bad = 0
+    for hub in hubs:
+        print(f"== 接口目标：{hub.name} [{hub.id}] ==")
+        print(f"   url     {hub.api.url}")
+        print(f"   超时    {hub.timeout:g}s")
+        print()
+
+        try:
+            healthy = await mcbridge.fetch_health(hub.api, hub.timeout)
+            print(f"   /health    → {'ok' if healthy else '应答了，但 ok 不是 true'}")
+        except mcbridge.BridgeError as exc:
+            # /health 免鉴权，所以它失败基本就是网络/服务的问题，不是 token
+            print(f"   /health    → [!!] {type(exc).__name__}: {exc}")
+            bad += 1
+            print()
+            continue
+
+        try:
+            status = await mcbridge.fetch_status(hub.api, hub.timeout)
+        except mcbridge.BridgeAuthError as exc:
+            # 单独一条：token 错的话后面两条也都不用试了，而且要去要新 token
+            print(f"   /status    → [!!] 认证失败（401）：token 可能被对方轮换了")
+            print(f"                {exc}")
+            bad += 1
+            print()
+            continue
+        except mcbridge.BridgeError as exc:
+            print(f"   /status    → [!!] {type(exc).__name__}: {exc}")
+            bad += 1
+            print()
+            continue
+
+        tracked = {
+            t.source_name for t in full.targets if t.source == hub.id
+        }
+        print(f"   /status    → 全群组 {status.proxy_online} 人，{len(status.servers)} 台子服")
+        for server in status.servers:
+            mark = "[已挂]" if server.name in tracked else "[未挂]"
+            names = "、".join(server.players)
+            tail = f"　{names}" if names else ""
+            print(f"     {mark} {server.name:12s} {server.online} 人{tail}")
+        missing = [s.name for s in status.servers if s.name not in tracked]
+        if missing:
+            # 不挂的子服**不会报错**，只会让人数悄悄少一块 —— 所以要点名说出来
+            print(
+                f"   [!] 上面 {len(missing)} 台我们没挂：{'、'.join(missing)}"
+                f"（它们的玩家会算进群组总数，但不在任何分服行里）"
+            )
+        print()
+
+        try:
+            whitelist = await mcbridge.fetch_whitelist(hub.api, hub.timeout)
+        except mcbridge.BridgeError as exc:
+            print(f"   /whitelist → [!!] {type(exc).__name__}: {exc}")
+            bad += 1
+            print()
+            continue
+        entries = "、".join(whitelist.entries) or "（空的）"
+        print(f"   /whitelist → enabled={whitelist.enabled}，{len(whitelist.entries)} 条")
+        print(f"     {entries[:200]}{' …' if len(entries) > 200 else ''}")
+        if not whitelist.enabled:
+            # 「配了却不生效」：名单能读能改，但代理层的拦截是关的，谁都能进
+            print("   [!] enabled=false：代理层的白名单拦截**没开**，谁都能进群组服。")
+            print("       名单增减照常生效，但拦不住人 —— 要在对方那侧打开 whitelist-enabled。")
+        print()
+
+    if bad:
+        print(f"== 结论：{bad} 项失败 ==")
+        return 1
+    print("== 结论：接口三条路径都正常 ==")
+    return 0
+
+
 async def _whitelist(audience: str = "", query: str = "") -> int:
     """只读地看一眼服务端白名单，确认解析对不对。
 
@@ -2783,6 +3667,10 @@ async def _whitelist(audience: str = "", query: str = "") -> int:
     一定会漂。
 
     逐台**串行**：诊断输出要稳定、可读、顺序与配置一致，不为省几秒把顺序交给 gather。
+
+    两条通道都走：RCON 的照旧，接口型的打 `enabled` + 名单数组（见
+    `_whitelist_via_api`）。所以「解析对不对」这句话只对 RCON 那几台成立 ——
+    接口给的是结构化数据，没有解析这一层。
 
     刻意**不发** add / remove：诊断脚本会真实改动服务端，而它没有任何清理逻辑——
     脚本中途挂掉，whitelist.json 就被留在谁也不知道的状态。要测写入，去群里用一次
@@ -2828,14 +3716,22 @@ async def _whitelist(audience: str = "", query: str = "") -> int:
         print()
 
     ok_count = 0
+    # 接口报「名单开着但拦截是关的」的那些台（enabled=false）。攒到最后一起说：
+    # 单看某一台的名单会以为白名单生效了，而这恰好是「配了却不生效」那一类。
+    intercept_off: list[str] = []
     for index, route in enumerate(routes, start=1):
         if len(routes) > 1:
             print(f"---- 第 {index}/{len(routes)} 台 ----")
-        if not route.rcon_enabled:
+        if not route.whitelist_ready:
             print(f"== 白名单目标：{route.name} [{route.id}] ==")
-            print("   [!!] 没配 rcon.password：命令发不出去，也就没有名单可看。")
-            print("        （群里会回「白名单服 X 没配 RCON 密码」）")
+            print("   [!!] 两条通道都没配（既没有 rcon.password 也没有 api）：")
+            print("        命令发不出去，也就没有名单可看。")
+            print("        （群里会回「白名单服 X 两条通道都没配」）")
             print()
+            continue
+
+        if route.target.is_api:
+            ok_count += await _whitelist_via_api(route, intercept_off)
             continue
 
         # 命令前缀来自这一台的 route.command，**不是**硬编码的 "whitelist"。
@@ -2880,11 +3776,57 @@ async def _whitelist(audience: str = "", query: str = "") -> int:
         else:
             print("   [!!] 这台没读到（原因见上）。")
         return 1
+    if intercept_off:
+        print("== 结论 ==")
+        print(f"   [!!] {'、'.join(intercept_off)} 的名单读得到，但接口报 enabled=false：")
+        print("        代理层的**白名单拦截是关的**，谁都能进服。加白命令会照常成功、")
+        print("        名单也会变长，只是拦不住人。去对方 velocity.toml 的 whitelist 段落确认。")
+        return 1
     print("== 结论 ==")
     print("   [OK] 解析正常，白名单命令可以正常判定成败。")
-    print("   注意：本脚本只能看到 whitelist.json 的内容，看不出服务端有没有开")
-    print("   white-list。若白名单里有人却仍能自由进出，去 server.properties 确认。")
+    if any(r.target.is_api for r in routes):
+        print("   接口那几台连「名单有没有生效」都看得到（上面的 enabled）；RCON 那几台")
+        print("   看不到服务端有没有开 white-list —— 若名单里有人却仍能自由进出，")
+        print("   去 server.properties 确认。")
+    else:
+        print("   注意：本脚本只能看到 whitelist.json 的内容，看不出服务端有没有开")
+        print("   white-list。若白名单里有人却仍能自由进出，去 server.properties 确认。")
     return 0
+
+
+async def _whitelist_via_api(route: "WhitelistRoute", intercept_off: list[str]) -> int:
+    """接口型白名单服的只读一览。返回 1 = 这台算正常，0 = 没读到。
+
+    **刻意不做「解析」这一段**：RCON 那条路上 parse_whitelist_names 是个真实的失败点
+    （插件改文案就把 `list` 的输出读成 None），接口给的是结构化数组，没有对应的坑。
+    把 RCON 的「判不出来」原样搬过来只会让人以为这里也有一套解析要验。
+
+    `intercept_off` 由调用方持有并汇总 —— 这里只负责把「名单在、拦截关」这件事
+    记进去，因为它是**跨台**的结论（单台那一屏很容易被下一台冲掉）。
+    """
+    from plugins_napcat._shared.mcbridge import BridgeError, fetch_whitelist
+
+    print(f"== 白名单目标：{route.name} [{route.id}] 接口 {route.target.api.url} ==")
+    print("   这一台走群组接口的 GET /whitelist：**没有命令前缀** —— 前缀是 RCON 那边")
+    print("   插件命令的事，接口直接给结构化数据（本条的 whitelist.command 对这台无效）。")
+    print()
+
+    try:
+        whitelist = await fetch_whitelist(route.target.api, route.target.timeout)
+    except BridgeError as exc:
+        print(f"== 接口 GET /whitelist 失败 ==\n   [!] {type(exc).__name__}: {exc}")
+        print()
+        return 0
+
+    print("== 接口 GET /whitelist ==")
+    print(f"   enabled（代理层的白名单总开关）: {whitelist.enabled}")
+    print(f"   共 {len(whitelist.entries)} 人")
+    print(f"   {list(whitelist.entries[:20])}{' …' if len(whitelist.entries) > 20 else ''}")
+    if not whitelist.enabled:
+        print("   [!!] enabled=false：名单本身没问题，但**代理层没在拦人**。")
+        intercept_off.append(route.name)
+    print()
+    return 1
 
 
 def _list_targets() -> int:
@@ -2932,10 +3874,22 @@ def _list_targets() -> int:
         # 而看这个输出的人正是来查那件事的。
         mark = f"　← 被 {'、'.join(watchers)} 关联" if watchers else "　← ⚠️ 没被任何群关联"
         print(f"   {t.name}  [{t.id}]  {t.kind}{mark}")
-        print(f"      游戏 {t.game_addr}    RCON {t.rcon_addr}    组 {t.group}")
+        # 地址行按通道分支：接口型目标没有游戏端口，打「游戏 -　RCON -」等于一屏
+        # 没配的东西，而它其实配得好好的 —— 只是走的是第三条通道。
+        addr = f"游戏 {t.game_addr}    RCON {t.rcon_addr}"
+        if t.is_api:
+            addr = f"接口 {t.api.url}"
+        elif t.source:
+            src = t.hub.name if t.hub is not None else t.source
+            addr = f"数据 {src} 的接口（servers[].name = {t.source_name!r}）"
+        print(f"      {addr}    组 {t.group}")
         print(f"      名字 {'、'.join(t.keys)}    "
               f"超时 SLP {t.timeout:g}s / RCON {t.rcon_timeout:g}s")
-        if not t.serves_names:
+        if t.is_api:
+            print("      （代理：接口给整组数据，全群组人数不进分服合计）")
+        elif t.source:
+            print(f"      （子服：数据从 {t.source} 的接口取，自己不发请求）")
+        elif not t.serves_names:
             print("      （代理：SLP 只给全群组总人数，不出分服名单）")
         elif not t.rcon_enabled:
             print("      （没配 RCON 密码：不出名单，只能靠 SLP 样本，>12 人就不完整）")
@@ -2949,7 +3903,10 @@ def _list_targets() -> int:
         print(f"      {audience.whitelist_summary}")
         print(f"      推送   {audience.flags_summary}")
     print("   白名单是**按群关联**定的，逐条细节与命令前缀见：")
-    print("       .venv\\Scripts\\python.exe tools\\mc_check.py --list-audiences")
+    # 用**正在跑的那个解释器**而不是写死 .venv\Scripts\python.exe：Windows 和 Linux
+    # 的 venv 布局不同（Scripts/ vs bin/），而这行是要给人复制粘贴的。sys.executable
+    # 两边都对，也不会因为将来换了 venv 名字而失效。
+    print(f"       \"{sys.executable}\" tools/mc_check.py --list-audiences")
     print()
 
     # 一轮探测的耗时预算。**这是上界，不是典型值**：正常一轮在毫秒级，
@@ -2968,10 +3925,12 @@ def _list_targets() -> int:
         # 「进服提醒怎么没反应」，而原因往往就是忘了写 watch = true。
         print("   没有任何 [[audience]] 写 watch = true，进服提醒不跑轮询，没有预算可言")
     else:
-        slp, rcon, budget = round_budget(book.scoped(watched))
+        slp, rcon, api, budget = round_budget(book.scoped(watched))
         print(f"   基数：开着 watch 的关联覆盖到的 {len(watched)} 台服"
               f"（全量表共 {len(book.targets)} 台，没开 watch 的不算）")
-        print(f"   SLP {slp:g}s + RCON {rcon:g}s ×2 = 最坏 {budget:g}s")
+        # 接口那一项照样打出来（哪怕是 0s）：算式和右边的小计**必须加得起来**，
+        # 否则配了接口型目标之后这里会莫名多出 5s，看着像算错。
+        print(f"   SLP {slp:g}s + RCON {rcon:g}s ×2 + 接口 {api:g}s = 最坏 {budget:g}s")
         raw_interval = os.environ.get("MC_WATCH_INTERVAL_SEC", "").strip()
         if raw_interval:
             try:
@@ -3089,6 +4048,8 @@ _USAGE = (
     "   --target <服名>        只实机探测这一个目标；配 --whitelist 时收窄到那一台\n"
     "   --whitelist            只读地看一眼服务端白名单（本条关联的全部白名单服，\n"
     "                          逐台列出；一台时就是那一台）\n"
+    "   --api                  直接看群组接口：/health、/status、/whitelist 三条都打，\n"
+    "                          并列出接口里有、我们却没挂的子服（配 --target 收窄一台）\n"
     "   --audience <关联名>    站在哪条群关联的视角上（默认第一条；影响 --target\n"
     "                          能认出的服名，以及 --whitelist 发给哪几台服）\n"
     "   （不带参数）           实机探测所选关联的全部目标"
@@ -3098,7 +4059,7 @@ _USAGE = (
 def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
     """把命令行解析成 `(动作, 服名, 关联名)`；返回 None 表示用法错误（提示已打印）。
 
-    动作 ∈ self-test / list-targets / list-audiences / whitelist / live。
+    动作 ∈ self-test / list-targets / list-audiences / whitelist / api / live。
     抽成纯函数是为了能自测：「认不出的参数不许退化成实机探测」这条不能只靠读代码保证。
     """
     # 认不出的参数必须拦下。否则 `--help`（本脚本没有这个参数）或 `--targets`
@@ -3112,6 +4073,7 @@ def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
         "--list-targets",
         "--list-audiences",
         "--whitelist",
+        "--api",
         "--target",
         "--audience",
     }
@@ -3164,6 +4126,8 @@ def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
 
     if "--whitelist" in argv:
         return "whitelist", query, picked
+    if "--api" in argv:
+        return "api", query, picked
     return "live", query, picked
 
 
@@ -3180,6 +4144,8 @@ def main() -> int:
         return _list_audiences()
     if action == "whitelist":
         return asyncio.run(_whitelist(audience, query))
+    if action == "api":
+        return asyncio.run(_api(audience, query))
     return asyncio.run(_live(query, audience))
 
 

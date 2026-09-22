@@ -7,7 +7,9 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 - **NapCat 版（推荐）**：`bot_napcat.py`，走个人 QQ 号 + [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11），**可主动推送**，不受官方限制，含定时播报 / 进频道欢迎。
 - **QQ 官方版（备选/回退）**：`bot.py`，官方机器人仅被动响应（2025-04-21 起官方停用主动推送，发起即报 `40034105`）。
 
-> 🚀 **从零部署**（全新 Windows 环境搭建）：见 [DEPLOY.md](DEPLOY.md)。
+> 🚀 **从零部署**：Windows 见 [DEPLOY.md](DEPLOY.md)，Linux 见 [DEPLOY-Linux.md](DEPLOY-Linux.md)。
+> 后者用 systemd 挂机器人、用 Docker Compose 跑 NapCat；`.env` / 两份 `.toml` 的字段含义
+> 两份文档共用 [DEPLOY.md 第 4 节](DEPLOY.md)。
 
 ## 功能
 
@@ -16,12 +18,14 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 | `@机器人 你好` | 「收到！被动回复链路已打通 🎉」——链路自检 |
 | `@机器人 oopz` | 📊 oopz 语音频道在线成员报告（分域/频道 + 昵称） |
 | `@机器人 mc [服名]` | 🗺️ Minecraft 在线人数 + 玩家名单。**不带服名 = 本群关联的服的总览**（每个服一小段名单）；带服名 = 该服明细，服名支持 id / 名字 / 别名 / 唯一前缀，认不出或有歧义都会明确回复 |
-| `@机器人 whitelist add/remove <玩家名> [服名]`<br>`@机器人 whitelist list [服名]` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且本群那条群关联的 `whitelist` 要指到配了 RCON 的服）。服名写在**末尾**；本群只有一台白名单服时可以省，多台时必须点名 |
+| `@机器人 whitelist add/remove <玩家名> [服名]`<br>`@机器人 whitelist list [服名]` | 🧾 MC 玩家白名单管理（**仅 `MC_ADMIN_QQ` 里的管理员**，且本群那条群关联的 `whitelist` 要指到配了 RCON 或群组接口的服）。服名写在**末尾**；本群只有一台白名单服时可以省，多台时必须点名 |
 
 > 触发词可改：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（逗号分隔，不区分大小写）。一条消息只会被一个插件响应。
 >
 > MC 服务器的地址、显示名、RCON 密码在 **`mcs_servers.toml`**；**哪个 QQ 群看哪几台服**
 > 在 **`mcs_audiences.toml`**（两份都不在 `.env`），见 [DEPLOY.md 4.1 / 4.2](DEPLOY.md)。
+> 取数走三条通道：SLP（人数）、RCON（名单，自己的服）、**群组 HTTP 接口**（一次拿整组
+> 每个子服的人数与名单，对方装 Velocity 插件时首选，见 4.1）。
 >
 > **MC 功能是按群开通的**：群号被写进某条 `[[audience]].groups` 才算开通，没被提到
 > 就不开通（群里会明确回一句，不是静默）。关联外的服名在那个群里查不到 —— 这是刻意的隔离。
@@ -34,7 +38,7 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 
 - ⏰ **oopz 定时播报**：整点对齐推送（间隔 30 分钟则在 :00/:30，间隔 60 则每小时整点），向 `NAPCAT_REPORT_GROUP` 推送独立格式的「📣 oopz 语音频道播报」——**仅当 oopz 有人在线时**，无人则静默跳过
 - 👋 **进频道欢迎**：每 `NAPCAT_WELCOME_INTERVAL_SEC` 秒轮询，检测到有人进入目标域语音频道时推送趣味欢迎语（随机文案）
-- 🎮 **MC 进服提醒**：每 `MC_WATCH_INTERVAL_SEC` 秒轮询 MC 服务器，有人进服时推送提醒（**只推进服，不推退服**；最小推送间隔 `MC_JOIN_MIN_INTERVAL_SEC` 秒，窗口内的进服合并成一条）。**收件人和盯哪几台都由那条群关联决定**（`watch = true` + 它自己的 `targets`），一条关联挂三台服时一个周期内合成**一条**消息
+- 🎮 **MC 进服提醒**：每 `MC_WATCH_INTERVAL_SEC` 秒轮询 MC 服务器，有人进服时推送提醒（**推「进服」和「换服」（同组两台之间移动），不推退服**；最小推送间隔 `MC_JOIN_MIN_INTERVAL_SEC` 秒，窗口内的进服合并成一条）。**收件人和盯哪几台都由那条群关联决定**（`watch = true` + 它自己的 `targets`），一条关联挂三台服时一个周期内合成**一条**消息
 - ⏰ **MC 定时播报**：整点对齐推送「📣 MC 播报」+ 各服在线名单（`report = true`）——某台服没人或不可达只是**列成一行**，不再让整条播报跳过；真的全都没人才静默跳过
 - ⚠️ **MC 掉线提醒**：连续两轮探测失败才判定离线（单轮网络抖动不报），恢复时也会推一条；`MC_NOTIFY_SERVER_STATE=false` 可关。掉线只推给**关联了那台服**的群
 
@@ -64,11 +68,12 @@ oopz-bot/
 ├── bot.py                    # 启动入口①：QQ 官方版（被动响应）
 ├── bot_napcat.py             # 启动入口②：NapCat/OneBot 版（可主动推送）
 ├── requirements.txt          # Python 依赖清单
-├── vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
-├── tools/
+├── vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发；requirements.txt 里默认装它）
+├── tools/                    # 人手动跑的工具（机器人本体不 import 它们）
+│   ├── README.md             # 三个工具的分工、用法、什么时候该跑哪个
 │   ├── oopz_login.py         # 手机号+密码 → 写入 OOPZ_* 凭据
 │   ├── oopz_check.py         # 独立验证 oopz 查询链路
-│   └── mc_check.py           # 独立验证 MC 取数链路（`--list-targets` 看服务器 / `--list-audiences` 看群关联 / `--target` 测单台 / `--self-test` 离线自测）
+│   └── mc_check.py           # 独立验证 MC 取数链路（`--list-targets` 看服务器 / `--list-audiences` 看群关联 / `--target` 测单台 / `--api` 只看群组接口 / `--self-test` 离线自测）
 ├── plugins/                  # QQ 官方版插件（bot.py 加载）
 │   ├── hello.py              # @你好 → 链路自检
 │   └── oopz_stats.py         # @oopz → 实时成员报告
@@ -84,7 +89,8 @@ oopz-bot/
 │   │   ├── mc_admin.py       #   @whitelist（管理 MC 玩家白名单）
 │   │   └── mc_reporter.py    #   进服提醒 + 定时播报
 │   └── _shared/              # 跨插件共享工具（下划线前缀 → 不会被当插件加载）
-│       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + list/白名单输出解析
+│       ├── mc.py             #   MC 取数层：SLP + 自实现 RCON + 群组接口合并 + list/白名单输出解析
+│       ├── mcbridge.py       #   群组接口客户端（Velocity 插件：/health /status /whitelist 增删查）
 │       ├── mcservers.py      #   服务器清单（mcs_servers.toml 解析 / 校验 / 服名解析 / 投影）
 │       ├── mcaudiences.py    #   群关联（mcs_audiences.toml 解析 / 「这个群看哪几台」/ 唯一加载入口）
 │       ├── mcdelta.py        #   玩家进出对账（reconcile：两份名单差成进服/退服/换服事件）
@@ -96,21 +102,36 @@ oopz-bot/
 │       ├── schedule.py       #   整点对齐时间槽
 │       ├── triggers.py       #   触发词归属（决定消息归哪个插件响应）
 │       └── whitelist.py      #   群白名单（**现在只有 oopz 在用**；被拦下时打 warning）
-├── DEPLOY.md                 # 从零部署指南
+├── deploy/linux/             # Linux 部署用的现成文件（见 DEPLOY-Linux.md）
+│   ├── docker-compose.yml    #   NapCat 协议端容器
+│   ├── oopz-bot.service      #   机器人本体（systemd）
+│   └── mc-tunnel.service     #   MC 取数用的 ssh 隧道（可选）
+├── DEPLOY.md                 # 从零部署指南（Windows）
+├── DEPLOY-Linux.md           # 从零部署指南（Linux）
 └── docs/
     └── chat.md               # 完整技术文档与踩坑记录
 ```
 
 ## 快速开始
 
+> 下面这套命令是 **Windows** 的。Linux（systemd + Docker Compose NapCat）的环境准备、
+> venv、配置权限、挂服务、验收与排查都在 [DEPLOY-Linux.md](DEPLOY-Linux.md)，那份从
+> 第 1 节开始就不一样，别照抄这里的路径 —— 但**配置项和工具用法完全相同**。
+
 **环境**：Windows / Linux，Python ≥ 3.10
 
 **1. 安装依赖**
 
 ```bash
-pip install -r requirements.txt
-pip install ./vendor/Oopzbot-SDK   # oopz_sdk 不在 PyPI，从本地 vendor 安装
+pip install -r requirements.txt   # oopz 默认一起装上：最后一行 oopz-sdk 指的就是本工程
+                                  # vendor/ 里的 SDK（不在 PyPI），不用再单跑 pip。
+                                  # ⚠️ 那条是本地相对路径，pip 按 cwd 解析 ——
+                                  #    所以这条命令要在工程根目录跑
 ```
+
+> **只要 MC 功能、不要 oopz**：把 `requirements.txt` 最后那一行注释掉再装即可。这是**受
+> 支持的**状态 —— 机器人照常启动，oopz 那半边自动停用并明说原因（群里回一句、日志吼一声），
+> MC 查询 / 白名单一字不受影响。以后想要：`pip install ./vendor/Oopzbot-SDK` 再重启。
 
 **2. 配置 `.env`**
 
@@ -138,7 +159,7 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 
 **5. 验证 Minecraft 取数**（可选，用 MC 功能才需要）
 
-先按 [DEPLOY.md 第 4.1 节](DEPLOY.md#41-minecraft-服务端准备rcon) 在 MC 服务端打开 RCON（**别漏 `broadcast-rcon-to-ops=false`**），再跑：
+先按 [DEPLOY.md 4.1 的「每台服务端的准备」](DEPLOY.md) 在 MC 服务端打开 RCON（**别漏 `broadcast-rcon-to-ops=false`**，缺省是 `true`，不改的话每次 `list` 都会广播给在线 OP 刷屏），再跑：
 
 ```powershell
 .venv\Scripts\python.exe tools\mc_check.py                     # 实测所选群关联的全部目标（并发）
@@ -148,6 +169,7 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 .venv\Scripts\python.exe tools\mc_check.py --list-audiences    # 只读：每条群关联覆盖哪些群、哪几台服
 .venv\Scripts\python.exe tools\mc_check.py --self-test         # 只跑解析自测，不联网
 .venv\Scripts\python.exe tools\mc_check.py --whitelist         # 只读地看一眼服务端白名单
+.venv\Scripts\python.exe tools\mc_check.py --api               # 只看群组接口那一层（/health、/status、/whitelist）
 ```
 
 每个目标一个块，块头就是结论；末尾汇总 `N/M 个目标正常`，**有目标不正常时退出码为 1**。
@@ -252,14 +274,14 @@ whitelist = [
 > ⚠️ **多写一台白名单服 = 同一个人能改的服务器多一台**。`MC_ADMIN_QQ` 鉴的是「人」、**不分服**，所以加项之前先确认这个人本来就该管那台服——这是权限扩大，而它不会出现在任何输出里。
 >
 > 三种「没配好」群里回的话不同，修法也不同，别混：
-> 那条关联没写 `whitelist` → 「⚠️ 本群没有指定白名单服」；写了但那台没配
-> `rcon.password` → 「⚠️ 白名单服 X 没配 RCON 密码」；多台时没点名 →
-> 「⚠️ 本群有 N 台白名单服，命令里要点名发给哪台」。服名认不出、或者那台是本群的服
-> 但**没配白名单**，也各有专门文案（后者**不会**谎称「没这台服」）。
+> 那条关联没写 `whitelist` → 「⚠️ 本群没有指定白名单服」；写了但那台
+> **两条通道都没配**（既没有 `rcon` 也没有 `api`）→ 「⚠️ 白名单服 X 两条通道都没配」；
+> 多台时没点名 → 「⚠️ 本群有 N 台白名单服，命令里要点名发给哪台」。服名认不出、
+> 或者那台是本群的服但**没配白名单**，也各有专门文案（后者**不会**谎称「没这台服」）。
 >
 > 别把两个「白名单」搞混：**群关联**（`mcs_audiences.toml`，限制哪些 QQ 群能用 MC 功能、各看哪几台）和 **MC 玩家白名单**（`whitelist.json`，服务端的玩家准入表，由本功能管理）毫无关系，可以同时生效。`MC_ALLOWED_GROUPS` 是 2026-09-21 之前那套群白名单，已被群关联取代、不再生效。
 >
-> 本功能走 RCON，所以该项的 `target` 要指到配了 `rcon.password` 的服；且只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`。
+> 本功能走**两条通道之一**：RCON（自己的服）或群组 HTTP 接口（对方的 Velocity 插件，见 [DEPLOY.md](DEPLOY.md) 4.1），所以该项的 `target` 要指到**配了其中之一**的服。走 RCON 时只读写 `whitelist.json`，**不会**替你打开 `server.properties` 里的 `white-list`；走接口时端口和拦截开关都由对方管。
 >
 > 名字打什么大小写都行：bot 先读一遍白名单，下发命令时改用服务端记录的那条拼写（`add vul` 服务端存的是 `Vul`，回复里会注明），判定同样忽略大小写。**重复添加和重复移除都会如实回「无需改动」，不会虚报成功。**
 >
@@ -299,7 +321,8 @@ msg = "\n".join(lines)
 
 **4. 统计范围**（[.env](.env)）：`OOPZ_TARGET_AREAS=<你的域名>`——逗号分隔可加多个域（area_id 或域名），删除该行则统计全部已加入的域。
 
-改完**重启 `bot.py`** 生效。
+改完**重启对应的入口**生效（NapCat 版重启 `bot_napcat.py`，Linux 上是
+`sudo systemctl restart oopz-bot`）。
 
 ## 维护与常见问题
 

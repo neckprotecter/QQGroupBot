@@ -4,6 +4,11 @@
 
 本文档按"干净环境从 0 部署"编写。当前工程目录已经过清理，只保留运行所需 + 部署所需文件。
 
+> 🐧 **要部署到 Linux**：看 [DEPLOY-Linux.md](DEPLOY-Linux.md)。那份从环境准备到挂服务
+> 整套都不一样（systemd 跑机器人、Docker Compose 跑 NapCat），但**第 4 节的配置项含义、
+> 第 7 节的验证办法、第 8 节的业务侧排查（F5/F7/F8/F9/F11 等）两份完全通用** ——
+> 本文档里 Windows 专属的只有 F1–F4（NapCat 的 DLL / 沙箱坑）和那几条 PowerShell 命令。
+
 ---
 
 ## 0. 工程文件清单
@@ -18,19 +23,25 @@ oopz-bot/
 │  ├─ oopz/                  # oopz 语音频道：@查询 / 定时播报 / 进频道欢迎
 │  ├─ mcs/                   # Minecraft：@查询 / 进服提醒 / 定时播报 / 白名单管理
 │  └─ _shared/               # 跨插件共享工具（下划线前缀，不会被当插件加载）
-├─ tools/
+├─ tools/                    # 人手动跑的工具（机器人本体不 import 它们，详见 tools/README.md）
+│  ├─ README.md              # 三个工具的分工、用法、什么时候该跑哪个
 │  ├─ oopz_login.py          # 生成 oopz 平台登录凭据（device_id / jwt / 私钥）
 │  ├─ oopz_check.py          # oopz 诊断脚本
-│  └─ mc_check.py            # Minecraft 诊断脚本（SLP + RCON + 白名单，含解析自测）
+│  └─ mc_check.py            # Minecraft 诊断脚本（SLP + RCON + 群组接口 + 白名单，含离线自测）
 ├─ requirements.txt          # Python 依赖清单
-├─ vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发）
+├─ vendor/Oopzbot-SDK/       # oopz_sdk 源码（不在 PyPI，随工程分发；requirements.txt 里默认装它）
 ├─ .env.example              # 行为类配置模板 → 复制为 .env 填写
 ├─ .env                      # 实际配置（含密钥，勿外泄/勿提交）
 ├─ mcs_servers.toml.example  # MC 服务器清单模板 → 复制为 mcs_servers.toml 填写
 ├─ mcs_servers.toml          # 实际清单（含各服 RCON 密码，勿外泄/勿提交）
 ├─ mcs_audiences.toml.example # MC 群关联模板 → 复制为 mcs_audiences.toml 填写
 ├─ mcs_audiences.toml        # 实际群关联（不含密码，但含真实群号，勿提交）
-├─ DEPLOY.md                 # 本文档
+├─ DEPLOY.md                 # 本文档（Windows）
+├─ DEPLOY-Linux.md           # 从零部署指南（Linux）
+├─ deploy/linux/             # Linux 部署用的现成文件（见 DEPLOY-Linux.md）
+│  ├─ docker-compose.yml     #   NapCat 协议端容器
+│  ├─ oopz-bot.service       #   机器人本体（systemd）
+│  └─ mc-tunnel.service      #   MC 取数用的 ssh 隧道（可选）
 ├─ README.md                 # 项目简介
 ├─ docs/chat.md              # 维护记录（含 NapCat 踩坑细节）
 ├─ logs/                     # 运行日志（bot 自动写入）
@@ -51,6 +62,10 @@ oopz-bot/
 - 一个目标 QQ 群（机器人要加入的群，群号后面用到）
 - oopz 账号（已有加入的语音域）
 - （可选，MC 功能用）一个 **Java 版** Minecraft 服务端，能改 `server.properties` 并重启
+
+> 这几条与平台无关，Linux 上要的是一样的东西 —— 只是装法不同，见
+> [DEPLOY-Linux.md 第 1 节](DEPLOY-Linux.md)（另有两条 Linux 特有的准备：时区必须是
+> `Asia/Shanghai`，以及**不能用 root 跑机器人**，要建一个专用账号）。
 
 ---
 
@@ -89,10 +104,20 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 pip install -r requirements.txt
-pip install ./vendor/Oopzbot-SDK     # oopz_sdk 不在 PyPI，从本地 vendor 安装
 ```
 
-> oopz_sdk 会通过其 `pyproject.toml` 自动拉取 aiohttp / cryptography / pillow / pydantic / playwright / requests 等依赖，无需手动装。
+> **oopz 默认就一起装上了**，不用再单跑一条 pip：`requirements.txt` 最后一行是
+> `oopz-sdk @ file:./vendor/Oopzbot-SDK` —— oopz_sdk 不在 PyPI，源码随工程分发在
+> `vendor/` 下。注意那一行是**本地相对路径，pip 按当前工作目录解析**（实测：从别的
+> 目录 `pip install -r <这个文件>` 会找不到它），所以这条命令**必须在工程根目录执行**。
+
+> **只要 MC 功能、不要 oopz**（只用 MC 查询 / 白名单）：把 `requirements.txt` 最后那一行
+> 注释掉再装，或者装完 `pip uninstall oopz-sdk`。这是**受支持的**状态，不是坏掉 ——
+> 机器人照常启动，oopz 那半边自动停用：群里 `@我 oopz` 会明确回一句「本机未安装
+> oopz_sdk」，启动日志也吼一声，而 **MC 功能完全不受影响**。
+> 以后想要了：`pip install ./vendor/Oopzbot-SDK`（同样在工程根目录），然后重启机器人。
+
+> oopz_sdk 会通过其 `pyproject.toml` 自动拉取 aiohttp / cryptography / pillow / pydantic / playwright / requests 等依赖，无需手动装 —— 这一串（尤其 playwright）只为 oopz 服务，所以不要 oopz 的时候省掉它是实打实的收益。
 
 ---
 
@@ -145,6 +170,14 @@ Copy-Item mcs_servers.toml.example mcs_servers.toml
    （`proxy` / `backend` / `standalone`）、`host` / `port`、`rcon = { port, password }`。
 2. **`[defaults]`**：`timeout` / `rcon_timeout` 两个默认超时。
 
+**三样取数通道**（一台目标可以有 API 或 RCON，二者互斥）：
+
+| 通道 | 字段 | 给什么 |
+|---|---|---|
+| SLP | `host` / `port` | 在线人数、版本、延迟；玩家样本最多 12 个且随机，**不能当名单** |
+| RCON | `rcon = { port, password }` | 完整名单，也用来改白名单 |
+| 群组接口 | `api = { url, token }` | 一次响应给**整组**每个子服的人数与名单（见下一节） |
+
 > ⚠️ **`[whitelist]` 段和 `[defaults] primary` 已经不在这里了**（2026-09-21 搬到
 > `mcs_audiences.toml` 的每条 `[[audience]]`）——它们要**按 QQ 群区分**，不能再是
 > 全局一份。留在本文件里会**直接报错**（报错里会说搬到哪），不会静默忽略。
@@ -157,6 +190,84 @@ Copy-Item mcs_servers.toml.example mcs_servers.toml
 ```powershell
 .\.venv\Scripts\python.exe tools\mc_check.py --list-targets
 ```
+
+#### 走群组接口（代理那侧装了 HTTP 插件时）
+
+> 这一节和下一节是**两条并行的路**：装了接口的群组服走这一节，自己不装接口的服
+> （独立模组服、老群组服）走下一节的 RCON。**接口型目标不需要下一节的任何配置。**
+
+有些群组服不给 RCON，而是给一个带 token 的 HTTP 口。SZUcraft 这套就是：Velocity 插件
+`szucraft-bridge`。这条路比 RCON 好 —— 一次 `GET /status` 就带**每个子服**的人数与名单，
+所以 N 台子服只发 1 次请求；而且它看的是代理的连接状态，比 RCON 的 `list` 更权威。
+
+对方那个接口一共四个端点（**对方文档已删，这里是唯一记录**）：
+
+| 端点 | 返回 |
+|---|---|
+| `GET /health` | `{"ok": true}` —— **不需要 token**，所以它是「隧道通不通」的专用探针 |
+| `GET /status` | `{"proxy": {"online": N}, "servers": [{"name","online","players"}]}` |
+| `GET /whitelist` | `{"enabled": bool, "count": N, "entries": [...]}` |
+| `POST /whitelist/add`<br>`POST /whitelist/remove` | 表单 / JSON / query 三种写法都收；`changed` 表示这次是不是真改了（add 已存在的人会返回 `ok` 但 `changed=false`） |
+
+认证三种写法都认：`Authorization: Bearer <token>`（我们在用的）、`X-Auth-Token: <token>`、
+`?token=<token>` —— 哪天 Bearer 那条被对方改了，另两种是应急口子。401 = token 不对
+（去要新的），404 = 路径不对，400 = 参数不对。
+
+写法是**一台代理配 `api`，全部子服挂到它上面（`source`）**：
+
+```toml
+[[targets]]
+id    = "szu"                  # 代理
+name  = "主服群"
+kind  = "proxy"                # api 只能配在 proxy 上
+group = "主服群"
+api   = { url = "http://127.0.0.1:8080", token = "<对方给的 token>" }
+host  = "127.0.0.1"            # 可选：给了就有 SLP，能给接口报的人数做独立复查
+port  = 25565
+
+[[targets]]
+id         = "bingo"
+name       = "Bingo"
+kind       = "backend"
+group      = "主服群"
+source     = "szu"             # 数据去 szu 的接口里拿，自己不发任何请求
+source_key = "bingo"           # 对方 velocity.toml 里的服名；不填 = 用这里的 id
+```
+
+几条硬规则（写错都在**加载期直接报错**，不会静默生效）：
+
+- `api` 和 `rcon` 不能配在同一台目标上；
+- `source` 和 `rcon` 也不能同配 —— 名单会从接口来、白名单却走本机 RCON，两处各说各话，
+  于是「机器人说已添加，人还是进不去」（代理层的白名单才是进服校验那一道）；
+- `api` 只能配在 `kind = "proxy"` 上，子服一律写 `source`；
+- `api.url` **只填到端口**（`http://127.0.0.1:8080`），带路径会报错。
+
+> ⚠️ `token` 是密码，和 RCON 密码一样躺在 `mcs_servers.toml` 里（该文件已 gitignore）。
+> 对方轮换 token 后，群里会回「😵 接口认证失败（token 可能被对方轮换了）」——
+> 去要新 token 就行，**别去查隧道和防火墙**。
+
+> ⚠️ 地址同样是**机器人本机**能连到的地址。SZUcraft 这套对方把 8080 只发到它自己主机的
+> `127.0.0.1`，所以要 ssh -L 转过来（这行是对方给的，原样抄）：
+>
+> ```bash
+> ssh -N -p 222 -L 8080:127.0.0.1:8080 -L 25575:127.0.0.1:25575 \
+>     -i ~/.ssh/id_ed25519_mcbot -o IdentitiesOnly=yes -o ServerAliveInterval=30 \
+>     mcbot@203.0.113.10
+> ```
+>
+> 隧道是**临时**的（机器人搬家成容器后直接用 `http://velocity:8080`，这一段就能撤）。
+> 所以要知道它断掉时的症状：报的是「接口连不上」（不是 401）。隧道不是常驻服务，
+> 机器重启/网络抖动之后要**重新拉**，否则群里会开始报取不到数据。
+
+自测（**只看接口这一层，不碰 SLP / RCON**）：
+
+```powershell
+.\.venv\Scripts\python.exe tools\mc_check.py --api
+```
+
+它把 `/health`、`/status`（逐子服一行，并列出「接口里有、我们没挂」的那几台）和
+`/whitelist` 的原文打出来。排查「对方到底有没有把那台子服接进群组」用它最快；
+`source_key` 写错时的报错也会**直接列出接口里实际有的服名**，照抄即可。
 
 #### 每台服务端的准备（`server.properties`，改完要重启该服务端）
 
@@ -187,13 +298,19 @@ MC 功能要拿**完整**玩家名单，靠的是 RCON 执行 `list` 命令（SL
 > **一条关联挂了多台白名单服时，前缀是逐台各写各的**：一台写错只影响那一台，
 > 而不点名的那几台始终正常 —— 只看「`list` 能出结果」是发现不了的。用
 > `--whitelist` 逐台核对（它会把每一台的前缀都打出来）。
+>
+> **接口型目标（配了 `api` 的那台）不看 `command`**：`/whitelist` 直接收结构化数据，
+> 没有命令前缀这回事。字段仍是必填的，填对方插件实际注册的命令名即可（将来要切回
+> RCON 就不用再改）。
 
-改完**重启 MC 服务端**，然后跑诊断脚本确认：
+改完**重启 MC 服务端**（只有走 RCON 的服需要重启；接口那侧改的是对方的配置，重启谁
+由对方决定），然后跑诊断脚本确认：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\mc_check.py                      # 并发探测所选关联的全部目标
 .\.venv\Scripts\python.exe tools\mc_check.py --target bingo       # 只看一台
 .\.venv\Scripts\python.exe tools\mc_check.py --audience 建筑群    # 换一条群关联的视角
+.\.venv\Scripts\python.exe tools\mc_check.py --api                # 只看群组接口那一层
 ```
 
 每个目标打一个块，块头就是结论（`[OK]` / `[!!]`），末尾汇总 `N/M 个目标正常`；
@@ -344,15 +461,21 @@ targets   = []
 不带 `--audience` 时看第一条群关联；不带 `--target` 时**逐台**列出该关联的全部白名单服
 （`--target <服名>` / 裸写服名收窄到一台，认不出来的服名会逐态说明原因并**退出码 2**）。
 它打印每台 `whitelist list` 的原文、解析结果和**那一台的命令前缀**，结尾给一句
-`N 台中 M 台正常`，有任何一台没读到就退出码 1。
+`N 台中 M 台正常`，有任何一台没读到就退出码 1。接口型目标打的是 `/whitelist` 的
+原文（`enabled` + 名单数组），没有「解析」这一层。
 
 看到 `[OK] 解析正常` 就说明该服的白名单输出格式能被正确判定成败；若报「判不出来」，
 说明格式被插件改写过，加白命令会回「未能验证」而不是「已添加」（功能仍可用，只是
 无法自动确认）。若那条关联没写 `whitelist`，它会直接说明「该群的白名单管理不可用」
 并给出该补的那一行 —— 这正是群里那句「⚠️ 本群没有指定白名单服」对应的配置。
 
-**这台服为什么没读到**（逐台分别看）：`没配 rcon.password` 要在 `mcs_servers.toml`
-补密码；`RCON 认证失败` 是密码不对；`连不上` 是端口/进程问题。
+接口那条通道会额外说一件 RCON 看不见的事：`enabled=false` 意味着**对方把代理层的
+白名单拦截关掉了** —— 名单读得到、也改得动，但谁都能进服。脚本会把这种目标单列出来
+并**退出码 1**。
+
+**这台服为什么没读到**（逐台分别看）：`两条通道都没配` 要去 `mcs_servers.toml`
+补 `rcon` 或 `api`；`RCON 认证失败` / `接口认证失败` 是凭证不对（后者去要新 token）；
+`连不上` 是端口/进程/隧道问题。
 
 > ⚠️ `--whitelist` **不写只读之外的任何东西** —— 它只发 `list`。诊断脚本会真的改动
 > 服务端而它没有任何清理逻辑，脚本中途挂掉就会把 `whitelist.json` 留在谁也不知道的
@@ -405,6 +528,10 @@ targets   = []
   `MC 目标配置：` / `MC 群关联配置：` / `MC 群关联「<名字>」：` 三类。
 - **MC 查询**：在**已开通**的群里 `@机器人 mc` → 回复该群关联的服务器总览（主服排最前）
   - 在该群里 `@机器人 mc <服名>` → 单服明细；打 `@机器人 mc b` 这种半截名 → 列出候选
+  - **走群组接口的服**（`api` / `source`）：先离线跑 `tools\mc_check.py --api`，确认
+    `/health` 通、`/status` 里有你要的那几台（`--api` 会把「接口里有、我们没挂」的也列出来）。
+    它对不上时群里会报「数据来源 X 的接口这次没取到」——那是**隧道断了或 token 过期**，
+    不是服务端掉线（见 4.1）
   - ⚠️ **必测跨群隔离**：在一个**没写进** `mcs_audiences.toml` 的群里发 `@机器人 mc`，
     应回「🤔 本群还没有开通 MC 查询」，且日志里有一条同等信息的 warning（见 F10）
   - 若某条关联 `targets = []`（配置里那条占位条目就是，群号是假的所以没法在群里测），
@@ -427,7 +554,7 @@ targets   = []
   - **同组换服**：在 `group` 相同的两台（`主服群` 里的 bingo / 谁是杀手）之间移动 → 一条 `🔄 X 从「<来源服>」换服过来`。跨 group 移动（GTNH ↔ bingo）**只报普通加入**，没有 `🔄`——跨组时玩家确实断线重连了，说「从哪来」是猜。
     - ⚠️ **`🔄` 要求「退出一台」和「进入另一台」落在同一轮探测里**（10 秒内走完）。切换若跨过一轮（退出、加载、再进，中间有整轮没在任何一台服上），就退化成普通加入 `⛏️ X 上线了 <服名>`——**不是 bug**，是对账层刻意的保守：跨轮的名字移动可能真的是「退了去吃饭、半小时后才进另一台」，只有同一轮看到才算同一次移动。
     - 代理还没上线的今天，两台之间移动**实际是断线重连**，报「换服」只是措辞上的近似；等真代理搭好才是无缝跳转。
-  - **退服不推**：只退出、没有别人进服时，群里**不应有任何消息**（`reconcile` 会算出退服事件，是推送层刻意不发的）。
+  - **退服不推**：只退出、没有别人进服时，群里**不应有任何消息**（`reconcile` 会算出退服事件，是推送层刻意不发的）。注意「换服」不算退服 —— 同组两台之间移动会发 `🔄`（上一条），只有**真的走了、也没出现在别的服上**才什么都不发。
   - **掉线提醒不被限流压住**：把 `MC_JOIN_MIN_INTERVAL_SEC` 调大（如 120）重启，停掉一台服 → 掉线提醒当轮就发，不等窗口。恢复时同理。
   - 提醒只发进**开了 `watch = true`** 的那些关联的群；同一台服被两条关联共用时，两条各自收到。
   - **对照日志确认**：每推一条都有一行 `MC 进服提醒（「<关联名>」）→ N 个群：` 并附发出去的原文。
@@ -506,7 +633,8 @@ Get-Content logs/napcat_bot.log -Encoding UTF8 -Tail 30
 ```
 
 - **名单完整 False** → 进服提醒会**静默暂停**（不误报，但也不推消息）。这是刻意的设计：名单残缺时（比如只拿到 12 条随机样本）推「进服」全是假的。
-  - 该目标没配 `rcon.password`（`mcs_servers.toml`）：在线人数 ≤12 时 SLP 样本本身就是完整名单；超过就必须开 RCON（见 4.1）。
+  - 该目标**两条通道都没配**（既没 `rcon.password` 也没接口数据源，见 4.1）：在线人数 ≤12 时 SLP 样本本身就是完整名单；超过就必须开一条通道。
+  - 走接口的目标（配了 `api` 或 `source`）：名单是**对方插件**给的，我们原样报。人数和名单条数对不上就是对方那边报了人数没给全名单 —— 跑 `--api` 看接口原文。
   - 配了 RCON 仍不完整：看脚本打印的 `list` **原始输出**——可能是插件改写了 `list` 格式，或 `enable-rcon` 没生效。
 - **名单完整 True 但仍不推** → 查**那个群所属的 `[[audience]]` 有没有写 `watch = true`**
   （见 4.2）。不写就是默认不收推送——这是刻意的：新加一条关联不该悄悄开始说话。
@@ -588,15 +716,17 @@ MC 插件认领了这条消息，但这个群没被写进任何 `[[audience]].gr
 | 「🚫 你没有 MC 管理权限」 | 你的号不在 `MC_ADMIN_QQ` 里；或该项**留空**（留空 = 功能对所有人关闭） | 把自己的 QQ 号加进去，重启 bot。日志里能区分「未配置」和「不在名单内」两种 |
 | 「🤔 本群还没有开通 MC 查询」 | 该群没被写进任何 `[[audience]].groups` | 见 F10 情况一 |
 | 「⚠️ 本群没有指定白名单服，白名单管理不可用。」 | 这个群开通了，但那条 `[[audience]]` 没写 `whitelist`（或那一项只写了 `command` 没写 `target`，**该项被忽略**） | 按 4.2 节给那条 `[[audience]]` 补 `whitelist = [{ target = "...", command = "..." }]`；只读地先看一遍：`mc_check.py --audience <关联名> --whitelist`。只写 `command` 的项加载时会**逐项**报一条警告，日志里搜「只写了 command」 |
-| 「⚠️ 白名单服 Bingo 没配 RCON 密码，命令发不出去。」 | 该条 `whitelist` 里那一项的 `target` 指到了目标，但那台没配 `rcon.password` | 在 `mcs_servers.toml` 给那台补上 `rcon.password`（见 4.1）。管理命令必须走 RCON，没有降级路径。**多台时逐台检查** —— 日志和启动摘要会**逐台**报，别看到第一台正常就以为都正常 |
+| 「⚠️ 白名单服 Bingo 两条通道都没配（既没有 rcon 也没有 api），命令发不出去。」 | 该条 `whitelist` 里那一项的 `target` 指到了目标，但那台**两条通道都没配** | 在 `mcs_servers.toml` 给那台补 `rcon = { port, password }` 或 `api = { url, token }`（见 4.1）。二选一，没有降级路径。**多台时逐台检查** —— 日志和启动摘要会**逐台**报，别看到第一台正常就以为都正常 |
+| 「😵 接口认证失败（token 可能被对方轮换了）」 | 接口返回 401：`api.token` 不对，或对方轮换了 token | 找对方要新的 token 填回 `mcs_servers.toml`（4.1）。⚠️ **这不是网络问题**，别去查隧道和防火墙 |
+| 「😵 连不上 X服务器（接口）」 | 请求发不出去：隧道断了、对方服务没起、或 `api.url` 指向的地址不通 | 先跑 `tools\mc_check.py --api` 看 `GET /health` 通不通。隧道是临时的（4.1），机器重启/网络抖动后要重新拉 |
 | 「⚠️ 本群有 N 台白名单服，命令里要点名发给哪台：…」 | 该条配了**多台**白名单服，命令里没写服名。**没有「默认那台」的回退**（猜错 = 改错服务器的白名单） | 在命令**末尾**加上服名：`whitelist add Steve bingo`。只有一台时才能省 |
 | 「⚠️ 没有叫 X 的服。本群能查的是：…」 | 服名打错了，或者那台服**不在本条的 `targets` 里**（关联外隔离） | 列表里就是本群能查的全部服名（id / 名字 / 别名 / 唯一前缀都认）。要加服就补该条的 `targets`（见 F10 第 2 条） |
 | 「⚠️ GTNH 是本群关联的服，但它不是白名单服。」 | 这台服本群查得到，只是没写进该条的 `whitelist` 数组 | ⚠️ **这条不是「没这台服」**，别去改 `targets`。要让它能管白名单就往 `whitelist` 里加一项 `{ target = "gtnh" }`；只想看它的在线状态用 `@机器人 mc GTNH`。加之前先想清楚「多一台白名单服 = 管理员权限多一圈」（4.2 第 5 条） |
 | 「⚠️ 服名要写在最后：你写的 `X` 是服名。改成：…」 | 服名写到了动词**前面**（`whitelist bingo add Steve`） | 照回复里给出的整条命令重打一遍。⚠️ 旧版本这里是**静默把 `bingo` 丢掉**再把命令发往缺省那台的 —— 也就是说它**改了另一台服的白名单却什么都没说**。所以这条报错是要留着的，不是啰嗦 |
 | 「⚠️ 服务器配置读不了：…」 | `mcs_servers.toml` / `mcs_audiences.toml` 不存在或有语法/校验错误 | 报错里带原始原因，照着改；先跑 `--list-targets`（目标）和 `--list-audiences`（群关联）看详细 |
-| 「❌ 未生效：名单里仍没有 X」 | 命令发出去了，但服务端没执行 | 看日志里那行 warning 的 **RCON 回执原文**——常见是服务端根本没启用 `whitelist` 命令、被权限插件接管、或本条的 `whitelist.command` 前缀写错了（见 4.2 第 3 条）。**多台时只可能是点名的那一台**（回复里的 `【服名】` 就是它），别去查其它台 |
-| 「⚠️ 读不到服务端当前的白名单，add 命令没有发出去」 | 连改动前的名单都读不出来，bot **一条命令都没发**（不知道名单里有什么就不敢下手） | 跑 `tools\mc_check.py --whitelist` 看 RCON **原文**——多半是 `whitelist list` 的输出解析不了，照下面的「空名单哨兵」处理 |
-| 「⚠️ 命令已发送（未能验证）」 | 命令确实发出去了，只是**反查**（改完再读一次名单）读不懂，判不出成没成 | 去服务端 `whitelist list` 亲眼确认。⚠️ 这条**不代表命令已经生效**，只是「发了，不知道结果」 |
+| 「❌ 未生效：名单里仍没有 X」 | 命令发出去了（或接口调用成功了），但**重新读一遍名单还是没有它** | RCON 那台：看日志里那行 warning 的 **RCON 回执原文**——常见是服务端根本没启用 `whitelist` 命令、被权限插件接管、或本条的 `whitelist.command` 前缀写错了（见 4.2 第 3 条）。接口那台：对方回执说成功也不算数，我们一律以**重新读一遍名单**为准；仍是「未生效」就是对方插件真的没写进去，把日志里的回执发给对方。**多台时只可能是点名的那一台**（回复里的 `【服名】` 就是它），别去查其它台 |
+| 「⚠️ 读不到服务端当前的白名单，add 命令没有发出去」 | 连改动前的名单都读不出来，bot **一条命令都没发**（不知道名单里有什么就不敢下手） | 跑 `tools\mc_check.py --whitelist` 看**原文**——RCON 那台多半是 `whitelist list` 的输出解析不了，照下面的「空名单哨兵」处理；接口那台是 `/whitelist` 取不到（看上面两行的认证/连不上） |
+| 「⚠️ 命令已发送（未能验证）」 | 命令确实发出去了，只是**反查**（改完再读一次名单）读不懂，判不出成没成。**只有 RCON 那台会出现** —— 接口给的是结构化数组，不存在读不懂 | 去服务端 `whitelist list` 亲眼确认。⚠️ 这条**不代表命令已经生效**，只是「发了，不知道结果」 |
 | 完全没有任何回复 | 消息没被 @ 到 / 不在群里 | 同 F10 |
 | 回的是「未知命令」用法提示 | 命令格式不对 | 用法提示里会列出当前触发词 |
 
@@ -619,6 +749,10 @@ MC 插件认领了这条消息，但这个群没被写进任何 `[[audience]].gr
 ---
 
 ## 9. 日常维护
+
+> Linux 上的对应命令（`systemctl restart oopz-bot`、`journalctl -u oopz-bot -f`、
+> 更新代码、备份哪四样）见 [DEPLOY-Linux.md 第 11 节](DEPLOY-Linux.md)。下文凡是写
+> 「重启 bot」的地方，Linux 上就是 `sudo systemctl restart oopz-bot`。
 
 - **改文案**：
   - oopz 播报格式在 `plugins_napcat/oopz/auto_reporter.py` 的 `_build_broadcast_message()`；进频道欢迎语在同文件顶部的 `_WELCOME_TEMPLATES`。

@@ -10,7 +10,7 @@
     groups    = [123456]                     # 必填，非空。这些 QQ 群共享本关联
     targets   = ["gtnh", "bingo"]            # 可选，**可为空**。顺序即总览顺序
     primary   = "gtnh"                       # 可选，本群默认先看哪台
-    whitelist = { target = "bingo", command = "whitelist" }   # 可选，省略 = 本群不管白名单
+    whitelist = [{ target = "bingo", command = "whitelist" }] # 可选，**一组表**，省略 = 本群不管白名单
     watch     = true                         # 可选，缺省 false。本条的 groups 收进服提醒
     report    = true                         # 可选，缺省 false。本条的 groups 收定时播报
 
@@ -114,16 +114,23 @@ class Audience:
         if not routes:
             return "不提供白名单管理"
 
+        # 接口型目标没有「命令前缀」这个概念（路径由 mcbridge 拼死），打出来只会让人
+        # 以为有个字段没配。它那半句换成「接口」。
+        def how(route: WhitelistRoute) -> str:
+            if route.target.is_api:
+                return "接口"
+            return f"命令前缀 {route.command!r}"
+
         def one(route: WhitelistRoute) -> str:
-            if not route.rcon_enabled:
-                return f"{route.name}[{route.id}]（没配 rcon.password —— 发不出去）"
-            return f"{route.name}[{route.id}]（命令前缀 {route.command!r}）"
+            if not route.whitelist_ready:
+                return f"{route.name}[{route.id}]（两条通道都没配 —— 发不出去）"
+            return f"{route.name}[{route.id}]（{how(route)}）"
 
         if len(routes) == 1:
             route = routes[0]
-            if not route.rcon_enabled:
-                return f"白名单发往 {route.name}[{route.id}]，但它没配 rcon.password —— 发不出去"
-            return f"白名单发往 {route.name}[{route.id}]（命令前缀 {route.command!r}）"
+            if not route.whitelist_ready:
+                return f"白名单发往 {route.name}[{route.id}]，但它两条通道都没配 —— 发不出去"
+            return f"白名单发往 {route.name}[{route.id}]（{how(route)}）"
         return f"白名单发往 {len(routes)} 台：" + "、".join(one(r) for r in routes)
 
     def summary(self) -> str:
@@ -384,9 +391,10 @@ def _audience_warnings(
     # **逐台**一条。写成 `if 第一台 and not rcon_enabled` 那种单数判断的话，「配了 3 台、
     # 第 2 台没配密码」永远不会被报出来，而群里表现为「那台的命令发出去没反应」。
     for route in whitelist_routes:
-        if not route.rcon_enabled:
+        if not route.whitelist_ready:
             warnings.append(
-                f"「{name}」的白名单服 {route.name} 没配 rcon.password，白名单命令发不出去"
+                f"「{name}」的白名单服 {route.name} 两条通道都没配（rcon 和 api），"
+                f"白名单命令发不出去"
             )
 
     # 没写 target 的项：**只丢这一项**，合法的那些照常生效（下面那句会把还活着的列出来）。

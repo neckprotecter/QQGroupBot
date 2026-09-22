@@ -27,6 +27,9 @@ from .client import (
     _filter_areas,
     _get_client,
     _reset_client,
+    disabled_reason,
+    sdk_available,
+    sdk_error,
 )
 
 driver = get_driver()
@@ -66,9 +69,12 @@ async def _build_broadcast_message() -> str | None:
     带时间头、每频道一行紧凑列出成员名，结尾一句俏皮话；
     无人在线时返回 None（定时播报只在有人时推送，无人静默跳过）。
     """
+    reason = disabled_reason()
+    if reason is not None:
+        return f"📣 oopz 语音频道播报：{reason}。"
     bot = await _get_client()
     if bot is None:
-        return "📣 oopz 语音频道播报：凭据未配置，请先运行 tools/oopz_login.py 然后重启机器人。"
+        return "📣 oopz 语音频道播报：oopz 客户端初始化失败，详情见机器人日志。"
 
     try:
         async with asyncio.timeout(_QUERY_TIMEOUT):
@@ -226,5 +232,16 @@ async def _check_joins() -> None:
 
 @driver.on_startup
 async def _start_background_tasks() -> None:
+    # 没装 SDK 时**连循环都不起**：起了也只会每轮生成一句「未安装 SDK」然后推给群，
+    # 变成每 30 分钟一次的刷屏。这里吼一声就够，而且要说清「MC 功能不受影响」——
+    # 否则看到 oopz 没起来会以为整只机器人有问题。
+    if not sdk_available():
+        logger.warning(
+            "未安装 oopz_sdk（它随 requirements.txt 默认装，这台特意跳过了），"
+            "oopz 的定时播报与进频道欢迎不会启动（MC 功能不受影响）。"
+            "要用 oopz 就 pip install ./vendor/Oopzbot-SDK 然后重启；导入失败原因: {}",
+            sdk_error(),
+        )
+        return
     asyncio.create_task(_report_loop())
     asyncio.create_task(_welcome_loop())

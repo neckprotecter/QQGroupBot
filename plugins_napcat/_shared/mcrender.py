@@ -18,7 +18,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from .mc import SLP_UNPARSEABLE, McSnapshot
+from .mc import API_AUTH, SLP_UNPARSEABLE, McSnapshot
 from .mcdelta import KIND_JOIN, KIND_LEAVE, KIND_SWITCH, PlayerEvent, StatusEvent
 from .mcservers import ServerTarget
 from .textlen import MAX_LEN, truncate
@@ -64,6 +64,9 @@ def render_detail(snap: McSnapshot, target: ServerTarget, *, max_names: int) -> 
         # 前者叫人来开服 / 检查端口，后者多半是服务端还在加载（GTNH 那类大整合包
         # 启动要几分钟，期间端口已 bind、能应答，但玩家列表还没就绪）。
         # 一律说「连不上了」会让人白等或白查防火墙。
+        if snap.error_kind == API_AUTH:
+            # 401 说成「连不上了」会让人去查网络和隧道，而真正要做的是**去要新 token**
+            return f"⚠️ {name} 的数据接口不认我们的凭证了。\n{snap.error}"
         if snap.error_kind == SLP_UNPARSEABLE:
             return f"😵 {name} 应答异常（刚启动的话可能还在加载）。\n{snap.error}"
         return f"😵 {name} 连不上了。\n{snap.error}"
@@ -107,6 +110,9 @@ def _summary_block(row: Row, budget: int) -> list[str]:
     label = f"【{target.name}】"
 
     if not snap.reachable:
+        # 凭证不对不是「不可达」—— 服务好得很，是我们进不去。总览里也要分开
+        if snap.error_kind == API_AUTH:
+            return [f"{label}⚠️ 接口凭证失效"]
         return [f"{label}😵 不可达"]
 
     tail = f"　延迟 {snap.latency:.0f}ms" if snap.latency is not None else ""
@@ -118,7 +124,10 @@ def _summary_block(row: Row, budget: int) -> list[str]:
     if snap.max_players:
         body = f"{snap.count}/{snap.max_players}"
     if snap.count == 0:
-        return [f"{label}在线 {body}{tail}　目前无人"]
+        # 0 人就是 0 人，不再补一句「目前无人」—— 数字已经说完了（用户原话：冗余）。
+        # 这里仍然**提前返回**，走不到下面的名单与「⚠️ 名单不完整」：一台空的服没有
+        # 名字可列，那两句在这个上下文里只会变成噪音。
+        return [f"{label}在线 {body}{tail}"]
 
     lines = [f"{label}在线 {body}{tail}"]
     shown = snap.names[:budget]
@@ -183,7 +192,17 @@ def _footnote(rows: Sequence[Row], all_targets: Sequence[ServerTarget]) -> str:
         )
 
     counted = _counting(rows)
-    proxies = [r for r in rows if not r.target.serves_names and r.snap.reachable]
+    # 接口型代理不参与这条对照（api is not None）。理由有两条，缺一条都不够：
+    #   1. 这条对照要发现的是**ping-passthrough**（代理把自己某一台后端的人数当成
+    #      全群组报出来）—— 那是 SLP 才有的毛病，接口给的是代理自己的权威计数。
+    #   2. 接口的 /status 会把**全部**子服都列出来，而我们只挂关心的那几台（对方 6 台、
+    #      我们挂 3 台）。于是「有人在 lobby 里」也会让合计对不上，每张总览都挂一条
+    #      误导提示。真要提醒「有几台我们没挂」，那是配置问题，属于探测工具的活。
+    proxies = [
+        r
+        for r in rows
+        if not r.target.serves_names and r.snap.reachable and r.target.api is None
+    ]
     # 只有一台子服时「代理总人数」和「子服之和」在两种成因下都相等，说什么都是误导
     if proxies and len(counted) >= 2:
         total = sum(r.snap.count for r in counted)

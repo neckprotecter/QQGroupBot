@@ -22,14 +22,98 @@
    照着里面的拼写下命令——赌注直接没了。见 run_whitelist_command。
 """
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from nonebot.log import logger
 
-from .mc import parse_whitelist_names, rcon_command
+from . import mcbridge
+from .mc import (
+    RconAuthError,
+    RconConnectError,
+    RconError,
+    parse_whitelist_names,
+    rcon_command,
+)
+from .mcbridge import BridgeAuthError, BridgeError, BridgeUnreachable
 from .mcservers import ServerTarget
 
 VERBS: tuple[str, ...] = ("add", "remove", "list")
+
+
+# ---------------------------------------------------------------- 通道无关的失败
+# 白名单有两条通道：RCON（一台一个端点）和接口（群组级，一次改整组）。**上面的逻辑
+# 一模一样**（先读后写 + 反查），所以故障类型也必须是通道无关的一套 ——
+# 让 run_whitelist_command 去分辨「这个异常是 RCON 的还是 HTTP 的」，等于把通道判断
+# 散进业务逻辑里，而它下面只有「读名单 / 下命令」两件事。
+#
+# 三类（同 mc.error_kind 那套）：下一步动作不同 —— 连不上查网络、认证失败要新 token、
+# 数据不对查对方的插件版本。调用方拿 `WhitelistRoute.channel` 决定文案里说「RCON」
+# 还是「接口」。
+class WhitelistError(Exception):
+    """白名单操作失败（通道无关）。"""
+
+
+class WhitelistUnreachable(WhitelistError):
+    """连不上：拒绝连接、超时、隧道断了。"""
+
+
+class WhitelistAuthError(WhitelistError):
+    """凭证不对：RCON 密码错 / 接口 401。"""
+
+
+class WhitelistDataError(WhitelistError):
+    """连上了，但答的内容不是我们要的形状。"""
+
+
+def _translate(exc: Exception) -> WhitelistError:
+    """把两条通道各自的异常翻成上面那三类。**原文照抄**，只换类型。
+
+    原文里带着地址和原因（`请求 http://… 超时` / `连接 RCON 127.0.0.1:25575 失败`），
+    那正是排查要看的；调用方决定它进日志还是进群。
+    """
+    if isinstance(exc, (RconAuthError, BridgeAuthError)):
+        return WhitelistAuthError(str(exc))
+    if isinstance(exc, (RconConnectError, BridgeUnreachable)):
+        return WhitelistUnreachable(str(exc))
+    return WhitelistDataError(str(exc))
+
+
+async def _read_names(target: ServerTarget, command: str) -> list[str] | None:
+    """读当前白名单的名字。**判不出来返回 None**，通道故障抛 WhitelistError。
+
+    两条通道在「空名单」上的语义**不一样**，这里必须都处理对：RCON 的 `list` 在名单
+    为空时输出的是一句哨兵文案，靠 parse_whitelist_names 才能认出「是空的」而不是
+    「判不出来」；接口直接给 `entries: []`，天然无歧义。
+    """
+    if target.is_api:
+        try:
+            whitelist = await mcbridge.fetch_whitelist(target.api, target.timeout)
+        except BridgeError as exc:
+            raise _translate(exc) from exc
+        return list(whitelist.entries)
+    try:
+        payload = await rcon_command(target, command)
+    except RconError as exc:
+        raise _translate(exc) from exc
+    return parse_whitelist_names(payload)
+
+
+async def _send_mutation(
+    target: ServerTarget, command: str, verb: str, spelling: str
+) -> str:
+    """下发一条变更命令，返回**回执原文**（只用于日志/排查，不用于判定成败）。"""
+    if target.is_api:
+        try:
+            result = await mcbridge.write_whitelist(
+                target.api, target.timeout, verb, spelling
+            )
+        except (BridgeError, ValueError) as exc:
+            raise _translate(exc) from exc
+        # 接口的回执是结构化的，但**它的 ok/changed 在各版本里含义不同**（见
+        # BridgeWriteResult），所以这里只把原样打成一行给日志，成败照旧看反查。
+        return f"ok={result.ok} changed={result.changed}"
+    return await rcon_command(target, f"{command} {verb} {spelling}")
 
 # 既是格式校验，也是注入防护（见模块 docstring 第 2 条）。
 PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
@@ -134,10 +218,8 @@ def parse_command(text: str) -> tuple[AdminCommand | None, str]:
     return AdminCommand(verb, player, server, head), ""
 
 
-def whitelist_matches(payload: str, name: str) -> list[str] | None:
-    """白名单里所有**忽略大小写**等于 name 的条目，按服务端记录的拼写返回。
-
-    返回 None = 判不出来（格式不认识）；空列表 = 名单里没有。
+def whitelist_matches_of(names: Sequence[str], name: str) -> list[str]:
+    """在一份**已经解析好**的名单里找忽略大小写等于 name 的条目，按服务端拼写返回。
 
     比对必须是**整体**、不区分大小写的：子串匹配会让 `Steve` 命中 `Steve_2`。
 
@@ -145,11 +227,20 @@ def whitelist_matches(payload: str, name: str) -> list[str] | None:
     两条独立记录，所以同名不同拼写的重复条目是真会出现的。只看第一条的话，
     「移除」会留下一条幽灵记录，紧接着的反查又命中它，报出假的「未生效」。
     """
+    lowered = name.lower()
+    return [entry for entry in names if entry.lower() == lowered]
+
+
+def whitelist_matches(payload: str, name: str) -> list[str] | None:
+    """同上，但输入是 RCON `list` 的**原始回执**。
+
+    返回 None = 判不出来（格式不认识）；空列表 = 名单里没有。
+    接口那条通道不需要它 —— 它给的就是一份数组（见 _read_names）。
+    """
     names = parse_whitelist_names(payload)
     if names is None:
         return None
-    lowered = name.lower()
-    return [entry for entry in names if entry.lower() == lowered]
+    return whitelist_matches_of(names, name)
 
 
 def whitelist_lookup(payload: str, name: str) -> tuple[bool, str] | None:
@@ -215,8 +306,10 @@ async def run_whitelist_command(
     所以调用方必须把配置值传进来，不能在这里硬编码（那样这个配置键就是「被接受
     但被忽略」，比没有它更坏）。
 
-    RCON 故障（RconError 子类）照常抛出，由调用方转成用户文案——在这里塞进字符串
-    字段反而会丢掉类型，没法给出「密码错」和「连不上」不同的提示。
+    通道故障（WhitelistError 的三个子类，RCON 与接口共用）照常抛出，由调用方转成
+    用户文案——在这里塞进字符串字段反而会丢掉类型，没法给出「凭证错」和「连不上」
+    不同的提示。**走哪条通道由目标自己决定**（`target.is_api`）：群组服那台只有
+    接口没有 RCON，而这套「先读后写 + 反查」的逻辑对两条通道一字不差。
 
     **顺序是先读名单、再下命令**，不是反过来。两个理由：
 
@@ -233,10 +326,12 @@ async def run_whitelist_command(
     的那一台才收命令）。一条命令同时改多台 = 一次误操作同时改坏几台服的白名单，
     收益与风险不成比例；要看多台的现状用 list（读操作，由调用方并发发起）。
     """
+    # 读名单在两条通道上都是「发一条 list」：RCON 是 `whitelist list`，接口是 GET
+    # /whitelist。命令前缀只对 RCON 有意义，接口那条由 mcbridge 自己拼路径。
     listed = f"{command} list"
 
     if cmd.verb == "list":
-        names = parse_whitelist_names(await rcon_command(target, listed))
+        names = await _read_names(target, listed)
         return AdminResult(
             verb="list",
             player="",
@@ -245,7 +340,8 @@ async def run_whitelist_command(
             detail="" if names is not None else f"{listed} 输出无法解析",
         )
 
-    matches = whitelist_matches(await rcon_command(target, listed), cmd.player)
+    before = await _read_names(target, listed)
+    matches = None if before is None else whitelist_matches_of(before, cmd.player)
     if matches is None:
         # 前置读就读不懂 → **一条变更命令都没发**（mutation_sent 保持默认 False）。
         # 读不到当前名单就不敢下手，这是刻意的：不知道名单里有什么，
@@ -268,11 +364,12 @@ async def run_whitelist_command(
     # 循环变量叫 spelling 不叫 target：本函数的形参 target 是服务器目标，
     # 而这里遍历的是**玩家名的拼写**（同一玩家在服务端可能有不止一条记录）。
     for spelling in spellings:
-        raw = await rcon_command(target, f"{command} {cmd.verb} {spelling}")
+        raw = await _send_mutation(target, command, cmd.verb, spelling)
         # 回执只记 debug：它的文案是本地化的，不足以判定成败（见 docstring 第 3 条）
-        logger.debug("RCON {} {} {} 回执: {}", command, cmd.verb, spelling, raw)
+        logger.debug("{} {} {} 回执: {}", command, cmd.verb, spelling, raw)
 
-    after = whitelist_matches(await rcon_command(target, listed), cmd.player)
+    after_names = await _read_names(target, listed)
+    after = None if after_names is None else whitelist_matches_of(after_names, cmd.player)
     if after is None:
         # 命令**已经发出去了**（上面的循环），只是反查读不懂 —— 和前置读读不懂是
         # 两件相反的事，所以 mutation_sent 要显式给 True。

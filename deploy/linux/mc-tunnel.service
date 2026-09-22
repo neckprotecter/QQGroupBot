@@ -1,0 +1,57 @@
+# MC 取数用的 ssh 隧道 —— 部署方法见 DEPLOY-Linux.md 第 8 节
+#
+# **只有 MC 服务端在另一台机器上、而且端口只绑了那边的回环时才需要这个单元。**
+# 独立模组服（RCON 直连）和群组接口（HTTP）现在都是这个形态，所以通常都要。
+#
+# 安装：
+#     sudo cp deploy/linux/mc-tunnel.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now mc-tunnel
+#     systemctl status mc-tunnel        # active (running) = 隧道在
+#
+# ⚠️ 隧道**不是**常驻网络设施，这是拿 systemd 替掉「手动拉一条 ssh」的做法：
+#    网络抖动、对端重启、笔记本休眠之后 ssh 都会断，普通 ssh 断了就永远断了，
+#    症状是群里报「数据来源 X 的接口这次没取到」/「连不上」（**不是 401** —— 401 是
+#    token 的事）。Restart=always + ServerAlive* 让它自己回来。
+
+[Unit]
+Description=MC 取数用的 ssh 隧道（RCON + 群组接口）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ---- 把下面三行改成你自己的（密钥路径、端口、账号、要转的端口）----
+# 这份文件对应的实际情况（对方那台）是：
+#     端口 222（不是 22）、账号 mcbot（shell 是 nologin，只能转发）
+#     本地 8080 ← 对端回环 8080（群组接口）    本地 25575 ← 对端回环 25575（GTNH RCON）
+#     密钥 ~/.ssh/id_ed25519_mcbot（不是默认名，所以 -i 不能省）
+User=oopzbot
+Environment=SSH_KEY=/home/oopzbot/.ssh/id_ed25519_mcbot
+Environment=SSH_HOST=mcbot@example.com
+Environment=SSH_PORT=222
+Environment=FORWARDS=-L 8080:127.0.0.1:8080 -L 25575:127.0.0.1:25575
+
+# ⚠️ -L 右边那个主机名是**由对端解析**的：写对端的 docker 别名（velocity:8080）必失败，
+#    必须写 127.0.0.1:端口。
+#
+# || true：ssh 退出后不报失败，交给 Restart 处理（systemd 才不会把它当成配置错误）。
+# BatchMode=yes：systemd 里没有终端，密钥要口令的话会一直挂着等输入 —— 宁可立刻失败。
+# ExitOnForwardFailure=yes：某个 -L 被占（比如本地 8080 已被别的东西监听）时直接退出，
+#    而不是「连上了但那个口没转成」—— 后者查起来很费劲。
+ExecStart=/bin/sh -c 'exec ssh -N \
+    -o BatchMode=yes \
+    -o ExitOnForwardFailure=yes \
+    -o IdentitiesOnly=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -p $SSH_PORT -i $SSH_KEY \
+    $FORWARDS \
+    $SSH_HOST'
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

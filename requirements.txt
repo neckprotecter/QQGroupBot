@@ -1,10 +1,14 @@
 # oopz QQ 群机器人 —— Python 运行时依赖（Windows + Python 3.12）
 #
-# 安装：
+# 安装（**必须在工程根目录执行** —— 最后一行是本地的相对路径，pip 按 cwd 解析它，
+# 换个目录跑 `pip install -r <这个文件>` 就会找不到 oopz_sdk，实测）：
 #   pip install -r requirements.txt
-#   pip install ./vendor/Oopzbot-SDK        # oopz_sdk 不在 PyPI，从本地 vendor 装
 #
-# 说明：oopz_sdk 通过其 pyproject.toml 自动拉取自身依赖（aiohttp / cryptography /
+# oopz_sdk 不在 PyPI，源码随工程分发在 vendor/ 下，**默认跟着一起装**（见最后一行）。
+# 只用 MC 查询 / 白名单、不要 oopz 的话，把那一行注释掉再装：机器人照常启动，
+# oopz 那半边自动停用并在群里明说原因。见 DEPLOY.md 第 3 节。
+#
+# 说明：oopz-sdk 通过其 pyproject.toml 自动拉取自身依赖（aiohttp / cryptography /
 #       pillow / pydantic / playwright / requests），本文件只列应用直连依赖。
 #       完整部署步骤见 DEPLOY.md。
 
@@ -21,3 +25,10 @@ mcstatus==14.2.0                # Minecraft 服务器状态查询（SLP）；RCO
 #   asyncio-dgram  —— Query(UDP) 协议用；mcstatus 的 connection.py 顶层硬导入，删不掉。
 #                     我们只用 async_status，不碰 async_query（Windows 默认
 #                     ProactorEventLoop 不支持 create_datagram_endpoint）
+
+# oopz_sdk —— **默认装它**：@oopz 查询、定时播报、进频道欢迎都靠它。不在 PyPI，
+# 源码就在本工程的 vendor/ 下（`file:` 后面这条路是相对**当前工作目录**的，见文件头）。
+# 只跑 MC 功能的话把这一行注释掉或删掉，那是**受支持**的状态，不是坏掉：机器人照常
+# 启动，oopz 那半边自动停用、在群里明说原因，MC 查询与白名单一字不受影响。
+# 补装（当初跳过了、后来想要）：pip install ./vendor/Oopzbot-SDK
+oopz-sdk @ file:./vendor/Oopzbot-SDK

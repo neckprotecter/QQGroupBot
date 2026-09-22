@@ -1,0 +1,35 @@
+# NapCat 协议端（Docker）—— 部署方法见 DEPLOY-Linux.md 第 2 节
+#
+# 用法：
+#     cd deploy/linux
+#     export NAPCAT_UID=$(id -u) NAPCAT_GID=$(id -g)
+#     docker compose up -d
+#     查看二维码：docker compose logs -f napcat      （WebUI 里也能看，见下）
+#
+# ⚠️ 三个端口**一律只绑回环**（`127.0.0.1:...`）。这不是洁癖：
+#    6099 的 WebUI 能扫码登录、能改 QQ 号的所有网络配置，3001 的 WS 拿到 token 就能
+#    以这个 QQ 的身份收发消息。网上教程常写「云服务器要在安全组放行 6099」—— 别照抄，
+#    那等于把机器人账号的控制面板挂到公网上。远程要看 WebUI 就 ssh -L 转过来：
+#        ssh -L 6099:127.0.0.1:6099 <你的服务器>
+#    然后本机浏览器开 http://127.0.0.1:6099/webui
+#
+# ⚠️ 两个卷都要挂。少挂 ./QQ 的话，**每次重启容器都要重新扫码**（登录会话在里头）。
+
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    environment:
+      # 让容器里的文件归你所有（不指定的话卷里的文件属 root，后面想改配置得 sudo）
+      - NAPCAT_UID=${NAPCAT_UID:-1000}
+      - NAPCAT_GID=${NAPCAT_GID:-1000}
+      - TZ=Asia/Shanghai
+    ports:
+      # 只绑回环。想换成别的宿主端口就改 `:` 左边（比如 3001 被占 → 13001:3001），
+      # 但记得 .env 的 ONEBOT_V11_WS_URLS 要跟着改。
+      - "127.0.0.1:3001:3001"   # OneBot v11 正向 WebSocket（机器人连这个）
+      - "127.0.0.1:6099:6099"   # WebUI（扫码登录、配网络）
+    volumes:
+      - ./config:/app/napcat/config   # NapCat 自己的网络配置（正向 WS、token 等）
+      - ./QQ:/app/.config/QQ          # QQ 登录会话 —— 不挂就要反复扫码

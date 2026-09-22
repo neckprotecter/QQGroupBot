@@ -26,7 +26,7 @@ import os
 import tomllib
 import unicodedata
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # 目标角色。决定的不多，但有一条很关键：代理不出在线名单。
@@ -42,9 +42,24 @@ KINDS = (KIND_PROXY, KIND_BACKEND, KIND_STANDALONE)
 _TOP_KEYS = frozenset({"defaults", "targets"})
 _DEFAULT_KEYS = frozenset({"timeout", "rcon_timeout"})
 _TARGET_KEYS = frozenset(
-    {"id", "name", "kind", "group", "host", "port", "rcon", "aliases", "timeout", "rcon_timeout"}
+    {
+        "id",
+        "name",
+        "kind",
+        "group",
+        "host",
+        "port",
+        "rcon",
+        "api",
+        "source",
+        "source_key",
+        "aliases",
+        "timeout",
+        "rcon_timeout",
+    }
 )
-_RCON_KEYS = frozenset({"port", "password"})
+_RCON_KEYS = frozenset({"host", "port", "password"})
+_API_KEYS = frozenset({"url", "token"})
 
 _MOVED_WHITELIST_KEYS = frozenset({"whitelist"})
 _MOVED_DEFAULT_KEYS = frozenset({"primary"})
@@ -81,9 +96,15 @@ class ServerConfigError(Exception):
 
 @dataclass(frozen=True)
 class RconSpec:
-    """一个目标的 RCON 端点。密码为空 = 该目标不出名单（也不下发任何命令）。"""
+    """一个目标的 RCON 端点。密码为空 = 该目标不出名单（也不下发任何命令）。
 
+    `host` 留空 = 跟目标自己的 `host` 相同（绝大多数情况）。需要单独填是因为
+    SLP 和 RCON 可以不在一个地址上 —— 典型场景是 RCON 只绑在内网/回环，由隧道
+    转出来，而游戏的 SLP 走的是公网端口。2026-09-22 对方那台 GTNH 就是这样：
+    SLP 在 `203.0.113.10:30004`，RCON 在隧道这头的 `127.0.0.1:25575`。
+    """
     port: int
+    host: str = ""
     password: str = ""
 
     @property
@@ -93,38 +114,158 @@ class RconSpec:
 
 
 @dataclass(frozen=True)
+class ApiSpec:
+    """一个目标的 HTTP 接口端点 —— 群组服那侧自建的 bridge 插件（见 DEPLOY.md）。
+
+    存在的理由：**群组的权威数据在代理手里**，而代理那台通常只有一个内网 HTTP 口，
+    没有 SLP、没有 RCON。SZUcraft 那套（2026-09-22 对接）给的是：
+
+        GET  /status    → {"proxy":{"online":N},"servers":[{"name","online","players"}]}
+        GET  /whitelist → {"enabled":bool,"count":N,"entries":[...]}
+        POST /whitelist/add | /whitelist/remove  （表单 / JSON / query 三选一）
+        GET  /health    → {"ok":true}（免鉴权，探活专用）
+
+    它和 RCON 是**互斥的两条通道**：都配在一台目标上，就没人说得清实际走哪条 ——
+    所以解析期直接报错（见 parse_book），不做「有 api 就优先」这种静默择优。
+
+    token 必填（这里的默认值只是为了构造方便，`parse_book` 那侧是 allow_empty=False，
+    空 token 在解析期就报错）。理由：没有 token 时每条请求都是 401，等于配了一个
+    「永远取不到数据」的目标，与其留到运行时不如现在就拦下。url 里的路径部分不参与
+    拼接，固定用上面那四条绝对路径 —— 免得出现「url 写到 /status、再拼一次」这类错。
+    """
+    url: str
+    token: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        """**解析期已保证 token 非空**，所以真跑起来时这里恒为 True。
+
+        留着是因为 `ServerTarget.is_api` 读它（那是个语义正确的转发），删掉得同时改
+        调用方。写这段注释是为了拦住「照这个 if 反推『token 可以为空』」—— 加等于白加
+        的那版行为（空 token = 没配）在 2026-09-22 已经废掉，权威是 parse_book。
+        """
+        return bool(self.token)
+
+
+@dataclass(frozen=True)
 class ServerTarget:
     id: str
     name: str
     kind: str
     group: str
-    host: str
-    port: int
     timeout: float
     rcon_timeout: float
+    # host/port 有默认值是因为 **接口型目标（api 段）根本没有游戏端口**：它的数据
+    # 全从那一个 HTTP 口来，游戏端口没发布到公网、机器人够不着。RCON 还留着默认值
+    # 之前的位置不变（谁都在用），只是不能排在无默认值的字段前面。
+    host: str = ""
+    port: int = 0
     rcon: RconSpec | None = None
+    api: ApiSpec | None = None
+    # 数据不从自己这儿取，而是「哪台目标的接口里带我的数据」。值是另一条 [[targets]]
+    # 的 id，且那台必须配了 api。群组子服（lobby/bingo/…）都指向代理那条。
+    source: str = ""
+    # 在上面那台的响应里，用哪个键取自己（/status 的 servers[].name）。不填 = 用 id。
+    source_key: str = ""
     aliases: tuple[str, ...] = ()
+    # `source` 解出来的**那台目标本身**，由 _check_sources 在解析期回填；自己没有
+    # source 时是 None。存对象而不是每处都拿着 id 去查表，是为了让取数层能在**任意
+    # 子集**里工作：只探测 bingo 一个目标时，也得知道去问 szu 的接口（收数的人可能
+    # 只关联了子服，或者缓存里只有子服过期了）。查表要有一份全量表在手，而那是
+    # 配置层的东西，取数层不该依赖它。
+    # repr=False：它是另一条 ServerTarget，打进日志会把整张表套着打一遍。
+    # compare=False：两个目标的相等性与它无关（同一个 id 就是一个目标）。
+    hub: "ServerTarget | None" = field(default=None, repr=False, compare=False)
+
+    @property
+    def source_name(self) -> str:
+        """在 hub 的响应里取自己那一份用的键。
+
+        回退只写在这一处（和 rcon_host 同一个道理）：`--list-targets` 给人看的、
+        真去查表用的，都读它。群组那边的服名和本地的 id **不必相同**，所以能单独填。
+        """
+        return self.source_key or self.id
+
+    @property
+    def is_api(self) -> bool:
+        """数据与白名单都走 HTTP 接口。"""
+        return self.api is not None and self.api.enabled
+
+    @property
+    def has_own_source(self) -> bool:
+        """这台目标自己就能给出「谁在线」的名单（不算 SLP 样本那条降级路）。
+
+        代理配了接口 → 能；子服挂了 source → 能（从 hub 那台拿）；配了 RCON → 能。
+        """
+        return self.is_api or bool(self.source) or self.rcon_enabled
 
     @property
     def game_addr(self) -> str:
-        return f"{self.host}:{self.port}"
+        """SLP 地址。接口型目标没有这个，回 `-`（和 rcon_addr 同一套写法）。"""
+        return f"{self.host}:{self.port}" if self.host else "-"
+
+    @property
+    def rcon_host(self) -> str:
+        """RCON 连哪台主机。`rcon.host` 没填就用目标自己的 `host`（绝大多数目标如此）。
+
+        单独存在是因为 SLP 和 RCON 可以不在一个地址上：RCON 只绑内网/回环、由隧道
+        转出来，而游戏 SLP 走公网端口。回退逻辑只写在这一处，`rcon_addr`（给人看）
+        和 `mc._open()`（真去连）都读它 —— 免得两处各有一套判断。
+        """
+        if self.rcon is not None and self.rcon.host:
+            return self.rcon.host
+        return self.host
 
     @property
     def rcon_addr(self) -> str:
-        return f"{self.host}:{self.rcon.port}" if self.rcon else "-"
+        return f"{self.rcon_host}:{self.rcon.port}" if self.rcon else "-"
 
     @property
     def serves_names(self) -> bool:
-        """代理层拿不到「谁在哪个子服」（Velocity 无原生 glist），所以它不出名单。
+        """代理恒为 False —— **配上接口也是 False**。
 
-        见《群组服对接需求.md》§1：代理的 SLP 只给全群组总人数，分服名单必须
-        逐个连子服 RCON。
+        这个属性问的不是「拿不拿得到名单」，而是「这份快照的名单该不该按**分服口径**
+        进入计数与渲染」。代理的名单是**全群组**的（所有人，不管在哪台子服），把它当
+        一台服来数，`_counting()` 就会把同一批人数两遍 —— 各子服的名单里本来就有他们。
+        所以即便接口明明能给出全群组的名单，这里也**故意**不用它。
+
+        顺带纠正一条旧结论：出不了名单的理由**不是**「Velocity 拿不到谁在哪台子服」——
+        那是 BungeeCord 时代的印象（把「没有内置 glist 那条命令」当成了「拿不到」）。
+        Velocity 插件能直接枚举每台后端的连接玩家。真正的限制只是 SLP + RCON 那条
+        通道拿不到，而接口那条能拿到，只是我们按上面的理由不用它。
+
+        代理的 RCON 也不参与（它只服务白名单，没有 `list`），所以这里从不看 rcon_enabled。
         """
         return self.kind != KIND_PROXY
 
     @property
     def rcon_enabled(self) -> bool:
         return self.rcon is not None and self.rcon.enabled
+
+    @property
+    def whitelist_ready(self) -> bool:
+        """这台目标能不能做白名单操作：RCON 或 HTTP 接口，通一条就行。
+
+        和 rcon_enabled 分开是因为**问的问题不一样**。调用方真正想知道的是「能不能改
+        这台服的白名单」，用 rcon_enabled 代替它，接口型目标就会被当成「没配密码」拒掉，
+        群里表现为「本群没配白名单服」，而配置里明明写着 —— 又一处「配了却不生效」。
+        """
+        return self.rcon_enabled or self.is_api
+
+    @property
+    def transport(self) -> str:
+        """靠什么取在线名单，给诊断打印用（describe / 探测失败时的排查）。
+
+        顺序即优先级：接口 > 挂在接口上的子服 > RCON > SLP（只剩人数）。
+        和谁真正生效保持一致（见 parse_book 对 api + rcon 并存的报错）。
+        """
+        if self.is_api:
+            return "接口"
+        if self.source:
+            return f"接口（{self.source} 的子服）"
+        if self.rcon_enabled:
+            return "RCON"
+        return "SLP"
 
     @property
     def keys(self) -> tuple[str, ...]:
@@ -182,6 +323,20 @@ class WhitelistRoute:
     @property
     def rcon_enabled(self) -> bool:
         return self.target.rcon_enabled
+
+    @property
+    def whitelist_ready(self) -> bool:
+        """能不能改这台的名单（RCON 或接口，通一条就行）。判定见 ServerTarget 同名属性。"""
+        return self.target.whitelist_ready
+
+    @property
+    def channel(self) -> str:
+        """白名单走哪条通道，给用户文案用。只有 "接口" 和 "RCON" 两种可能。
+
+        与 `transport` 分开：那个是**诊断**用的（会把「接口（szu 的子服）」这种来源
+        写全），而这里进群文案，要的是最短的那个通道名。
+        """
+        return "接口" if self.target.is_api else "RCON"
 
     @property
     def rcon_addr(self) -> str:
@@ -409,13 +564,36 @@ class ServerBook:
         return Resolution(query=raw)
 
     def describe(self) -> list[str]:
-        """给 --list-targets / 启动日志用的一行一个目标概览。"""
+        """给 --list-targets / 启动日志用的一行一个目标概览。
+
+        **把「数据从哪来」显式打出来**（接口 / hub 的子服 / RCON / 只剩人数）。
+        接口型目标是唯一「游戏端口可有可无」的一类，光看 host:port 分不出
+        「没配」和「不需要」，而这两种情况的排查方向相反。
+        """
         rows = []
         for t in self.targets:
-            rcon = t.rcon_addr if t.rcon_enabled else "未配密码"
-            rows.append(
-                f"{t.name} [{t.id}] {t.kind} 游戏={t.game_addr} RCON={rcon} 组={t.group}"
-            )
+            parts = [f"{t.name} [{t.id}] {t.kind} 组={t.group}"]
+            if t.is_api:
+                parts.append(f"接口={t.api.url}")
+                # 接口型的 host/port 是**可选**的：填了就拿 SLP 做一次人数交叉校验
+                # （接口的名单和人数出自同一份 JSON，少了这层独立来源），填不填都不影响取数。
+                parts.append(
+                    f"游戏={t.game_addr}（仅交叉校验）" if t.host else "游戏=（无）"
+                )
+            elif t.source:
+                parts.append(f"数据={t.source}:{t.source_name}")
+                parts.append(f"游戏={t.game_addr}" if t.host else "游戏=（不可达）")
+            else:
+                parts.append(f"游戏={t.game_addr}")
+            if t.is_api:
+                parts.append("白名单=接口")
+            elif t.rcon_enabled:
+                parts.append(f"RCON={t.rcon_addr}")
+                if t.source:
+                    parts.append("（也用于白名单）")
+            elif t.kind != KIND_PROXY:
+                parts.append("RCON=未配密码")
+            rows.append(" ".join(parts))
         return rows
 
 
@@ -533,8 +711,65 @@ def parse_book(text: str) -> ServerBook:
                 f"{where}.kind 非法：{kind!r}；只能是 {'、'.join(KINDS)} 之一"
             )
 
-        host = _as_text(raw.get("host", ""), f"{where}.host", allow_empty=False)
-        port = _as_int(raw.get("port", 0), f"{where}.port")
+        api_raw = raw.get("api")
+        api: ApiSpec | None = None
+        if api_raw is not None:
+            if not isinstance(api_raw, dict):
+                raise ServerConfigError(f"{where}.api 必须是一个表")
+            _reject_unknown(api_raw, _API_KEYS, f"{where}.api")
+            api = ApiSpec(
+                url=_as_text(api_raw.get("url", ""), f"{where}.api.url", allow_empty=False),
+                # token 不给默认值、也不许空：没有它每条请求都是 401，等于配了个
+                # 「永远取不到数据」的目标。宁可现在就报错。
+                token=_as_text(api_raw.get("token", ""), f"{where}.api.token", allow_empty=False),
+            )
+            if not api.url.startswith(("http://", "https://")):
+                raise ServerConfigError(
+                    f"{where}.api.url 必须以 http:// 或 https:// 开头，实际是 {api.url!r}"
+                )
+            # url 只填到端口。**带路径的写法必须拦下**：那一段不会参与拼接（mcbridge
+            # 用死路径），也就是说 http://h:8080/status 里的 /status 被静默忽略 ——
+            # 看着像配对了、其实那一段从来没生效过。这正是「配了却不生效」那一类。
+            if "/" in api.url.split("://", 1)[1].rstrip("/"):
+                raise ServerConfigError(
+                    f"{where}.api.url 只填到端口就行（如 http://127.0.0.1:8080），不要带路径 ——"
+                    f"/status、/whitelist 这些路径由机器人自己拼。实际是 {api.url!r}"
+                )
+            if kind != KIND_PROXY:
+                raise ServerConfigError(
+                    f"{where} 的 kind 是 {kind!r}，但配了 api —— 这个接口给的是整个群组的"
+                    f'数据（每个子服各一行），只有 kind = "proxy" 的目标用得上它。'
+                    f"子服不要配 api，改成 source = \"<代理的 id>\"。"
+                )
+
+        source = _as_text(raw.get("source", ""), f"{where}.source")
+        source_key = _as_text(raw.get("source_key", ""), f"{where}.source_key")
+        if source_key and not source:
+            raise ServerConfigError(
+                f"{where}.source_key 只有配了 source 之后才有意义（它指的是「去那台的"
+                f"接口里，用哪个键取我自己」）"
+            )
+        if source and api is not None:
+            raise ServerConfigError(
+                f"{where} 同时配了 api 和 source：api 是「数据从我自己的接口取」，"
+                f"source 是「数据从 {source} 的接口取」，两者只能留一个"
+            )
+
+        # host/port 在**数据不靠自己取**时是可选的：接口型目标（api）的机器只有那一个
+        # 内网 HTTP 口，子服（source）压根没发布游戏端口，机器人都够不着。填了仍有用
+        # ——SLP 会给人数做一次独立交叉校验（见 fetch_snapshot），所以不是「填了也白填」，
+        # 但**只填 port 不填 host** 就真的是白填（SLP 要两个一起），当错误拦下。
+        if api is not None or source:
+            host = _as_text(raw.get("host", ""), f"{where}.host")
+            port = _as_int(raw.get("port", 0), f"{where}.port") if host else 0
+            if not host and "port" in raw:
+                raise ServerConfigError(
+                    f"{where}.port 单独出现没有意义：SLP 要 host 和 port 一起给。"
+                    f"这个目标的数据本来也不靠 SLP，两个都删掉就是对的写法。"
+                )
+        else:
+            host = _as_text(raw.get("host", ""), f"{where}.host", allow_empty=False)
+            port = _as_int(raw.get("port", 0), f"{where}.port")
         # name 缺省就用 id：消息里显示的服名不该是空的
         name = _as_text(raw.get("name", target_id), f"{where}.name") or target_id
         # group 缺省用 id = 自己独占一组。同组的才会把 A→B 合并成一条「换服」。
@@ -550,7 +785,34 @@ def parse_book(text: str) -> ServerBook:
             _reject_unknown(rcon_raw, _RCON_KEYS, f"{where}.rcon")
             rcon = RconSpec(
                 port=_as_int(rcon_raw.get("port", 0), f"{where}.rcon.port"),
+                # 留空 = 跟目标的 host 相同。不用 allow_empty=False —— 空是这个字段的
+                # 正常取值（"跟着目标走"），不是漏填。
+                host=_as_text(rcon_raw.get("host", ""), f"{where}.rcon.host"),
                 password=_as_text(rcon_raw.get("password", ""), f"{where}.rcon.password"),
+            )
+        if rcon is not None and api is not None:
+            # 两条通道都能取名单、都能改白名单，同时配着就没有任何一处能说清实际走哪条。
+            # 更坏的是两边会**各说各话**：名单按接口的报、白名单按…其实按接口（transport
+            # 的优先级），于是 rcon 段静默失效，而配它的人以为自己开着一条后路。
+            raise ServerConfigError(
+                f"{where} 同时配了 rcon 和 api —— 这是两条互斥的通道（都能出名单、都能改"
+                f"白名单），同时存在就没法判断实际走哪条。留一个：走对方接口的群组服留 "
+                f"api，自己开 RCON 的服留 rcon。"
+            )
+        if rcon is not None and source:
+            # source 和 rcon **不会各说各话到报错**，所以这条比上一条隐蔽得多：在线名单
+            # 走 source（hub 的接口），而白名单命令走本机 RCON —— 群里显示的名字和加白
+            # 名单时读的名字来自两个地方。真实翻车：代理那侧的白名单（GlobalWhitelist
+            # 之类）才是进服校验那一道，子服自己的白名单加上去**看起来成功**，
+            # 人还是进不去。取数层没法自己发现这件事（两条路各自都是自洽的），
+            # 所以只能在解析期拦下。
+            raise ServerConfigError(
+                f"{where} 同时配了 source 和 rcon：source 是「我的在线名单从 {source} 的"
+                f"接口拿」，而 rcon 会让白名单命令走「这台自己的」控制台 —— 群里的名单和"
+                f"加白名单时读的那份名单来自两处，代理层才是进服校验那一道，于是会出现"
+                f"「机器人说已添加，人还是进不去」。二选一：挂接口的子服把白名单也交给 "
+                f'{source}（在 mcs_audiences.toml 的 whitelist 里把 target 写成 '
+                f'"{source}"），或者去掉 source、这台完全走自己的 RCON。'
             )
 
         aliases_raw = raw.get("aliases", [])
@@ -570,6 +832,9 @@ def parse_book(text: str) -> ServerBook:
             timeout=timeout,
             rcon_timeout=rcon_timeout,
             rcon=rcon,
+            api=api,
+            source=source,
+            source_key=source_key,
             aliases=aliases,
         )
 
@@ -585,15 +850,19 @@ def parse_book(text: str) -> ServerBook:
                 )
             claimed[norm] = target_id
 
-        if not target.rcon_enabled and target.kind != KIND_PROXY:
+        # 「这台只会显示人数」的警告。三种情况不该报：配了 RCON / 自己有接口 /
+        # 挂在接口上（数据从 hub 拿）。代理也不报 —— 它出不出名单是通道决定的，
+        # 没配接口的代理是**设计如此**，不是漏配（见 serves_names）。
+        if not target.has_own_source and target.kind != KIND_PROXY:
             warnings.append(
-                f"{name}：没配 rcon.password，它不出玩家名单"
+                f"{name}：没配 rcon.password、也没有接口数据源，它不出玩家名单"
                 f"（只能靠 SLP 样本，超过 12 人就不完整）"
             )
 
         by_id[target_id] = target
         targets.append(target)
 
+    _check_sources(targets, by_id)
     _check_port_collisions(targets, warnings)
 
     # 白名单归属与主服都随群关联走了（见 _MOVED_* 那两条迁移报错），全量表里留空。
@@ -603,6 +872,45 @@ def parse_book(text: str) -> ServerBook:
         warnings=tuple(warnings),
         _by_id=by_id,
     )
+
+
+def _check_sources(targets: list[ServerTarget], by_id: dict[str, ServerTarget]) -> None:
+    """`source` 必须指向一台**配了 api** 的目标。加载期能查清，所以直接报错。
+
+    两件事只能在**所有目标都解析完**之后做：
+
+    1. source 允许指向写在它**后面**的那条 [[targets]]。人写配置时「代理段」不一定
+       在最前面，而写在循环里就会变成顺序敏感的坑 —— 调一下段落顺序就报错，报的还
+       是「不存在」这种误导话。
+    2. 反过来只有全表在手，才可能给出「你是不是想填 XX」这种能照着改的提示。
+
+    「指向一台没配 api 的服」是最容易犯的错（把 source 当成「数据来自哪台服」而不是
+    「哪台的接口」），所以那句话要点明接口才是来源。
+
+    校验的同时把 hub 对象**回填**进子服（见 ServerTarget.hub）：这一步必须在全表解析
+    完之后，而它恰好就在这里。回填后的对象要**同时换进 by_id** —— 它才是
+    ServerBook.get() / scoped() 真正查的那份索引，漏换就会出现「全量表里的 bingo 有
+    hub、投影出来的 bingo 没有」，而症状是「某个群里查 bingo 永远说不出来源」。
+    """
+    for index, t in enumerate(targets):
+        if not t.source:
+            continue
+        hub = by_id.get(t.source)
+        if hub is None:
+            raise ServerConfigError(
+                f"目标 {t.id} 的 source = {t.source!r} 不存在：它要填的是另一条 "
+                f"[[targets]] 的 id（配了 api 的那台，通常就是代理那条）"
+            )
+        if hub.api is None:
+            raise ServerConfigError(
+                f"目标 {t.id} 的 source 指向 {t.source}，但那台没配 api —— "
+                f"source 的意思是「去那台的接口里取我的数据」，所以那台必须有 api 段"
+            )
+        # 循环里查的一律是 by_id，而 hub 自己（配了 api 的那台）不可能有 source
+        # （见 parse_book：api + source 并存直接报错），所以本轮的查找不受回填影响。
+        bound = replace(t, hub=hub)
+        targets[index] = bound
+        by_id[t.id] = bound
 
 
 def _check_port_collisions(targets: list[ServerTarget], warnings: list[str]) -> None:
@@ -620,7 +928,11 @@ def _check_port_collisions(targets: list[ServerTarget], warnings: list[str]) -> 
     games: dict[str, list[str]] = {}
     rcons: dict[str, list[str]] = {}
     for t in targets:
-        games.setdefault(t.game_addr, []).append(t.id)
+        # 没有游戏地址的目标（接口型、挂在接口上的子服）不参与 —— 它们本来就没有
+        # SLP 端点，而 game_addr 会一律退化成 "-"，不加这一句就会报出一堆
+        # 「这几台都绑 -」的假冲突，把真冲突埋掉。
+        if t.host:
+            games.setdefault(t.game_addr, []).append(t.id)
         if t.rcon_enabled:
             rcons.setdefault(t.rcon_addr, []).append(t.id)
 
@@ -676,13 +988,24 @@ def book_path() -> Path:
 # 一半旧」。全量表本身仍然随时可用：load_book(book_path())，不缓存。
 
 
-def round_budget(book: ServerBook) -> tuple[float, float, float]:
-    """一轮探测的耗时上界（秒）：返回 (slp, rcon, budget)。
+def round_budget(book: ServerBook) -> tuple[float, float, float, float]:
+    """一轮探测的耗时上界（秒）：返回 (slp, rcon, api, budget)。
 
-    `budget = max(SLP 超时) + 2 × max(RCON 超时)`：
-      · 目标之间是**并发**探测，所以取 max 而不是求和 —— 加子服不会让这个数变大
-      · RCON 那项乘 2 是因为失败会重试一次
-      · 没配 rcon 的目标不参与 RCON 那项的 max
+    **目标之间是并发探测的**，所以各项都取 max 而不是求和 —— 加子服不会让这个数变大。
+    逐目标的成本：
+
+      · SLP：配了 host/port 就有（接口型目标是可选的），花 `timeout`
+      · 接口：只有 api 型目标有，花 `timeout`；它和 SLP **是串行的**（SLP 用来给
+        接口报的人数做独立交叉校验，见 fetch_snapshot），所以接口型目标两份都算
+      · RCON：有密码且出名单才有，花 `2 × rcon_timeout`（失败会重试一次）
+
+    `budget = max(上面那三类之和)`。接口型目标只加一次 HTTP，**挂在它上面的子服
+    （source）不额外花时间** —— 数据已经在 hub 那一份响应里了，这也是同源合并的意义。
+
+    三项分开返回而不是只给 `budget`：打给人看的算式必须**加得起来**
+    （`SLP 5s + RCON 5s ×2 + 接口 0s = 最坏 15s`）。早先只返回总和时，输出里少了
+    接口那一项，于是「接口型目标一配，算式就和小计对不上」—— 这种输出会让人怀疑
+    是算错了，而真相比这无聊：只是没打印出来。
 
     这是**上界**（所有目标同时卡到超时）不是典型值，只用来跟
     MC_WATCH_INTERVAL_SEC 比大小。`mc_reporter._watch_loop` 是「跑完再补睡剩余
@@ -691,6 +1014,12 @@ def round_budget(book: ServerBook) -> tuple[float, float, float]:
     放在 _shared 里而不是各调用点各算一遍：mc_check 的 --list-targets 和 bot 的
     启动日志都要报这个数，两处必须一致。
     """
-    slp = max((t.timeout for t in book.targets), default=0.0)
-    rcon = max((t.rcon_timeout for t in book.targets if t.rcon_enabled), default=0.0)
-    return slp, rcon, slp + 2 * rcon
+    slp = max((t.timeout for t in book.targets if t.host), default=0.0)
+    # 只有会真去连 RCON 的目标才计入：代理（RCON 只服务白名单、不发 list）不参与，
+    # 挂在外面的服（source）也不参与。
+    rcon = max(
+        (t.rcon_timeout for t in book.targets if t.rcon_enabled and t.serves_names),
+        default=0.0,
+    )
+    api = max((t.timeout for t in book.targets if t.is_api), default=0.0)
+    return slp, rcon, api, slp + 2 * rcon + api

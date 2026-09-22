@@ -19,6 +19,7 @@ from .client import (
     _filter_areas,
     _get_client,
     _reset_client,
+    disabled_reason,
 )
 
 stat = on_message(priority=1, block=False)
@@ -26,9 +27,13 @@ stat = on_message(priority=1, block=False)
 
 async def _build_stats_message() -> str:
     """查询 oopz 并生成统计文本。失败/无人时返回适合直接回复的字符串。"""
+    reason = disabled_reason()
+    if reason is not None:
+        # 没装 SDK / 没配凭据 —— 回一句说清是哪一种，别让群友以为机器人坏了
+        return f"oopz 功能未启用：{reason}。"
     bot = await _get_client()
     if bot is None:
-        return "oopz 凭据未配置：请先在终端运行 tools/oopz_login.py，然后重启机器人。"
+        return "oopz 客户端初始化失败，详情见机器人日志（多半是凭据或网络问题）。"
 
     try:
         async with asyncio.timeout(_QUERY_TIMEOUT):

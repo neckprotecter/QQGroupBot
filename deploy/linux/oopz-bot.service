@@ -1,0 +1,53 @@
+# oopz QQ 群机器人（NapCat / OneBot v11 版）—— 部署方法见 DEPLOY-Linux.md 第 7 节
+#
+# 安装：
+#     sudo cp deploy/linux/oopz-bot.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now oopz-bot
+#     journalctl -u oopz-bot -f
+#
+# ⚠️ WorkingDirectory 必须是**仓库根**，不能改成别处：日志是相对**当前工作目录**
+#    写的（`logs/napcat_bot_<日期>.log`）。写成别处，日志就落到别处，或者因为那儿
+#    不可写而在 logger.add() 阶段直接报错起不来 —— 而 systemd 状态还是 active。
+#
+#    另外两样**不认** cwd，别一起怀疑错：`.env` 是 load_dotenv() 按**调用它的那个
+#    文件**的位置找的（bot_napcat.py 就在仓库根，所以仓库放哪都读得到）；两份
+#    .toml 的默认路径是 Path(__file__) 算的。**只有 logs/ 认 cwd。**
+
+[Unit]
+Description=oopz QQ 群机器人（NapCat / OneBot v11）
+Documentation=file:/opt/oopz-bot/DEPLOY-Linux.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 建一个专用账号跑：sudo useradd -r -s /usr/sbin/nologin -d /opt/oopz-bot oopzbot
+# 它**不需要** docker 组 —— NapCat 是独立容器，两边通过 127.0.0.1:3001 说话。
+User=oopzbot
+Group=oopzbot
+WorkingDirectory=/opt/oopz-bot
+
+# ① LANG：systemd 起的进程环境里 LANG 常常是空的，那样 Python 会拿 ASCII 当控制台
+#    编码，打中文到 stdout 会报 UnicodeEncodeError（进 journald 的那一路日志就没了）。
+# ② PYTHONUTF8：和 Windows 那份 DEPLOY.md 里同一个理由，兜底。
+Environment=LANG=C.UTF-8
+Environment=PYTHONUTF8=1
+
+ExecStart=/opt/oopz-bot/.venv/bin/python bot_napcat.py
+
+# 崩了才重启（正常退出不拉起来）。改配置后用 systemctl restart 手动重启。
+Restart=on-failure
+RestartSec=10
+
+# .env（QQ token / oopz JWT + 私钥）和 mcs_servers.toml（RCON 密码）都是明文，
+# 靠 UMask + 文件本身的 600 权限挡住同机其他用户。见 DEPLOY-Linux.md 第 4 节。
+UMask=0007
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oopz-bot
+
+[Install]
+WantedBy=multi-user.target
