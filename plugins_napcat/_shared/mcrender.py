@@ -36,6 +36,12 @@ NO_TARGETS = "🏗️ 本群关联的服务器还没接入，暂时没有可查�
 # 功能引导因此被抑制，得在这里把人接回去。
 NO_AUDIENCE = "🤔 本群还没有开通 MC 查询。其它功能可以发「@机器人 你好」看看。"
 
+# 跨 group 之间的分隔线（2026-09-23 用户要求：模组服 GTNH 和群组服分开）。
+# 用最朴素的 ASCII 连字符加空格，不用「┄」「┈」「─」那类制表/box-drawing 虚线：
+# 那几个码点在部分安卓 QQ 的字体里是豆腐块，而这条线唯一的作用就是分区。
+# 长度对齐播报里那条 ━ 实线（10 个全角宽 ≈ 20 个半角）。
+_GROUP_SEP = ("- " * 10).strip()
+
 
 @dataclass(frozen=True)
 class Row:
@@ -117,8 +123,12 @@ def _summary_block(row: Row, budget: int) -> list[str]:
 
     tail = f"　延迟 {snap.latency:.0f}ms" if snap.latency is not None else ""
     if not target.serves_names:
-        # 单独标出「全群组」：它和下面的分服数字不是一个口径，混着看会以为重了
-        return [f"{label}全群组 {snap.count} 人{tail}（代理，不出分服名单）"]
+        # 单独标出「全群组」：它和下面的分服数字不是一个口径，混着看会以为重了。
+        # 2026-09-23 去掉句尾的「（代理，不出分服名单）」—— 总览这一行下面紧跟着就是
+        # 各子服的数字，「全群组」三个字已经说明它不在那个口径里了，括号那半句只是噪音。
+        # 明细视图（render_detail，见本文件 :87）里那句解释**保留**：那边是整份模板套上去，
+        # 没有上面这些兄弟行当上下文，读的人需要被明说一次。
+        return [f"{label}全群组 {snap.count} 人{tail}"]
 
     body = snap.count
     if snap.max_players:
@@ -217,6 +227,24 @@ def _footnote(rows: Sequence[Row], all_targets: Sequence[ServerTarget]) -> str:
     return "\n".join(notes)
 
 
+def _block_lead(row: Row, prev_group: str | None) -> list[str]:
+    """一个目标块**前面**的那一行：平时什么都不留，跨组时留一条虚线。
+
+    判据是 group 变化，不是拿服名硬编码「GTNH 之后画一条」：哪几台归一组由配置说了算
+    （没写 group 的各自独占一组），换个部署、加个别组的服都不用回来改这里。
+
+    第一个目标前面什么都不出（上面紧接着就是表头），整条消息只有一组时也不会有虚线 ——
+    刻意的：只挂模组服或只挂群组服的群里，那条线只是噪音。
+
+    块之间不空行是总览与播报共同的取向（2026-09-23 总览从「块间空行」改成这样：
+    六台服就是六条空行，把消息拉长了一倍）。规则与线型都只有这一份，两处各写一遍的话，
+    改线型或改判据时一定会只改一边。
+    """
+    if prev_group is not None and row.target.group != prev_group:
+        return [_GROUP_SEP]
+    return []
+
+
 def _assemble(rows: Sequence[Row], budget: int, all_targets: Sequence[ServerTarget]) -> str:
     counted = _counting(rows)
     total = sum(r.snap.count for r in counted)
@@ -228,10 +256,14 @@ def _assemble(rows: Sequence[Row], budget: int, all_targets: Sequence[ServerTarg
     if down:
         head += f"（{down} 台探测失败）"
 
-    lines = [head]
+    # 表头与第一块之间留一条空行（与播报同一处），块与块之间不留 —— 一块一台服时，
+    # 那些空行只是把消息拉长（2026-09-23 按用户要求去掉）。
+    lines = [head, ""]
+    prev_group: str | None = None
     for row in rows:
-        lines.append("")
+        lines.extend(_block_lead(row, prev_group))
         lines.extend(_summary_block(row, budget))
+        prev_group = row.target.group
 
     note = _footnote(rows, all_targets)
     if note:
@@ -336,10 +368,13 @@ def _assemble_report(
         head = "现在的在线情况"
 
     lines = [f"📣 MC 播报 · {(now or datetime.now()):%H:%M}", "━━━━━━━━━━", head, ""]
+    # 块之间不留空行：播报常常是连续几台「在线 N 人」的一行块，逐个空行会把它拉成
+    # 一屏，而这几行本该一眼扫完。跨组的虚线也不给自己加空行（见 _block_lead）。
+    prev_group: str | None = None
     for row in rows:
-        # 块之间不留空行（总览留）：播报常常是连续几台「在线 N 人」的一行块，
-        # 逐个空行会把它拉成一屏，而这几行本该一眼扫完。
+        lines.extend(_block_lead(row, prev_group))
         lines.extend(_summary_block(row, budget))
+        prev_group = row.target.group
     lines.append("")
     lines.append("想一起玩的，直接进服找他们～")
 

@@ -1253,9 +1253,11 @@ source_key = "bingo-s2"
     from plugins_napcat._shared.mcservers import ApiSpec, ServerTarget
     from plugins_napcat._shared.textlen import MAX_LEN
 
-    def _tgt(tid: str, kind: str = "backend", name: str = "") -> ServerTarget:
+    def _tgt(
+        tid: str, kind: str = "backend", name: str = "", group: str = "主服群"
+    ) -> ServerTarget:
         return ServerTarget(
-            id=tid, name=name or tid, kind=kind, group="主服群",
+            id=tid, name=name or tid, kind=kind, group=group,
             host="h", port=1, timeout=5.0, rcon_timeout=5.0,
         )
 
@@ -1439,6 +1441,59 @@ source_key = "bingo-s2"
     )
     if not ok:
         print(f"         实际尾部: {text[-160:]!r}")
+
+    # 跨组之间的虚线（2026-09-23 用户要求：模组服 GTNH 与群组服分开）。
+    # 判据是 group 变化，所以这里造一条「GTNH 独占一组 + 群组服的代理与子服同组」的表，
+    # 真实部署就是这个形状。断言不用具体线型，只认「一条只由 - 和空格组成的长行」——
+    # 线型是审美，位置才是行为。
+    def _seps(text: str) -> list[str]:
+        return [
+            ln
+            for ln in text.splitlines()
+            if len(ln) >= 8 and "-" in ln and set(ln) <= {"-", " "}
+        ]
+
+    rows = [
+        Row(_tgt("gtnh", "standalone", "GTNH", group="gtnh"), _snap(count=1, names=["A"])),
+        # 代理报 2 人 = 两台子服之和 → 尾注不触发。这是刻意的：下面数空行条数时，
+        # 尾注前那条空行会混进来，而这条断言要量的只是**块间距**。
+        Row(_tgt("szu", "proxy", "群组服", group="群组服"), _snap(count=2)),
+        Row(_tgt("lobby", name="大厅", group="群组服"), _snap(count=1, names=["A"])),
+    ]
+    text = render_summary(rows, total_names=50, all_targets=[r.target for r in rows])
+    lines = text.splitlines()
+    seps = _seps(text)
+
+    def _idx(prefix: str) -> int:
+        return next(n for n, ln in enumerate(lines) if ln.startswith(prefix))
+
+    # 位置也要卡：只数条数的话，把线画在表头之后、或整条消息最末尾（同样是「一条线」）
+    # 也能过。顺序必须是 GTNH → 线 → 群组服那一段。
+    ok = (
+        len(seps) == 1
+        and _idx("【GTNH】") < lines.index(seps[0]) < _idx("【群组服】") < _idx("【大厅】")
+        # 块之间不再空行（2026-09-23 用户：太长）。全线**只剩表头后那一条** ——
+        # 不钉的话，谁把块间空行加回来这条也照过，而组的形状正是这次要定的东西。
+        and lines[1] == ""
+        and lines.count("") == 1
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  跨组之间画一条虚线，且在两组的分界上")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # 反向：**只有一组**时不许画线。不钉这条的话，「每个目标之间都画一条」也能让
+    # 上面那条过 —— 而那样只挂群组服的群里会变成一行一个横杠。
+    rows = [
+        Row(_tgt("szu", "proxy", "群组服", group="群组服"), _snap(count=1)),
+        Row(_tgt("lobby", name="大厅", group="群组服"), _snap(count=1, names=["A"])),
+    ]
+    text = render_summary(rows, total_names=50, all_targets=[r.target for r in rows])
+    ok = not _seps(text)
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  只有一组时不画线（不然每台服之间都是横杠）")
+    if not ok:
+        print(f"         实际:\n{text}")
 
     # 空目标表不能炸：[[audience]].targets 写成了 []（建筑群就是这种）。
     # 文案必须与 mc_stats 短路返回的那条**是同一句** —— 两处各写一份一定会漂，
@@ -2672,9 +2727,12 @@ watch   = true
             host="h", port=1, timeout=5.0, rcon_timeout=5.0,
         )
 
-    def _row(tid, name, count, names=(), *, reachable=True, complete=True, kind="backend"):
+    def _row(
+        tid, name, count, names=(), *, reachable=True, complete=True, kind="backend",
+        group="主服群",
+    ):
         return _Row(
-            _t(tid, name, kind=kind),
+            _t(tid, name, group=group, kind=kind),
             McSnapshot(
                 target_id=tid, reachable=reachable, count=count,
                 names=list(names), names_complete=complete,
@@ -2814,6 +2872,41 @@ watch   = true
     )
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  播报：有人 / 没人 / 不可达三台各一块，照发不跳过")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # ⑨b 跨组的虚线在播报里也要有（2026-09-23 用户要求，与总览一致），但**不给自己加
+    #     空行** —— 播报的取向是块挨着块、一眼扫完。只加线不加空，正是两条消息排版
+    #     取向不同又被同一个规则覆盖的地方，所以两件事都要钉。
+    rows = [
+        _row("gtnh", "GTNH", 1, ["阿伟"], group="gtnh"),
+        _row("bingo", "Bingo", 1, ["小明"], group="群组服"),
+        _row("lobby", "大厅", 1, ["小红"], group="群组服"),
+    ]
+    text, _ = _rr(rows, total_names=50, all_targets=[r.target for r in rows], now=_NOW)
+    lines = text.splitlines()
+    seps = [ln for ln in lines if len(ln) >= 8 and "-" in ln and set(ln) <= {"-", " "}]
+    if seps:
+        _i = lines.index(seps[0])
+        ok = (
+            len(seps) == 1
+            # 上一行是 GTNH 块的**名字行**、下一行就是群组服那块的头：紧邻两行都不是空行
+            and lines[_i - 1] == "  • 阿伟"
+            and lines[_i + 1].startswith("【Bingo】")
+        )
+    else:
+        ok = False
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  播报里也画虚线，且自己不占空行")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # 反向：播报里只有一组时同样不许画（跟总览那对断言成对）
+    rows = [_row("bingo", "Bingo", 1, ["小明"]), _row("lobby", "大厅", 1, ["小红"])]
+    text, _ = _rr(rows, total_names=50, all_targets=[r.target for r in rows], now=_NOW)
+    ok = not [ln for ln in text.splitlines() if len(ln) >= 8 and "-" in ln and set(ln) <= {"-", " "}]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  播报只有一组时不画线")
     if not ok:
         print(f"         实际:\n{text}")
 
