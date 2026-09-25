@@ -47,7 +47,7 @@
 # 为什么这里只有开关、没有间隔：
 #   「多久播一次」「进服提醒最小间隔」这类参数**继续留在 .env**
 #   （MC_WATCH_INTERVAL_SEC / MC_JOIN_MIN_INTERVAL_SEC /
-#     MC_REPORT_INTERVAL_MIN / MC_NOTIFY_SERVER_STATE）。
+#     MC_REPORT_INTERVAL_MIN / MC_NOTIFY_SERVER_STATE / MC_QUIET_HOURS）。
 #   那是**整台机器人的节奏**，不是某个群的偏好。抄进 N 条关联只会变成
 #   「A 群改了 B 群没改」，而且改了其中一条完全看不出另外几条是什么值。
 # ============================================================

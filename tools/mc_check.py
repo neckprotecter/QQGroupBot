@@ -23,6 +23,7 @@ import asyncio
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -156,7 +157,11 @@ def _self_test() -> int:
         whitelist_lookup,
         whitelist_matches,
     )
-    from plugins_napcat._shared.schedule import seconds_until_slot
+    from plugins_napcat._shared.schedule import (
+        in_quiet_hours,
+        parse_quiet_hours,
+        seconds_until_slot,
+    )
     from plugins_napcat._shared.mcservers import (
         PICK_AMBIGUOUS,
         PICK_NEED_NAME,
@@ -293,6 +298,62 @@ def _self_test() -> int:
         except Exception as exc:
             failed += 1
             print(f"   FAIL  {desc}: {type(exc).__name__}: {exc}")
+    print()
+
+    print("== 夜间静默自测 ==")
+    # 解析：合法值
+    for raw, expected, desc in (
+        ("0-9", (0, 9), "0-9 → (0,9)（默认值）"),
+        ("23-7", (23, 7), "23-7 → 跨午夜"),
+        (" 0-9 ", (0, 9), "两端空白不算错（.env 里手滑敲的空格）"),
+        ("", None, "空串 → 不静默"),
+        ("   ", None, "纯空白 → 不静默"),
+        (None, None, "None → 不静默"),
+    ):
+        try:
+            got = parse_quiet_hours(raw)
+            ok = got == expected
+        except Exception as exc:
+            got, ok = f"{type(exc).__name__}: {exc}", False
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  {desc}: {got!r}")
+
+    # 解析：**必须报错**的写法。不报错就会被当成「没配静默」而静悄悄地放行 ——
+    # 「夜里安静」是需求本身，配错了还照发等于需求没做，且没有任何迹象。
+    for raw, desc in (
+        ("9", "只有一个数（少写 -止）"),
+        ("0-9-12", "三个数"),
+        ("0-24", "24 点越界（小时是 0..23，写 24 的人多半想表达 0-9 那种意思）"),
+        ("-1-9", "负号"),
+        ("a-b", "不是数字"),
+        ("0-0", "起止相同"),
+    ):
+        try:
+            got = parse_quiet_hours(raw)
+            failed += 1
+            print(f"   FAIL  {desc}：应报错却返回 {got!r}")
+        except ValueError:
+            print(f"   PASS  {desc} 报错")
+
+    # 判定：半开区间 [起, 止)
+    _cases = (
+        ((0, 9), 0, True, "0 点算静默"),
+        ((0, 9), 8, True, "8 点算静默"),
+        ((0, 9), 9, False, "**9 点整不算**（半开区间，9 点那班播报要发）"),
+        ((0, 9), 12, False, "白天不算"),
+        ((0, 9), 23, False, "23 点不算"),
+        ((23, 7), 23, True, "跨午夜：23 点算"),
+        ((23, 7), 3, True, "跨午夜：凌晨 3 点算"),
+        ((23, 7), 6, True, "跨午夜：6 点算"),
+        ((23, 7), 7, False, "跨午夜：7 点整不算"),
+        ((23, 7), 12, False, "跨午夜：中午不算"),
+        (None, 3, False, "没配静默时恒 False"),
+    )
+    for window, hour, expected, desc in _cases:
+        got = in_quiet_hours(window, datetime(2026, 9, 26, hour, 30))
+        ok = got == expected
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  {desc}：{hour} 点 → {got}")
     print()
 
     print("== 触发词归属自测（同一条消息只能被一个插件认领）==")
