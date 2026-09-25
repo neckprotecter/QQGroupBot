@@ -1,4 +1,7 @@
-# oopz QQ 群机器人（NapCat / OneBot v11 版）—— 部署方法见 DEPLOY-Linux.md 第 7 节
+# oopz QQ 群机器人（NapCat / OneBot v11 版）
+#
+# ⚠️ 这只在**不用 Docker 跑机器人本体**时才要 —— 也就是 DEPLOY-Linux.md 的**附录 A**。
+#    正式写法（本体也进容器）用的是仓库根的 docker-compose.yml，不需要这个单元。
 #
 # 安装：
 #     sudo cp deploy/linux/oopz-bot.service /etc/systemd/system/
@@ -6,27 +9,33 @@
 #     sudo systemctl enable --now oopz-bot
 #     journalctl -u oopz-bot -f
 #
-# ⚠️ WorkingDirectory 必须是**仓库根**，不能改成别处：日志是相对**当前工作目录**
-#    写的（`logs/napcat_bot_<日期>.log`）。写成别处，日志就落到别处，或者因为那儿
-#    不可写而在 logger.add() 阶段直接报错起不来 —— 而 systemd 状态还是 active。
+# ⚠️ 下面的 User/Group/WorkingDirectory/ExecStart 是**示例值**，照实际改。
 #
-#    另外两样**不认** cwd，别一起怀疑错：`.env` 是 load_dotenv() 按**调用它的那个
-#    文件**的位置找的（bot_napcat.py 就在仓库根，所以仓库放哪都读得到）；两份
-#    .toml 的默认路径是 Path(__file__) 算的。**只有 logs/ 认 cwd。**
+# ⚠️ WorkingDirectory 必须是**仓库根**，不能改成别处：**两样**东西认当前工作目录 ——
+#    ① 日志（`logs/napcat_bot_<日期>.log`）：写成别处日志就落到别处，或者因为那儿不可写
+#       而在 logger.add() 阶段直接报错起不来（导入期抛错，会进 Restart 循环）。
+#    ② **`.env`**：`nonebot.init()` 是按 cwd 找 `.env` 的（nonebot/config.py 里
+#       `Path(".env").is_file()`），而 DRIVER / ONEBOT_V11_WS_URLS / ONEBOT_V11_ACCESS_TOKEN
+#       正是从那儿读的 —— cwd 不对时机器人会**拿着空 WS 地址列表正常启动、然后永远不连
+#       NapCat**，systemd 状态还一切正常，极难查。
+#       （`load_dotenv()` 那一份确实按调用它的文件位置找、不认 cwd；**但 nonebot 自己那份认**，
+#        别把两者混为一谈。）
+#
+#    真正**不认** cwd 的只有两份 .toml（默认路径是 Path(__file__) 算的）。
 
 [Unit]
 Description=oopz QQ 群机器人（NapCat / OneBot v11）
-Documentation=file:/opt/oopz-bot/DEPLOY-Linux.md
+Documentation=file:/opt/qqgroupbot/DEPLOY-Linux.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# 建一个专用账号跑：sudo useradd -r -s /usr/sbin/nologin -d /opt/oopz-bot oopzbot
+# 建一个专用账号跑：sudo useradd -r -s /usr/sbin/nologin -d /opt/qqgroupbot oopzbot
 # 它**不需要** docker 组 —— NapCat 是独立容器，两边通过 127.0.0.1:3001 说话。
 User=oopzbot
 Group=oopzbot
-WorkingDirectory=/opt/oopz-bot
+WorkingDirectory=/opt/qqgroupbot
 
 # ① LANG：systemd 起的进程环境里 LANG 常常是空的，那样 Python 会拿 ASCII 当控制台
 #    编码，打中文到 stdout 会报 UnicodeEncodeError（进 journald 的那一路日志就没了）。
@@ -34,7 +43,7 @@ WorkingDirectory=/opt/oopz-bot
 Environment=LANG=C.UTF-8
 Environment=PYTHONUTF8=1
 
-ExecStart=/opt/oopz-bot/.venv/bin/python bot_napcat.py
+ExecStart=/opt/qqgroupbot/.venv/bin/python bot_napcat.py
 
 # 崩了才重启（正常退出不拉起来）。改配置后用 systemctl restart 手动重启。
 Restart=on-failure

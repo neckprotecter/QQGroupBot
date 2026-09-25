@@ -1,0 +1,83 @@
+# ============================================================
+# QQGroupBot —— 机器人本体 + NapCat 协议端（同一个 compose 项目，两个服务）
+#
+# 部署步骤见 DEPLOY-Linux.md。日常命令（**都在仓库根跑**）：
+#
+#     export NAPCAT_UID=$(id -u) NAPCAT_GID=$(id -g) BOT_UID=$(id -u) BOT_GID=$(id -g)
+#     docker compose up -d --build                 # 起/更新（改了代码或依赖必须带 --build）
+#     docker compose logs -f bot                   # 跟日志
+#     docker compose exec bot python tools/mc_check.py --list-targets
+#
+# ⚠️ **两个服务为什么在同一个 compose 里**：机器人是按**服务名** `napcat:3001` 连协议端的，
+#    走的是本项目自动创建的内部网络。好处是 3001 连宿主回环都不用发布 —— 少一个暴露面，
+#    也少一次「端口被占」的争执。
+#    只想跑其中一半也行：`docker compose up -d napcat` 单起协议端（宿主 venv 那套写法要的
+#    就是这种，见 DEPLOY-Linux.md 附录）。
+#
+# ⚠️ 配置里的地址用**服务名**（`velocity:8080` / `gtnh:25575`）而不是 127.0.0.1 ——
+#    docker 的服务名只在容器网络里有 DNS，**宿主机解析不了**。机器人进了 mcnet 才能这么写，
+#    见 DEPLOY-Linux.md 第 8 节。
+# ============================================================
+
+services:
+  # ----------------------------------------------------------
+  # NapCat 协议端：用个人 QQ 号模拟登录，把消息包装成 OneBot v11
+  # ----------------------------------------------------------
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: qqgroupbot-napcat
+    restart: unless-stopped
+    environment:
+      # 让卷里的文件归你所有（不指定的话卷里是 root，后面想改配置得 sudo）
+      - NAPCAT_UID=${NAPCAT_UID:-1000}
+      - NAPCAT_GID=${NAPCAT_GID:-1000}
+      - TZ=Asia/Shanghai
+    ports:
+      # 只留 WebUI 这一条，而且**只绑回环**。6099 能扫码登录、能改这个 QQ 的所有网络配置，
+      # 放公网等于把账号交出去。远程要看就 ssh -L：
+      #     ssh -L 6099:127.0.0.1:6099 <服务器>   →  本地开 http://127.0.0.1:6099/webui
+      #
+      # 3001（OneBot 正向 WS）**故意不发布**：机器人就在同一个 compose 网络里，
+      # 按服务名直连即可。网上教程常写「云服务器要在安全组放行 6099/3001」—— 别照抄。
+      - "127.0.0.1:6099:6099"
+    volumes:
+      - ./napcat-data/config:/app/napcat/config   # NapCat 自己的网络配置（正向 WS、token 等）
+      - ./napcat-data/QQ:/app/.config/QQ          # QQ 登录会话 —— 不挂这个每次重启都要重扫码
+
+  # ----------------------------------------------------------
+  # 机器人本体
+  # ----------------------------------------------------------
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qqgroupbot-bot
+    restart: unless-stopped
+    init: true
+    # 用宿主的普通账号身份跑：才读得到那三份 600 的配置、才写得进 ./logs。
+    # 不设的话容器里是 root，落盘的日志属主也是 root。
+    # 这两个变量由 shell export 提供（compose 会拿同目录的 ./.env 做变量替换，
+    # 但 .env 里没有这两个键 —— 那是给机器人看的，别混）。
+    user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
+    environment:
+      - TZ=Asia/Shanghai
+      # ⚠️ 这里**不能**出现 HTTP_PROXY / HTTPS_PROXY：nonebot 的 aiohttp driver 是
+      #    trust_env=True，会把代理用上去，症状是连不上 ws://napcat:3001。
+    volumes:
+      - ./logs:/app/logs
+      # 三份配置**只读**挂进去（不打进镜像，见 .dockerignore）。
+      # 它们必须是宿主上真实存在、且上面那个 uid 读得到的文件 —— 缺一个机器人起不来。
+      - ./.env:/app/.env:ro
+      - ./mcs_servers.toml:/app/mcs_servers.toml:ro
+      - ./mcs_audiences.toml:/app/mcs_audiences.toml:ro
+    depends_on:
+      - napcat
+    networks:
+      - default
+      # 群组服那台的 docker 网络（MCSM 建的，已经存在，所以是 external）。
+      # 加进来是为了能用 velocity:8080 / gtnh:25575 这些服务名，见 DEPLOY-Linux.md 第 8 节。
+      - mcnet
+
+networks:
+  mcnet:
+    external: true
