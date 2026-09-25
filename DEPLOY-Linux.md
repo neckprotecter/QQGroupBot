@@ -302,11 +302,20 @@ docker compose down                 # 停（加 -v 会连卷一起删 —— **�
 > compose 挂的 `./.env:/app/.env` 保证；**附录 A 那种宿主写法要自己保证 `WorkingDirectory`**。
 > 两份 `.toml` 才是真不认 cwd 的（走 `Path(__file__)`）。
 
-改动配置之后**一定要重启**（`.env` 与两份 `.toml` 都是启动时读一次）：
+改动配置之后**一定要重启**（`.env` 与两份 `.toml` 都是启动时读一次）—— 直接用它：
 
 ```bash
-docker compose restart bot
+./restart.sh              # 改的是 .env / 两份 .toml
+./restart.sh --build      # 改了 .py 或 requirements.txt
 ```
+
+> 当然也可以自己敲 `docker compose restart bot`，但**别忘了上面那行 `export`**：
+> compose 里是 `${BOT_UID:-1000}`，不 export 就会按 1000 重建容器，而三份配置是
+> `1001` 属主、权限 `600` → 容器读不到 `/app/.env` → **机器人崩溃重启循环**。
+> `restart.sh` 把这件事连同「容器里挂的到底是不是刚改的那份文件」一起做了：它比对
+> 宿主 `.env` 与容器 `/app/.env` 的 **md5**，不一致就报警。为什么需要比：
+> 有些编辑器保存是「写新文件再改名」，普通 `restart` 可能还挂着旧 inode —— 症状是
+> **改了像没改**，而日志上完全看不出区别（配置生效了但没触发，和压根没生效，长得一样）。
 
 ---
 
