@@ -136,9 +136,21 @@ def _dedupe(targets: Sequence[ServerTarget]) -> list[ServerTarget]:
 
 # ---------------------------------------------------------------- 日志
 
-def _state_key(snap: McSnapshot) -> tuple:
+def _state_key(snap: McSnapshot, target: ServerTarget) -> tuple:
+    """取数状态的可比较形式。**必须带 target**：代理和普通服对「名单不完整」的判法不同。
+
+    代理（serves_names=False）拿不到分服名单是**设计如此，不是「不完整」** —— 见
+    mc.py 那两处 `names_complete = target.serves_names and ...`：它对代理恒为 False，
+    同时 snap.error 被清空（代理没名单不算故障，判它正常只看 reachable）。所以这里
+    若判成 "partial"，每次启动都会打一条永远为假、原因还恒为「原因未知」的告警。
+
+    真正读 names_complete 的三处（mcrender._footnote / mcdelta.reconcile /
+    tools/mc_check.py）都先看 serves_names，没有一个把代理当成「已暂停」。
+    """
     if not snap.reachable:
         return ("down",)
+    if not target.serves_names:
+        return ("ok", "n/a")
     if not snap.names_complete:
         return ("partial",)
     return ("ok", snap.names_source)
@@ -154,14 +166,20 @@ def _log_state_transition(snap: McSnapshot, target: ServerTarget) -> None:
     不带主语的日志在多目标下等于没打 —— 看日志的人不知道是哪台在报。
     """
     state = _target_state(target.id)
-    key = _state_key(snap)
+    key = _state_key(snap, target)
     if key == state.last_state:
         return
     state.last_state = key
     if key[0] == "ok":
-        logger.info(
-            "MC {} 名单来源 {}（完整，{} 人在线）", target.name, snap.names_source, snap.count
-        )
+        if snap.names_source == "n/a":
+            # 代理的正常态。别说「名单来源 n/a（完整）」那种话 —— 它本来就不出分服
+            # 名单，名册在它的子服那几台上，所以这一句只报人数、并点明名义。
+            logger.info("MC {} 正常（{} 人在线；这台不出分服名单，名册在它的子服上）",
+                        target.name, snap.count)
+        else:
+            logger.info(
+                "MC {} 名单来源 {}（完整，{} 人在线）", target.name, snap.names_source, snap.count
+            )
     elif key[0] == "partial":
         logger.warning(
             "MC {} 名单不完整，它的进服提醒已暂停：{}", target.name, snap.error or "原因未知"
