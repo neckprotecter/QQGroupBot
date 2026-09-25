@@ -636,6 +636,37 @@ port = 25565
             '[[targets]]\nid="a"\nkind="standalone"\nhost="h"\nport=true\n',
             "必须是整数",
         ),
+        # ↓ transit（中转服）的四条：它只对「配了 api 的代理」有意义，四种写错法都是
+        #   **配了却没生效**那一类 —— 表现只是「人数偏大」，看不出异样，所以都要拦住。
+        (
+            "transit 写在非代理上",
+            '[[targets]]\nid="a"\nkind="standalone"\nhost="h"\nport=1\ntransit=["limbo"]\n',
+            "只有 kind",
+        ),
+        (
+            "transit 但没有 api（代理只走 SLP）",
+            '[[targets]]\nid="p"\nkind="proxy"\nhost="h"\nport=1\ntransit=["limbo"]\n',
+            "没有 api 段",
+        ),
+        (
+            "transit 点名了自己挂着的子服",
+            '[[targets]]\nid="p"\nkind="proxy"\nhost="h"\nport=1\n'
+            'api={url="http://h:1",token="t"}\ntransit=["limbo"]\n'
+            '[[targets]]\nid="l"\nkind="backend"\nsource="p"\nsource_key="limbo"\n',
+            "我们的目标 l",
+        ),
+        (
+            "transit 里名字重复（会扣两次）",
+            '[[targets]]\nid="p"\nkind="proxy"\nhost="h"\nport=1\n'
+            'api={url="http://h:1",token="t"}\ntransit=["limbo","limbo"]\n',
+            "重复",
+        ),
+        (
+            "transit 写成字符串（不是数组）",
+            '[[targets]]\nid="p"\nkind="proxy"\nhost="h"\nport=1\n'
+            'api={url="http://h:1",token="t"}\ntransit="limbo"\n',
+            "必须是字符串数组",
+        ),
         # ↓ 四条迁移报错：旧键还在全量表里。**按键存在判、不看值** —— 空表
         #   `[whitelist]` 与 `primary = ""` 同样要报，否则「删干净了」只是错觉。
         #   报错必须点出新家（mcs_audiences.toml），只说不认识的键等于没说。
@@ -1507,7 +1538,9 @@ source_key = "bingo-s2"
     if not ok:
         print(f"         实际: {text!r}")
     # 「没开通」与「开通了但没服」是两件事，群里要能分辨：混成一句的话，建筑群
-    # 会被告知「本群还没有开通」，而它明明是开通的、只是还没服。
+    # 会被告知「本群还没有开通此功能」，而它明明是开通的、只是还没服。
+    # 只断言「还没有开通」这四个字：NO_AUDIENCE 后面跟的是「此功能」还是别的，
+    # 是文案层面的事，这句测的是「两条路没混成一句」。
     ok = NO_TARGETS != NO_AUDIENCE and "还没接入" in NO_TARGETS and "还没有开通" in NO_AUDIENCE
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  「没关联服」与「没开通」是两句不同的话")
@@ -2742,52 +2775,58 @@ watch   = true
     # 进服模板有 4 句，随机挑一句属于「体验」，不属于要钉的东西 —— 而随机性会让
     # 逐字断言变成碰运气。整个块换成固定模板（结束前还原）。
     _tpl_saved = _mr._JOIN_TEMPLATES
-    _mr._JOIN_TEMPLATES = ["🎮 {who} 加入了{where}（当前 {count} 人在线）"]
+    _mr._JOIN_TEMPLATES = ["🎮 {who} 加入了「{where}」"]
 
     _T2 = [_t("gtnh", "GTNH"), _t("bingo", "Bingo"), _t("backstabbed", "谁是杀手")]
     _NOW = _dt(2026, 9, 21, 14, 32)
 
+    # 分隔虚线的逐字形状（在 mcrender._SEP 里定）。刻意**不**引用 _mr._SEP：
+    # 那会变成同义反复（线型改成什么样这条都过），而这里要钉的正是它长什么样。
+    _LINE = "- - - - - - - - - -"
+
     # ① 没有事件就别发消息（空消息在群里是一行空白，比不发更糟）
-    text, clipped = _fe([], _T2, now=_NOW)
+    text, clipped = _fe([], _T2)
     ok = text is None and clipped is False
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  零事件 → None")
 
-    # ② 单个进服：**逐字**等于今天那句（DEPLOY.md / README.md 引用着它）
-    text, clipped = _fe([_PE(KIND_JOIN, "阿伟", "bingo", count=3)], _T2, now=_NOW)
-    ok = text == "🎮 阿伟 加入了 Bingo（当前 3 人在线）" and not clipped
+    # ② 单个进服 → 一行：服名带「」（DEPLOY.md 引用着这个形状）、不报人数。
+    #    count=3 传进去却断言输出里没有数字，正是「动态消息不报人数」那条规则。
+    text, clipped = _fe([_PE(KIND_JOIN, "阿伟", "bingo", count=3)], _T2)
+    ok = text == "🎮 阿伟 加入了「Bingo」" and not clipped
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  单个进服 → 旧文案一字不改：{text!r}")
+    print(f"   {'PASS' if ok else 'FAIL'}  单个进服 → 一行、服名带「」、不报人数：{text!r}")
 
-    # ③ 三台服都有事件 → 每台一个【服名】块，块顺序 = 传入的 targets 顺序
+    # ③ 三台服都有事件 → 每台一段（段顺序 = 传入的 targets 顺序），段间画虚线。
+    #    **没有消息标题、没有【服名】块头、行内自带服名**（2026-09-25 用户要求）：
+    #    逐字相等同时钉住了这四件事 —— 标题和块头一旦回来，这里立刻红。
     events = [
         _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
         _PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5),
         _PE(KIND_JOIN, "小红", "bingo", count=9),
     ]
-    text, _ = _fe(events, _T2, now=_NOW)
+    text, _ = _fe(events, _T2)
     want = "\n".join([
-        "🎮 MC 动态 · 14:32",
-        "【GTNH】",
-        "  🎮 阿伟 加入了（当前 3 人在线）",
-        "【Bingo】",
-        "  🔄 小明 从「谁是杀手」换服过来（当前 5 人在线）",
-        "  🎮 小红 加入了（当前 9 人在线）",
+        "🎮 阿伟 加入了「GTNH」",
+        _LINE,
+        "🔄 小明 从「谁是杀手」换到「Bingo」",
+        "🎮 小红 加入了「Bingo」",
     ])
     ok = text == want
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  多台服合成一条：块按 targets 顺序、换服行在进服行之前")
+    print(f"   {'PASS' if ok else 'FAIL'}  多台服合成一条：段按 targets 顺序、换服行在进服行之前、段间虚线、无标题无块头")
     if not ok:
         print(f"         期望:\n{want}\n         实际:\n{text}")
 
     # ④ 纯退服 → 不进消息。**对账层照样产出它**（块 19 有一条用例钉着），
     #    这里是推送层说「不推」的地方 —— 哪天要开退服提醒，改的就是这一处。
-    text, _ = _fe([_PE(KIND_LEAVE, "小明", "bingo", count=2)], _T2, now=_NOW)
+    text, _ = _fe([_PE(KIND_LEAVE, "小明", "bingo", count=2)], _T2)
     ok = text is None
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  纯退服 → 不发消息（对账层有它，推送层丢它）")
 
-    # ⑤ 退服不产生行，也**不改变**其余行的顺序/内容 —— 混进来时不能顺手多带一行
+    # ⑤ 退服不产生行，也**不改变**其余行的顺序/内容 —— 混进来时不能顺手多带一行。
+    #    换服只落在**到达**的那台（mcdelta 的 target_id 定义），来源服那段里没有半行。
     text, _ = _fe(
         [
             _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
@@ -2795,59 +2834,110 @@ watch   = true
             _PE(_SW, "小红", "bingo", origin_id="gtnh", count=5),
         ],
         _T2,
-        now=_NOW,
     )
     want = "\n".join([
-        "🎮 MC 动态 · 14:32",
-        "【GTNH】",
-        "  🎮 阿伟 加入了（当前 3 人在线）",
-        "【Bingo】",
-        "  🔄 小红 从「GTNH」换服过来（当前 5 人在线）",
+        "🎮 阿伟 加入了「GTNH」",
+        _LINE,
+        "🔄 小红 从「GTNH」换到「Bingo」",
     ])
     ok = text == want and "小明" not in text
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  退服不占行、不影响其余行（同一份事件里混着也不乱）")
+    print(f"   {'PASS' if ok else 'FAIL'}  退服不占行、不影响其余行；换服只落在到达的那台")
     if not ok:
         print(f"         期望:\n{want}\n         实际:\n{text}")
 
-    # ⑥ 单个换服：没有旧文案可留，所以哪怕只有一个事件也走合成排版
-    text, _ = _fe([_PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5)], _T2, now=_NOW)
-    ok = text == "\n".join([
-        "🎮 MC 动态 · 14:32",
-        "【Bingo】",
-        "  🔄 小明 从「谁是杀手」换服过来（当前 5 人在线）",
-    ])
+    # ⑥ 单个换服 → 一行，两端服名都在行里（2026-09-25 用户要求）。
+    #    **没有标题、没有块头、不报人数** —— 原来那句「从「X」换服过来」必须配着
+    #    【服名】块头才读得懂「过来」是过到哪台，一条事件占三行，用户嫌刷屏；
+    #    而「当前 N 人在线」在换服时几乎恒为 1，写了等于没写。
+    text, _ = _fe([_PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5)], _T2)
+    ok = text == "🔄 小明 从「谁是杀手」换到「Bingo」"
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  单个换服 → 合成排版里的「从「X」换服过来」一行")
+    print(f"   {'PASS' if ok else 'FAIL'}  单个换服 → 一行、两端服名、不带块头与人数：{text!r}")
     if not ok:
         print(f"         实际:\n{text}")
 
-    # ⑦ 掉线 / 恢复单个事件也走旧文案（DEPLOY 与 README 同样引用着这两句）
-    text, _ = _fe([_SE("bingo", down=True, streak=2, why="连不上了")], _T2, now=_NOW)
-    ok = text == "⚠️ Bingo 连不上了（已连续 2 轮探测失败）"
+    # ⑥b 两台服各一次换服 → 两段之间画虚线。**段的分界只剩这条线**（没块头了），
+    #     所以它必须画；同时钉住「一段里不重复画线」（只有一行虚线）。
+    text, _ = _fe(
+        [
+            _PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5),
+            _PE(_SW, "小红", "gtnh", origin_id="bingo", count=4),
+        ],
+        _T2,
+    )
+    want = "\n".join([
+        "🔄 小红 从「Bingo」换到「GTNH」",
+        _LINE,
+        "🔄 小明 从「谁是杀手」换到「Bingo」",
+    ])
+    ok = text == want
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  单个掉线 → 旧文案一字不改：{text!r}")
+    print(f"   {'PASS' if ok else 'FAIL'}  两台服的换服各占一段、中间画虚线")
+    if not ok:
+        print(f"         期望:\n{want}\n         实际:\n{text}")
 
-    text, _ = _fe([_SE("bingo", down=False, count=5)], _T2, now=_NOW)
-    ok = text == "✅ Bingo 已恢复，当前 5 人在线"
+    # ⑦ 掉线 / 恢复各一行，**不带失败轮数、不带人数**（2026-09-25 用户要求）。
+    #    streak=2 / count=5 都是为了让「输出里没有数字」这条断言有分量：值都传进去了。
+    text, _ = _fe([_SE("bingo", down=True, streak=2, why="连不上了")], _T2)
+    ok = text == "⚠️ Bingo 连不上了"
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  单个恢复 → 旧文案一字不改：{text!r}")
+    print(f"   {'PASS' if ok else 'FAIL'}  单个掉线 → 一行、不报失败轮数：{text!r}")
 
-    # ⑧ 状态跃迁混进合成消息时，服名由【】块头承担，所以行内不再重复服名 ——
-    #    重复的症状是「【Bingo】/ ⚠️ Bingo 连不上了」，同一个名字一行里出现两次
+    text, _ = _fe([_SE("bingo", down=False, count=5)], _T2)
+    ok = text == "✅ Bingo 已恢复"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  单个恢复 → 一行、不报人数：{text!r}")
+
+    # ⑧ 状态跃迁混进合成消息时，行内**照样**带服名（块头已经没有了，不在这里写就没处写），
+    #    并且延续「应答异常」与「连不上了」分开说的老规矩。
     text, _ = _fe(
         [
             _SE("bingo", down=True, streak=2, why="应答异常"),
             _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
         ],
         _T2,
-        now=_NOW,
     )
-    ok = "  ⚠️ 应答异常（已连续 2 轮探测失败）" in text and "Bingo 应答异常" not in text
+    want = "\n".join([
+        "🎮 阿伟 加入了「GTNH」",
+        _LINE,
+        "⚠️ Bingo 应答异常",
+    ])
+    ok = text == want
     failed += not ok
-    print(f"   {'PASS' if ok else 'FAIL'}  合成排版里状态行不重复服名，且区分「应答异常」")
+    print(f"   {'PASS' if ok else 'FAIL'}  状态行也带服名、不报轮数，且区分「应答异常」")
     if not ok:
-        print(f"         实际:\n{text}")
+        print(f"         期望:\n{want}\n         实际:\n{text}")
+
+    # ⑧b 四种行（进服 / 换服 / 掉线 / 恢复）混在一轮里，**逐字**断言它们都不带数字。
+    #     单独再钉一条是因为上面各条只钉自己那一句，而规则是「整条消息一个数字都没有」
+    #     —— 有人往任何一句里加回「（当前 N 人）」都被这条抓住。
+    #     判据用「不带『当前』『已连续』」而不是 `isdigit()`：**玩家名里是可以有数字的**
+    #     （真实案例 VulCaN9），拿 isdigit 当判据会在有人给测试换名字时莫名其妙地红。
+    text, _ = _fe(
+        [
+            _PE(KIND_JOIN, "阿伟", "gtnh", count=3),
+            _PE(_SW, "小明", "bingo", origin_id="backstabbed", count=5),
+            _PE(KIND_JOIN, "小红", "bingo", count=9),
+            _SE("gtnh", down=True, streak=12, why="连不上了"),
+            _SE("backstabbed", down=False, count=7),
+        ],
+        _T2,
+    )
+    want = "\n".join([
+        "🎮 阿伟 加入了「GTNH」",
+        "⚠️ GTNH 连不上了",
+        _LINE,
+        "🔄 小明 从「谁是杀手」换到「Bingo」",
+        "🎮 小红 加入了「Bingo」",
+        _LINE,
+        "✅ 谁是杀手 已恢复",
+    ])
+    ok = text == want and "当前" not in text and "已连续" not in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  四种行混在一轮：都不带人数与失败轮数，段间虚线照画")
+    if not ok:
+        print(f"         期望:\n{want}\n         实际:\n{text}")
 
     # ⑨ 播报：一台有人 + 一台 0 人 + 一台不可达 → **照发**，三台各一块。
     #    这是本期行为变更的核心：单目标时代「0 人 → 整条不发」在多目标下没道理，
@@ -3134,6 +3224,104 @@ source_key = "creative"
     )
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  接口 2 人 / SLP 7 人 → 按 SLP 报并标注接口可疑")
+    if not ok:
+        print(f"         人数={snaps[0].count} 来源={snaps[0].count_source} error={snaps[0].error!r}")
+
+    # ③b 中转服（transit）上的人不算进「全群组」。
+    #     用户看到的原始症状：总览里「【群组服】全群组 2 人」，下面几台子服加起来 1 人
+    #     ——差额是站在 limbo 里的那个。数字本身没错，但它回答的是「连着代理的有几个」，
+    #     不是群里想知道的「有几个在玩」。
+    _T_T = parse_book(_API_TOML.replace(
+        'api  = { url = "http://127.0.0.1:8080", token = "t" }',
+        'api  = { url = "http://127.0.0.1:8080", token = "t" }\ntransit = ["limbo"]',
+    ))
+    _t_szu, _t_bingo = _T_T.get("szu"), _T_T.get("bingo")
+    _lobby_limbo = _status(proxy=2, servers=[("lobby", 1, ("Rcwalter",)), ("limbo", 1, ("Lychee",))])
+
+    snaps, _ = _run_api([_t_szu], status=_lobby_limbo, slp={"szu": _slp_ok(2)})
+    ok = (
+        snaps[0].count == 1
+        and "扣掉中转服 limbo 1 人" in snaps[0].error
+        and _t_szu.transit == ("limbo",)
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  transit：中转服的人从「全群组」里扣掉（2 → 1）")
+    if not ok:
+        print(f"         人数={snaps[0].count} transit={_t_szu.transit} error={snaps[0].error!r}")
+
+    # ③c 扣减要能**扛住 SLP 那条分支**：SLP 报的也是「连着代理的有几个」，两边都含
+    #     中转服的人。只在接口那条分支上扣，SLP 一成功就把人带回来了（而且很隐蔽：
+    #     接口拿不到数据时才对，接口一通就不对）。
+    snaps, _ = _run_api(
+        [_t_szu],
+        status=_status(proxy=5, servers=[("lobby", 4, ("A",)), ("limbo", 1, ("L",))]),
+        slp={"szu": _slp_ok(5)},
+    )
+    ok = snaps[0].count == 4 and snaps[0].count_source == "slp" and "扣掉中转服" in snaps[0].error
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  transit：走 SLP 那条分支也照样扣")
+    if not ok:
+        print(f"         人数={snaps[0].count} 来源={snaps[0].count_source} error={snaps[0].error!r}")
+
+    # ③d 对不上号的名字**不能静默**：对方改了 velocity.toml 的服名、或那台中转服这次
+    #     没起，都会走到这里。扣不掉的表现是「人数偏大」，而偏大在群里看不出异样。
+    snaps, _ = _run_api(
+        [_t_szu],
+        status=_status(proxy=4, servers=[("lobby", 3, ("A", "B", "C")), ("hub", 1, ("D",))]),
+        slp={"szu": _slp_ok(4)},
+    )
+    ok = (
+        snaps[0].count == 4
+        and "limbo 不在接口的子服列表里" in snaps[0].error
+        and "hub" in snaps[0].error  # 候选清单要打出来，照着改
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  transit：名字对不上 → 照报原数并说明扣不掉")
+    if not ok:
+        print(f"         人数={snaps[0].count} error={snaps[0].error!r}")
+
+    # ③e transit 的点名与「接口与 SLP 对不上」那条对照互不干扰：后者问的是「对方插件
+    #     算错了吗」，拿我们自己的口径（扣减后）去比，等于把唯一能发现对方算错的地方
+    #     抹掉 —— 报出去的人数可以是我们修过的，但「接口说了几」必须是原话。
+    snaps, _ = _run_api(
+        [_t_szu],
+        status=_status(proxy=2, servers=[("lobby", 1, ("A",)), ("limbo", 1, ("L",))]),
+        slp={"szu": _slp_ok(5)},
+    )
+    ok = (
+        snaps[0].count == 4  # SLP 5 - 中转 1
+        and "接口 2" in snaps[0].error  # 原话，不是扣减后的「接口 1」
+        and "SLP 5" in snaps[0].error
+    )
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  transit：与「接口/SLP 对不上」的对照互不干扰")
+    if not ok:
+        print(f"         人数={snaps[0].count} error={snaps[0].error!r}")
+
+    # ③f 中转服上没人时什么都不扣、也不留一句噪音备注
+    snaps, _ = _run_api(
+        [_t_szu],
+        status=_status(proxy=1, servers=[("lobby", 1, ("A",)), ("limbo", 0, ())]),
+        slp={"szu": _slp_ok(1)},
+    )
+    ok = snaps[0].count == 1 and snaps[0].error == ""
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  transit：中转服没人时不扣、也不备注")
+    if not ok:
+        print(f"         人数={snaps[0].count} error={snaps[0].error!r}")
+
+    # ③g transit 只作用于代理那一行：子服的人数一个都不能扣（扣减只在
+    #     _api_hub_snapshot 里做）。扣错了的表现是「某台子服的人数莫名其妙少 1」。
+    snaps, _ = _run_api(
+        [_t_bingo],
+        status=_status(proxy=3, servers=[("bingo", 2, ("A", "B")), ("limbo", 1, ("L",))]),
+        slp={"szu": _slp_dead},
+    )
+    ok = snaps[0].count == 2 and snaps[0].names == ["A", "B"]
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  transit：只影响代理那一行（子服照旧）")
+    if not ok:
+        print(f"         人数={snaps[0].count} 名单={snaps[0].names}")
     if not ok:
         print(f"         人数={snaps[0].count} 来源={snaps[0].count_source} error={snaps[0].error!r}")
 
@@ -3630,12 +3818,14 @@ async def _api(audience: str = "", query: str = "") -> int:
     每台服是什么样」，这边问的是「接口到底给了什么」。接口的形状是**对方**实现的，
     一旦他们改了字段名或路径，那边只会表现成「某几台取不到数据」，看不出是哪一步错的。
 
-    这一条最有用的是最后那行漏挂清单：接口里有、而我们的表里一台都没挂的子服
-    （lobby / limbo 这种）。它们不会出现在任何别的地方 —— 不挂就不会被探测，
-    也就不会报错，只是「在线人数里少了几个人」这种谁都不会注意到的偏差。
+    这一条最有用的是最后那两行清单：接口里有、而我们一台都没挂的子服（[未挂]），
+    以及代理 `transit` 里点名过的中转服（[中转]）。前者不挂就不会被探测，也就不会
+    报错，只是「在线人数里少了几个人」这种谁都不会注意到的偏差；后者的名字一旦和
+    对方 velocity.toml 对不上，只是「人数没扣掉」——同样是看不出来的偏差。
 
     `query` 收窄到某一个接口型目标（按服名解析，和群里同一套名字）。
     """
+    from plugins_napcat._shared import mc as _mc
     from plugins_napcat._shared import mcbridge
     from plugins_napcat._shared.mcaudiences import default_config
     from plugins_napcat._shared.mcservers import ServerConfigError
@@ -3709,13 +3899,28 @@ async def _api(audience: str = "", query: str = "") -> int:
         tracked = {
             t.source_name for t in full.targets if t.source == hub.id
         }
-        print(f"   /status    → 全群组 {status.proxy_online} 人，{len(status.servers)} 台子服")
+        # 中转服：配在 hub 的 transit 里，人数要从「全群组」里扣掉（见 mc._transit_count）。
+        # 名字写错的表现只是「人数没扣掉」，所以这里逐个对号，并跟下面那张「没挂」的
+        # 清单分开说 —— 它们不是漏挂，是**故意不挂**的。
+        transit = set(hub.transit)
+        excluded, note = _mc._transit_count(hub, status)
+        head = f"   /status    → 全群组 {status.proxy_online} 人"
+        if excluded:
+            head += f"（扣掉中转服 {excluded} 人 → 群里报 {max(0, status.proxy_online - excluded)} 人）"
+        print(f"{head}，{len(status.servers)} 台子服")
         for server in status.servers:
-            mark = "[已挂]" if server.name in tracked else "[未挂]"
+            if server.name in transit:
+                mark = "[中转]"
+            else:
+                mark = "[已挂]" if server.name in tracked else "[未挂]"
             names = "、".join(server.players)
             tail = f"　{names}" if names else ""
             print(f"     {mark} {server.name:12s} {server.online} 人{tail}")
-        missing = [s.name for s in status.servers if s.name not in tracked]
+        if note:
+            print(f"   [i] {note}")
+        missing = [
+            s.name for s in status.servers if s.name not in tracked and s.name not in transit
+        ]
         if missing:
             # 不挂的子服**不会报错**，只会让人数悄悄少一块 —— 所以要点名说出来
             print(
@@ -3980,6 +4185,13 @@ def _list_targets() -> int:
               f"超时 SLP {t.timeout:g}s / RCON {t.rcon_timeout:g}s")
         if t.is_api:
             print("      （代理：接口给整组数据，全群组人数不进分服合计）")
+            if t.transit:
+                # 名字与对方 velocity.toml 对不上时什么都不会发生 —— 扣不掉的表现是
+                # 「人数偏大」，而偏大在群里看不出异样。所以这里必须点名打出来。
+                print(
+                    f"      （中转服 {'、'.join(t.transit)}：它们的人从「全群组」里扣掉，"
+                    f"名字要与对方 velocity.toml 逐字相同）"
+                )
         elif t.source:
             print(f"      （子服：数据从 {t.source} 的接口取，自己不发请求）")
         elif not t.serves_names:

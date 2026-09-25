@@ -30,7 +30,7 @@ def feature_list() -> str:
     oopz 那行**按实际情况加**：没装 SDK 还列着「@我 oopz」，等于指着一个用不了的
     命令（虽然它会回一句解释，但引导语不该把人往那儿引）。
     """
-    lines = ["🤖 我是塔萨小助手，可用指令：\n"]
+    lines = ["🤖 我是小助手，可用指令：\n"]
     if _oopz_available():
         lines.append("· “@我 oopz” —— 查看 oopz 在线列表\n")
     lines.append("· “@我 mc” —— 查看 Minecraft 服务器在线列表\n")

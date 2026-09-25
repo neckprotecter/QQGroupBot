@@ -34,13 +34,19 @@ NO_TARGETS = "🏗️ 本群关联的服务器还没接入，暂时没有可查�
 # 「本群压根没写进 mcs_audiences.toml」。末尾那句指路很重要：没开通的群里，任何含
 # mc / 我的世界 / 服务器 的 @ 消息都会被 MC 插件认领（触发词子串匹配），hello 的
 # 功能引导因此被抑制，得在这里把人接回去。
-NO_AUDIENCE = "🤔 本群还没有开通 MC 查询。其它功能可以发「@机器人 你好」看看。"
+# 说「此功能」而不是「MC 查询」：这条文案**查询和白名单管理共用**，而 whitelist 命令
+# 打在没开通的群里回一句「还没有开通 MC 查询」是把功能说串了（2026-09-25 用户要求）。
+NO_AUDIENCE = "🤔 本群还没有开通此功能。其它功能可以发「@机器人 你好」看看。"
 
-# 跨 group 之间的分隔线（2026-09-23 用户要求：模组服 GTNH 和群组服分开）。
+# 分区虚线。两处用它、线型只有这一份：
+# - 总览 / 播报：画在**跨 group** 的两个块之间（2026-09-23 用户要求：模组服 GTNH
+#   和群组服分开）；
+# - MC 动态（进服提醒）：画在**每两台服**的段之间（2026-09-25 用户要求：块头去掉
+#   之后，服与服的分界只剩这一条线）。
 # 用最朴素的 ASCII 连字符加空格，不用「┄」「┈」「─」那类制表/box-drawing 虚线：
 # 那几个码点在部分安卓 QQ 的字体里是豆腐块，而这条线唯一的作用就是分区。
 # 长度对齐播报里那条 ━ 实线（10 个全角宽 ≈ 20 个半角）。
-_GROUP_SEP = ("- " * 10).strip()
+_SEP = ("- " * 10).strip()
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,10 @@ def _summary_block(row: Row, budget: int) -> list[str]:
         # 各子服的数字，「全群组」三个字已经说明它不在那个口径里了，括号那半句只是噪音。
         # 明细视图（render_detail，见本文件 :87）里那句解释**保留**：那边是整份模板套上去，
         # 没有上面这些兄弟行当上下文，读的人需要被明说一次。
+        #
+        # 这个数**可能已经被扣掉了中转服**（`target.transit`，见 mc._transit_count）：
+        # 那也是刻意的 —— 群里要看的是「有几个在玩」，不是「连着代理的有几个」。
+        # 标签仍然写「全群组」，不为此再加一句括号（同一个理由：噪音）。
         return [f"{label}全群组 {snap.count} 人{tail}"]
 
     body = snap.count
@@ -241,7 +251,7 @@ def _block_lead(row: Row, prev_group: str | None) -> list[str]:
     改线型或改判据时一定会只改一边。
     """
     if prev_group is not None and row.target.group != prev_group:
-        return [_GROUP_SEP]
+        return [_SEP]
     return []
 
 
@@ -447,17 +457,16 @@ def render_whitelist_list(
 # 一轮内进服人数达到这个数就合并成一条，避免刷屏
 _BURST = 3
 
-# **进服那一行只有这一份模板**，单事件与合成排版都从它来。
-# 拆成「有服名」和「无服名」两套的后果是两边迟早只改一边，同一个动作在
-# 群里两种说法。
-#
-# {where} 展开成「 Bingo」或空串（空串时服名已经写在【】块头里）——
-# 因为它在句子中间，用「拼完再删掉服名」那种做法会留下多余空格。
+# **进服那一行只有这一份模板**。{where} 展开成服名，模板自己带「」——
+# 与换服行（`从「A」换到「B」`）同一套引号，中文服名（大厅 / 谁是杀手）不带引号时
+# 会和前面的词连成一片读不断句。
+# **不报人数**（2026-09-25 用户要求）：动态消息里一个数字都没有，人数只在定时播报
+# 与 @mc 查询里出现（那两处报的是「现在几个人可以一起玩」，这里报的是「谁来了」）。
 _JOIN_TEMPLATES = [
-    "🎮 {who} 加入了{where}（当前 {count} 人在线）",
-    "🚪 {who} 溜进了{where}（当前 {count} 人在线）",
-    "⛏️ {who} 上线了{where}（当前 {count} 人在线）",
-    "🌍 {who} 出现在了{where}（当前 {count} 人在线）",
+    "🎮 {who} 加入了「{where}」",
+    "🚪 {who} 溜进了「{where}」",
+    "⛏️ {who} 上线了「{where}」",
+    "🌍 {who} 出现在了「{where}」",
 ]
 
 
@@ -470,18 +479,14 @@ def _who(names: Sequence[str]) -> str:
     return f"{names[0]}、{names[1]} 等 {len(names)} 人"
 
 
-def _join_line(who: str, count: int, server_name: str = "") -> str:
-    """进服那一行。server_name 留空 = 服名由【】块头承担（合成排版）。"""
-    return random.choice(_JOIN_TEMPLATES).format(
-        who=who, where=f" {server_name}" if server_name else "", count=count
-    )
+def _join_line(who: str, server_name: str) -> str:
+    """进服那一行。server_name 不再是可省的 —— 块头已经没有了。"""
+    return random.choice(_JOIN_TEMPLATES).format(who=who, where=server_name)
 
 
 def format_events(
     events: Sequence[PlayerEvent | StatusEvent],
     targets: Sequence[ServerTarget],
-    *,
-    now: datetime | None = None,
 ) -> tuple[str | None, bool]:
     """把一轮（或几轮合并后）的事件拼成**一条**推给一个群的消息。
 
@@ -492,16 +497,25 @@ def format_events(
     **退服不推**（沿用既有产品决策）：leave 事件在对账层（mcdelta）照常产出，
     在这里被丢掉。哪天要开退服提醒，改的是这里，不是对账层。
 
-    两类排版，规则只有一条：
+    排版只有一套（2026-09-25 用户要求，之前是「单事件走单条模板 / 多事件走【服名】块」
+    两套）：
 
-    > 整条消息只有 1 个事件、且它不是「换服」时，逐字沿用旧文案；
-    > 其余一律走【服名】块 + 两空格缩进行的合成排版。
+    > 每台服一段，段内一行一件事，**行内自带服名**；段与段之间画一条虚线。
+    > 没有消息标题，没有【服名】块头，也不带时间。
 
-    这样让 DEPLOY / README 引用的那三句（`🎮 X 加入了 Bingo（当前 3 人在线）`、
-    `⚠️ Bingo 连不上了（已连续 2 轮探测失败）`、`✅ Bingo 已恢复，当前 5 人在线`）
-    一字不改地继续成立，而它们是 99% 的情况 —— 为一个人进服这种最常见的事套一层
-    排版，是拿最常见的情况去迁就最少见的。换服（switch）是本期的全新事物，没有旧
-    文案要保，所以无论几个事件都走合成排版。
+    **行内带服名是把两套排版合成一套的关键**：块头没了之后，进服行和状态行再没有
+    别的地方能说清「哪台服」（换服行本来就两端都写在行里）。于是「只有一个人进服」
+    这种最常见的情况和「三台服各有动静」走的是同一段代码，不再有「同一个动作在群里
+    两种说法」的余地 —— 这也正是本模块开头那句「模板只有一份」的取向。
+
+    位置按**玩家最后待在哪台**排：进服落在进的那台、换服落在**到达**的那台（与
+    mcdelta 的 target_id 定义一致），所以一个人换服不会在来源服那边留下半行。
+
+    **整条消息一个数字都没有**（2026-09-25 用户要求）。原来那三句各带一个括号
+    （`（当前 N 人在线）`、`（已连续 N 轮探测失败）`），今天全部去掉：人数只在**定时
+    播报**与 **@mc 查询**里报 —— 那两处回答的是「现在有几个人可以一起玩」，而这里
+    回答的是「谁来了 / 谁走了」，进服时那台往往就 1～2 人，写在每条后面是噪音；
+    失败轮数只有看日志的人用得上。
     """
     shown = [
         e for e in events if not (isinstance(e, PlayerEvent) and e.kind == KIND_LEAVE)
@@ -510,13 +524,7 @@ def format_events(
         return None, False
 
     name_of = {t.id: t.name for t in targets}
-
-    if len(shown) == 1:
-        solo = _solo_text(shown[0], name_of)
-        if solo is not None:
-            return solo, False
-
-    text = _composite(shown, targets, name_of, now)
+    text = _composite(shown, targets, name_of)
     if len(text) > MAX_LEN:
         return truncate(text), True
     return text, False
@@ -527,25 +535,10 @@ def _name_of(target_id: str, name_of: dict[str, str]) -> str:
     return name_of.get(target_id, target_id)
 
 
-def _solo_text(event: PlayerEvent | StatusEvent, name_of: dict[str, str]) -> str | None:
-    """单个事件时的旧文案。返回 None = 这个事件没有旧文案，得走合成排版。"""
-    name = _name_of(event.target_id, name_of)
-    if isinstance(event, StatusEvent):
-        if event.down:
-            # 「答了但答不对」（多半是刚启动还在加载）和「连不上」分开说：
-            # 一律叫「连不上了」会让人去开服，而它其实正开着。
-            return f"⚠️ {name} {event.why}（已连续 {event.streak} 轮探测失败）"
-        return f"✅ {name} 已恢复，当前 {event.count} 人在线"
-    if event.kind == KIND_JOIN:
-        return _join_line(event.player, event.count, name)
-    return None  # 换服
-
-
 def _composite(
     events: Sequence[PlayerEvent | StatusEvent],
     targets: Sequence[ServerTarget],
     name_of: dict[str, str],
-    now: datetime | None,
 ) -> str:
     buckets: dict[str, list[PlayerEvent | StatusEvent]] = {}
     for event in events:
@@ -556,42 +549,53 @@ def _composite(
     # 丢掉的话症状是「某个群少收到一台服的提醒」，而消息本身看着完全正常。
     ids = sorted(buckets, key=lambda tid: (order.get(tid, len(order)), tid))
 
-    lines = [f"🎮 MC 动态 · {(now or datetime.now()):%H:%M}"]
+    lines: list[str] = []
     for tid in ids:
-        # 只有出过事件的目标才有块 —— 摆一排「今天没人进服」的空块会把真正的那台埋掉
-        lines.append(f"【{_name_of(tid, name_of)}】")
-        lines.extend(_block_lines(buckets[tid], name_of))
+        # 只有出过事件的目标才有段 —— 摆一排「今天没人进服」的空段会把真正的那台埋掉
+        if lines:
+            # 段与段之间画虚线：没有块头之后，服与服的分界只剩这一条线
+            lines.append(_SEP)
+        lines.extend(_block_lines(buckets[tid], tid, name_of))
     return "\n".join(lines)
 
 
 def _block_lines(
-    events: Sequence[PlayerEvent | StatusEvent], name_of: dict[str, str]
+    events: Sequence[PlayerEvent | StatusEvent], tid: str, name_of: dict[str, str]
 ) -> list[str]:
-    """一个【服名】块里的行。行序：换服 → 进服 → 状态跃迁。
+    """一台服那一段里的行。行序：换服 → 进服 → 状态跃迁。
 
-    到达类在前（「谁来了」是这条消息存在的理由）。leave 排哪一行无从谈起 ——
+    到达类在前（「谁来了」是这段存在的理由）。leave 排哪一行无从谈起 ——
     它在 format_events 入口就被丢掉了，从来不渲染。
+
+    段内每一行都自带服名（2026-09-25 用户要求去掉块头）。服名只解析一次：`tid` 就是
+    本段的服，而换服行的**到达端必然等于它**（分桶就是按 target_id 分的）。
     """
+    name = _name_of(tid, name_of)
     lines: list[str] = []
 
-    # 换服每条单独一行（来源可能各不相同），玩家名排序让同一份输入永远同一份输出
+    # 换服每条单独一行（来源可能各不相同），玩家名排序让同一份输入永远同一份输出。
+    # 不报人数：换服时几台服往往都是「1 人在线」，写了等于没写（2026-09-25 用户要求）。
     for event in sorted(
         (e for e in events if isinstance(e, PlayerEvent) and e.kind == KIND_SWITCH),
         key=lambda e: e.player,
     ):
         origin = _name_of(event.origin_id, name_of)
-        lines.append(f"  🔄 {event.player} 从「{origin}」换服过来（当前 {event.count} 人在线）")
+        lines.append(f"🔄 {event.player} 从「{origin}」换到「{name}」")
 
     joins = [e for e in events if isinstance(e, PlayerEvent) and e.kind == KIND_JOIN]
     if joins:
-        # 人数取**最后一个** join 的：限流窗口把几轮并到一起时，后者才是最新的快照。
         # 名字排序是为了输出稳定 —— 顺序每轮乱跳的话，同一条消息看着像新的一条。
-        lines.append(f"  {_join_line(_who(sorted(e.player for e in joins)), joins[-1].count)}")
+        # 多人合并也靠 _who，不再涉及人数（见 _JOIN_TEMPLATES 那段）。
+        lines.append(_join_line(_who(sorted(e.player for e in joins)), name))
 
     for event in (e for e in events if isinstance(e, StatusEvent)):
         if event.down:
-            lines.append(f"  ⚠️ {event.why}（已连续 {event.streak} 轮探测失败）")
+            # 「答了但答不对」（多半是刚启动还在加载）和「连不上」分开说：
+            # 一律叫「连不上了」会让人去开服，而它其实正开着。
+            # 不报连续失败轮数（2026-09-25 用户要求）：群里要的是「去开服」这个动作，
+            # 「第 2 轮」只有看日志的人用得上，日志里也有。
+            lines.append(f"⚠️ {name} {event.why}")
         else:
-            lines.append(f"  ✅ 已恢复（当前 {event.count} 人在线）")
+            lines.append(f"✅ {name} 已恢复")
 
     return lines

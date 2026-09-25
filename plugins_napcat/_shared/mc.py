@@ -642,6 +642,7 @@ def _api_snapshot(
     names: list[str],
     slp: _SlpProbe | None,
     note: str = "",
+    exclude: int = 0,
 ) -> McSnapshot:
     """把「接口给的人数/名单」与「（可选的）SLP 复查」合成一份快照。
 
@@ -655,6 +656,10 @@ def _api_snapshot(
 
     接口这条路**没有 SLP sample 那条降级**：子服的名单是代理给的（权威且完整），
     不完整就是对方的问题，用随机的 sample 去补只会把「对方少报了人」掩盖掉。
+
+    `exclude` 是**中转服**上的人数，只对代理那条非零（见 `_api_hub_snapshot`）：
+    扣减发生在**来源选定之后**，因为接口和 SLP 报的都是「连着代理的有几个」，
+    两边都把中转服的人算在内 —— 只在接口那条分支上扣，SLP 一成功就把人带回来了。
     """
     count, count_source = api_count, "api"
     latency: float | None = None
@@ -667,6 +672,8 @@ def _api_snapshot(
             count, count_source = slp.count, "slp"
             latency, max_players, version = slp.latency, slp.max_players, slp.version
             if slp.count != api_count:
+                # 对照用的是**扣减前**的原始数字：这里问的是「对方插件算错了吗」，
+                # 拿我们自己的口径去修，会把唯一能发现对方算错的地方抹掉。
                 error = _join_error(
                     error,
                     f"接口与 SLP 的人数对不上（接口 {api_count}，SLP {slp.count}）"
@@ -675,7 +682,10 @@ def _api_snapshot(
         else:
             error = _join_error(error, f"SLP 复查没做成（{slp.error}），人数只能用接口报的")
 
+    # 名单长度对的是**原始**人数，所以这一句必须排在扣减之前。扣到负数是不可能的
+    # （中转服的人都算在全群组里），但对方数据错乱时宁可报 0，也不要打出一个负数。
     complete = len(names) == count
+    count = max(0, count - exclude)
     snap = McSnapshot(
         target_id=target.id,
         reachable=True,
@@ -702,9 +712,50 @@ def _api_snapshot(
     return snap
 
 
+def _transit_count(hub: ServerTarget, status: BridgeStatus) -> tuple[int, str]:
+    """数出中转服上的人，连同给诊断看的一句话。返回 `(人数, 说明)`。
+
+    名字对不上时**不说成故障**：对方改 `velocity.toml` 的服名、或者那台中转服这次没起，
+    都会走到这里。但也不能不出声 —— 扣不掉的表现是「人数偏大」，而偏大在群里看不出
+    异样（总览那句「全群组 N 人」本来就是唯一的口径）。所以备注进快照的 error，
+    mc_check --api 会把它打出来。
+    """
+    excluded = 0
+    counted: list[str] = []
+    unknown: list[str] = []
+    for name in hub.transit:
+        entry = status.find(name)
+        if entry is None:
+            unknown.append(name)
+            continue
+        excluded += entry.online
+        # 0 人的中转服不进备注：扣了 0 个人这件事本身没什么好说的，说了只是噪音
+        # （中转服上没人的时候才是常态）。
+        if entry.online:
+            counted.append(f"{name} {entry.online} 人")
+    notes: list[str] = []
+    if counted:
+        notes.append(f"已扣掉中转服 {'、'.join(counted)}")
+    if unknown:
+        notes.append(
+            f"transit 里写的 {'、'.join(unknown)} 不在接口的子服列表里"
+            f"（接口里有：{'、'.join(status.names) or '一台都没有'}）——"
+            f"名字要与对方 velocity.toml 里的服名逐字相同，否则一个人都扣不掉"
+        )
+    return excluded, "；".join(notes)
+
+
 def _api_hub_snapshot(hub: ServerTarget, status: BridgeStatus, slp: _SlpProbe | None) -> McSnapshot:
-    """hub 自己的快照。代理报的是**全群组**人数（口径），不进分服合计 —— 见 serves_names。"""
-    return _api_snapshot(hub, api_count=status.proxy_online, names=[], slp=slp)
+    """hub 自己的快照。代理报的是**全群组**人数（口径），不进分服合计 —— 见 serves_names。
+
+    「全群组」要减掉中转服上的人（`transit`，limbo 那种）：那个字段回答的是「连着代理
+    的有几个」，而群里想知道的是「有几个在玩」。不减的后果是一个自相矛盾的总览 ——
+    上面写「全群组 2 人」、下面几台子服加起来 1 人，而差额站在 limbo 里，谁都不知道。
+    """
+    excluded, note = _transit_count(hub, status)
+    return _api_snapshot(
+        hub, api_count=status.proxy_online, names=[], slp=slp, note=note, exclude=excluded
+    )
 
 
 def _api_sub_snapshot(
@@ -761,7 +812,11 @@ async def _fetch_api_group(hub: ServerTarget) -> _HubResult:
         # 名单本来也不从它取，所以这条降级损失的只是「分服那一份」。
         snap = await fetch_snapshot(hub)
         if snap.reachable:
-            snap.error = f"接口取数失败（{exc}）"
+            # 这条降级只剩 SLP，也就看不到 servers[] —— 中转服那几个人这一次扣不掉，
+            # 报出去的是「连着代理的有几个」。不写出来的话它只表现为人数比平时大
+            # 一两个，而那是谁也看不出来的（代理那一行本来就没有第二个数字可对照）。
+            tail = "；这次看不到子服列表，中转服上的人没能扣掉" if hub.transit else ""
+            snap.error = f"接口取数失败（{exc}）{tail}"
         return _HubResult(snapshot=snap, status=None, error=exc)
     slp = await slp_task if slp_task is not None else None
     return _HubResult(

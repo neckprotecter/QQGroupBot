@@ -54,6 +54,7 @@ _TARGET_KEYS = frozenset(
         "source",
         "source_key",
         "aliases",
+        "transit",
         "timeout",
         "rcon_timeout",
     }
@@ -168,6 +169,20 @@ class ServerTarget:
     # 在上面那台的响应里，用哪个键取自己（/status 的 servers[].name）。不填 = 用 id。
     source_key: str = ""
     aliases: tuple[str, ...] = ()
+    # 「中转服」：对方 `/status` 里列出、但**不是给人玩**的子服名（velocity 侧的
+    # limbo 就是这一种 —— 玩家在登录握手、换服的一瞬、或想进的服把他拒了的时候，
+    # 会被代理放在那里）。`kind = "proxy"` + `api` 的目标才有这一项。
+    #
+    # 作用只有一个：**代理报的「全群组人数」要减掉它们**（2026-09-25 用户要求）。
+    # 不带这一项时，总览会出现「全群组 2 人」而下面几台子服加起来只有 1 人 ——
+    # 差额正是站在 limbo 里的那个人。那个数字没错，但它回答的是「连着代理的有几个人」，
+    # 而不是群里想知道的「有几个人在玩」。
+    #
+    # 名字必须与对方 `velocity.toml` 的服名逐字相同（`source_key` 同一条约定）：
+    # 对不上就什么也扣不掉，而这件事只在运行期能发现 —— 所以三处都会把它打出来，
+    # 少一处的症状就是「扣不掉但没人知道」：启动日志、`--list-targets`、
+    # 以及唯一能逐个对号的 `--api`。
+    transit: tuple[str, ...] = ()
     # `source` 解出来的**那台目标本身**，由 _check_sources 在解析期回填；自己没有
     # source 时是 None。存对象而不是每处都拿着 id 去查表，是为了让取数层能在**任意
     # 子集**里工作：只探测 bingo 一个目标时，也得知道去问 szu 的接口（收数的人可能
@@ -564,11 +579,17 @@ class ServerBook:
         return Resolution(query=raw)
 
     def describe(self) -> list[str]:
-        """给 --list-targets / 启动日志用的一行一个目标概览。
+        """一行一个目标的一句话概览。
 
         **把「数据从哪来」显式打出来**（接口 / hub 的子服 / RCON / 只剩人数）。
         接口型目标是唯一「游戏端口可有可无」的一类，光看 host:port 分不出
         「没配」和「不需要」，而这两种情况的排查方向相反。
+
+        ⚠️ **目前没有调用方**（2026-09-25 核实）：`--list-targets` 和启动日志都自己
+        排版（tools/mc_check.py 的 `_list_targets`、plugins_napcat/mcs/__init__.py 的
+        启动摘要），格式比这里细。留着是因为上面那句「数据从哪来」的判断逻辑写对了，
+        再写一遍不如直接用它 —— 但**别在文档里说它在被谁用**，那句话曾经是假的。
+        新增需要打出来的字段（比如 transit）要在**那两处**各加一次。
         """
         rows = []
         for t in self.targets:
@@ -593,6 +614,10 @@ class ServerBook:
                     parts.append("（也用于白名单）")
             elif t.kind != KIND_PROXY:
                 parts.append("RCON=未配密码")
+            if t.transit:
+                # 打出来是必须的：名字对不上对方 velocity.toml 时什么都不会发生，
+                # 而这个「什么都没发生」在群里表现为「人数还是偏大一两个人」。
+                parts.append(f"中转={'、'.join(t.transit)}（不计入全群组人数）")
             rows.append(" ".join(parts))
         return rows
 
@@ -822,6 +847,37 @@ def parse_book(text: str) -> ServerBook:
             _as_text(a, f"{where}.aliases", allow_empty=False) for a in aliases_raw
         )
 
+        transit_raw = raw.get("transit", [])
+        if not isinstance(transit_raw, list):
+            raise ServerConfigError(f"{where}.transit 必须是字符串数组")
+        transit = tuple(
+            _as_text(n, f"{where}.transit", allow_empty=False) for n in transit_raw
+        )
+        if len(set(transit)) != len(transit):
+            # 重复的名字不报错也能跑（扣两次 = 扣多了），而「扣多了」在群里表现为
+            # 人数偏小，谁都看不出来。所以当配置错误拦下。
+            dupes: list[str] = []
+            for name in transit:
+                if transit.count(name) > 1 and name not in dupes:
+                    dupes.append(name)
+            raise ServerConfigError(f"{where}.transit 里有重复的名字：{'、'.join(dupes)}")
+        if transit and kind != KIND_PROXY:
+            raise ServerConfigError(
+                f"{where} 的 kind 是 {kind!r}，但配了 transit —— transit 说的是「代理的"
+                f'/status 里哪几台子服算中转、人数不计入全群组」，只有 kind = "proxy" '
+                f"的目标有这回事。"
+            )
+        if transit and api is None:
+            # 名字是拿去和 `/status` 的 servers[] 对号的，没有接口就没有那张表。
+            # 只看 SLP 的代理确实也把 limbo 的人算在总数里，但我们无从知道其中几个人
+            # 在中转服上 —— 那时候「配了没生效」的静默状态正好是这套东西最怕的，
+            # 所以宁可在这里报错。
+            raise ServerConfigError(
+                f"{where} 配了 transit 但没有 api 段：中转服的名字要跟接口 /status 里的"
+                f"子服列表逐字对号，没有接口就没有那张表，扣不掉的。"
+                f"（代理只走 SLP 的话，它报的总人数里也含着中转服的人，只是我们分不出来。）"
+            )
+
         target = ServerTarget(
             id=target_id,
             name=name,
@@ -836,6 +892,7 @@ def parse_book(text: str) -> ServerBook:
             source=source,
             source_key=source_key,
             aliases=aliases,
+            transit=transit,
         )
 
         for key in target.keys:
@@ -863,6 +920,7 @@ def parse_book(text: str) -> ServerBook:
         targets.append(target)
 
     _check_sources(targets, by_id)
+    _check_transit(targets)
     _check_port_collisions(targets, warnings)
 
     # 白名单归属与主服都随群关联走了（见 _MOVED_* 那两条迁移报错），全量表里留空。
@@ -911,6 +969,30 @@ def _check_sources(targets: list[ServerTarget], by_id: dict[str, ServerTarget]) 
         bound = replace(t, hub=hub)
         targets[index] = bound
         by_id[t.id] = bound
+
+
+def _check_transit(targets: list[ServerTarget]) -> None:
+    """`transit` 点名的中转服，不能同时又是我们挂着的子服。
+
+    两件事同时成立会自相矛盾：那台服的人从「全群组」里被扣掉，却仍在自己的那一行里
+    列着名单 —— 加起来对不上，而这正是这个功能要修的那个症状（只是换了个方向）。
+    想挂的中转服就不要写进 transit；不想要它的人就挂上、然后写 transit，二选一。
+
+    只能在全表解析完之后查：`source` 可能写在 transit 那条**后面**（和 _check_sources
+    同一条理由，段序不该影响合法性）。
+    """
+    for t in targets:
+        if not t.transit:
+            continue
+        # 中转服名 → 我们自己挂的那条子服的 id
+        mounted = {s.source_name: s.id for s in targets if s.source == t.id}
+        clash = [f"{n}（我们的目标 {mounted[n]}）" for n in t.transit if n in mounted]
+        if clash:
+            raise ServerConfigError(
+                f"目标 {t.id} 的 transit 里有 {'、'.join(clash)}，但它们同时也是挂在它"
+                f"下面的子服 —— 那样它们的人会被扣出「全群组」，却仍各自出现在分服行里，"
+                f"数字照样对不上。二选一：要么别挂它们，要么把它们从 transit 里删掉。"
+            )
 
 
 def _check_port_collisions(targets: list[ServerTarget], warnings: list[str]) -> None:

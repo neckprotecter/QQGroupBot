@@ -68,12 +68,15 @@ async def _log_targets() -> None:
         return
 
     described = "、".join(
-        f"{t.name}[{t.id}]{'/' + t.group if t.group else ''}" for t in book.targets
+        f"{t.name}[{t.id}]{'/' + t.group if t.group else ''}"
+        # 中转服逐个点名：名字写错时它什么也不会发生，只表现为「人数还是偏大」。
+        f"{'（中转 ' + '、'.join(t.transit) + '，不计入全群组人数）' if t.transit else ''}"
+        for t in book.targets
     )
     logger.info("MC 目标 {} 个：{}", len(book.targets), described)
 
     # 群关联：哪个群看哪几台。这段是排查「新加的群为什么不响应」的第一入口 ——
-    # 群不在任何一条里，查询就会回「本群还没有开通 MC 查询」。
+    # 群不在任何一条里，查询和白名单命令都会回「本群还没有开通此功能」。
     logger.info("MC 关联服务器：{} 条", len(config.audiences))
     for audience in config.audiences:
         logger.info("  {}", audience.summary())

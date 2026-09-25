@@ -252,7 +252,7 @@ async def _tick_audience(
     """一条群关联：对账 → 攒事件 → 到了窗口就合成一条推给它自己的 groups。"""
     state = _audience_state(audience)
     # 顺序用 targets_primary_first：[[audience]].primary 那台排最前，其余按配置顺序。
-    # 它同时是 reconcile 的输出顺序 → 合成消息里【服名】块的顺序，块顺序每轮乱跳的话
+    # 它同时是 reconcile 的输出顺序 → 合成消息里各段的顺序，段顺序每轮乱跳的话
     # 同一条消息看着像新的一条。
     ordered = audience.book.targets_primary_first
     my_ids = {t.id for t in audience.book.targets}
