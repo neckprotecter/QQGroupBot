@@ -251,7 +251,7 @@ OOPZ_LOGIN_PHONE='你的oopz手机号' OOPZ_LOGIN_PASSWORD='你的oopz密码' \
 cd /opt/qqgroupbot
 export NAPCAT_UID=$(id -u) NAPCAT_GID=$(id -g) BOT_UID=$(id -u) BOT_GID=$(id -g)
 
-# 离线自测：403 条断言，不联网、不读配置 —— 先证明镜像里那套依赖是齐的
+# 离线自测：447 条断言，不联网、不读配置 —— 先证明镜像里那套依赖是齐的
 docker compose run --rm bot python tools/mc_check.py --self-test
 
 # MC 那边（用 MC 功能才需要）：
@@ -355,7 +355,9 @@ docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' <
 按顺序做一遍，每步都有明确的预期：
 
 1. 离线自测过了：`docker compose run --rm bot python tools/mc_check.py --self-test`
-   → `403 PASS / 0 FAIL`。
+   → `447 PASS / 0 FAIL`。顺手把夜间静默那条也跑了：
+   `docker compose run --rm bot python tools/mc_check.py --quiet-test` → `全部通过`
+   （它要 init nonebot 读 `.env`，所以在容器里跑，不是在裸机上）。
 2. `docker compose ps` → 两个容器都 `Up`；`docker compose logs bot | tail -50` 里能看到
    `Bot <QQ号> connected`。
 3. 群里 `@机器人 你好` → 回「收到！被动回复链路已打通 🎉」。

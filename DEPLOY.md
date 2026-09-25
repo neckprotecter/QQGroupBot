@@ -147,7 +147,7 @@ copy .env.example .env
 | `MC_WATCH_INTERVAL_SEC` | 进服检测轮询间隔（秒，默认 10）。进服到被发现的延迟 = 0～本值 |
 | `MC_JOIN_MIN_INTERVAL_SEC` | 进服推送最小间隔（秒，默认 15），窗口内的进服合并成一条，防刷屏。**设 0 = 进服立刻推**。最大额外延迟 ≈ 本值 + 一个轮询间隔 |
 | ~~`MC_REPORT_GROUP`~~ / `MC_REPORT_INTERVAL_MIN` | 群号那半**已作废**，改成那条 `[[audience]]` 的 `report = true`；间隔（分钟，默认 60，整点对齐）留在这里 |
-| `MC_QUIET_HOURS` | **夜间静默时段**，写成 `起-止`（小时，默认 `0-9`）。这段时间里不推进服提醒、不做定时播报；`0-9` 是半开区间，**09:00 整那班照常发**。支持跨午夜（`23-7`）。**留空 = 不静默**。掉线/恢复提醒不受影响 |
+| `MC_QUIET_HOURS` | **夜间静默时段**，写成 `起-止`（小时，默认 `0-9`）。这段时间里不发进服/换服提醒、不做定时播报；`0-9` 是半开区间，**09:00 整那班照常发**。支持跨午夜（`23-7`）。**留空 = 不静默**。掉线/恢复提醒不受影响 |
 
 > ⚠️ **MC 服务器的地址 / 显示名 / 超时 / RCON 密码都不在 `.env` 里。**
 > 它们在同目录的 **`mcs_servers.toml`**（一台服一段 `[[targets]]`），见 4.1 节。
@@ -799,7 +799,7 @@ MC 插件认领了这条消息，但这个群没被写进任何 `[[audience]].gr
   - 白名单命令的回复文案与用法提示在 `plugins_napcat/mcs/mc_admin.py` 的 `_build_message()` / `_usage()`；命令解析与执行在 `plugins_napcat/_shared/mcadmin.py`。
 - **改触发词**：`.env` 的 `OOPZ_TRIGGER` / `MC_TRIGGER` / `MC_ADMIN_TRIGGER`（不用改代码）。归属逻辑在 `plugins_napcat/_shared/triggers.py`：`locate()` 定归属并带回位置，`detect()` 是它的薄包装，`strip_keyword()` 把触发词剥掉取载荷（`@bot 服务器 mc bingo` → `bingo`）——它剥的是该插件的**全部**触发词，所以多写几个触发词也能解析对。
 - **改管理员**：`.env` 的 `MC_ADMIN_QQ`（逗号分隔 QQ 号，**留空 = 关闭该功能**）。鉴权在 `plugins_napcat/_shared/admin.py`。
-- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`。不带参数 = 并发探测**所选群关联**的全部目标，逐台给结论；加 `--target <服名>` 只看一台；加 `--audience <关联名>` 换一条群关联的视角（默认第一条）；加 `--list-targets` 只读配置、不联网（新加的子服没生效先跑这个）；加 `--list-audiences` 只读群关联、不联网（新加的群不响应先跑这个）；加 `--self-test` 只跑解析自测、不联网；加 `--whitelist` 只看服务端白名单，只读不改。退出码 0 正常 / 1 有目标不正常 / 2 用法错误。
+- **排查 MC 取数**：`.\.venv\Scripts\python.exe tools\mc_check.py`。不带参数 = 并发探测**所选群关联**的全部目标，逐台给结论；加 `--target <服名>` 只看一台；加 `--audience <关联名>` 换一条群关联的视角（默认第一条）；加 `--list-targets` 只读配置、不联网（新加的子服没生效先跑这个）；加 `--list-audiences` 只读群关联、不联网（新加的群不响应先跑这个）；加 `--self-test` 只跑解析自测、不联网（447 条断言）；加 `--quiet-test` 跑夜间静默的行为自测（进服不发、基线照推进、掉线照发），也不联网；加 `--whitelist` 只看服务端白名单，只读不改。退出码 0 正常 / 1 有目标不正常 / 2 用法错误。
 - **续期 oopz JWT（每月一次）**：`OOPZ_JWT_TOKEN` 约 31 天过期。症状：@统计 无回复、播报显示「查询失败」。重跑 `tools\oopz_login.py` → 回填 `.env` → 重启 bot。
 - **改间隔/目标群**：改 `.env` 后重启 bot。
 - **看日志**：`logs/napcat_bot_<日期>.log`（按天切、留 14 天，内容与屏幕一致；文件是 UTF-8 写的，PowerShell 用 `-Encoding UTF8` 读）。回看「某轮为什么没推送」全靠它 ——

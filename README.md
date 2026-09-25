@@ -41,7 +41,7 @@ QQ 群机器人：群成员 @ 机器人发「**oopz**」或「**mc**」，实时
 - 🎮 **MC 进服提醒**：每 `MC_WATCH_INTERVAL_SEC` 秒轮询 MC 服务器，有人进服时推送提醒（**推「进服」和「换服」（同组两台之间移动），不推退服**；最小推送间隔 `MC_JOIN_MIN_INTERVAL_SEC` 秒，窗口内的进服合并成一条）。**收件人和盯哪几台都由那条群关联决定**（`watch = true` + 它自己的 `targets`），一条关联挂三台服时一个周期内合成**一条**消息
 - ⏰ **MC 定时播报**：整点对齐推送「📣 MC 播报」+ 各服在线名单（`report = true`）——某台服没人或不可达只是**列成一行**，不再让整条播报跳过；真的全都没人才静默跳过
 - ⚠️ **MC 掉线提醒**：连续两轮探测失败才判定离线（单轮网络抖动不报），恢复时也会推一条；`MC_NOTIFY_SERVER_STATE=false` 可关。掉线只推给**关联了那台服**的群
-- 🌙 **MC 夜间静默**：`MC_QUIET_HOURS`（默认 `0-9`，即 00:00–08:59）内**不推进服提醒、不做定时播报**，半夜不吵人；`09:00` 整那班照常发，支持跨午夜（`23-7`），留空 = 不静默。**掉线/恢复提醒不受影响**（夜里服务器真挂了得让人知道）。静默期间照样探测，所以 09:00 之后不会把整晚的人当成「刚进服」补报一遍
+- 🌙 **MC 夜间静默**：`MC_QUIET_HOURS`（默认 `0-9`，即 00:00–08:59）内**不发进服/换服提醒、不做定时播报**，半夜不吵人；`09:00` 整那班照常发，支持跨午夜（`23-7`），留空 = 不静默。**掉线/恢复提醒不受影响**（夜里服务器真挂了得让人知道）。静默期间照样探测，所以 09:00 之后不会把整晚的人当成「刚进服」补报一遍
 
 示例回复：
 
@@ -74,7 +74,7 @@ oopz-bot/
 │   ├── README.md             # 三个工具的分工、用法、什么时候该跑哪个
 │   ├── oopz_login.py         # 手机号+密码 → 写入 OOPZ_* 凭据
 │   ├── oopz_check.py         # 独立验证 oopz 查询链路
-│   └── mc_check.py           # 独立验证 MC 取数链路（`--list-targets` 看服务器 / `--list-audiences` 看群关联 / `--target` 测单台 / `--api` 只看群组接口 / `--self-test` 离线自测）
+│   └── mc_check.py           # 独立验证 MC 取数链路（`--list-targets` 看服务器 / `--list-audiences` 看群关联 / `--target` 测单台 / `--api` 只看群组接口 / `--self-test` 离线自测 / `--quiet-test` 夜间静默行为自测）
 ├── plugins/                  # QQ 官方版插件（bot.py 加载）
 │   ├── hello.py              # @你好 → 链路自检
 │   └── oopz_stats.py         # @oopz → 实时成员报告
@@ -169,6 +169,7 @@ $env:OOPZ_LOGIN_PASSWORD = "你的oopz密码"
 .venv\Scripts\python.exe tools\mc_check.py --list-targets      # 只读：服务器清单 + 被哪些群关联
 .venv\Scripts\python.exe tools\mc_check.py --list-audiences    # 只读：每条群关联覆盖哪些群、哪几台服
 .venv\Scripts\python.exe tools\mc_check.py --self-test         # 只跑解析自测，不联网
+.venv\Scripts\python.exe tools\mc_check.py --quiet-test        # 夜间静默的行为自测，不联网
 .venv\Scripts\python.exe tools\mc_check.py --whitelist         # 只读地看一眼服务端白名单
 .venv\Scripts\python.exe tools\mc_check.py --api               # 只看群组接口那一层（/health、/status、/whitelist）
 ```

@@ -2,6 +2,7 @@ r"""验证 Minecraft 服务器取数链路（SLP + RCON），不启动机器人�
 
 用法：
     .venv\Scripts\python.exe tools\mc_check.py --self-test        # 只跑解析自测，不联网
+    .venv\Scripts\python.exe tools\mc_check.py --quiet-test       # 夜间静默的行为自测，不联网
     .venv\Scripts\python.exe tools\mc_check.py --list-targets     # 看 mcs_servers.toml 解析出什么，不联网
     .venv\Scripts\python.exe tools\mc_check.py --whitelist        # 只读地看一眼服务端白名单
     .venv\Scripts\python.exe tools\mc_check.py                    # 实机探测**全部**目标
@@ -1304,6 +1305,12 @@ source_key = "bingo-s2"
         ),
         ("--api 写在后头也照样是 api", ["--target", "szu", "--api"], ("api", "szu", "")),
         ("自测优先于实机探测", ["--self-test", "--target", "x"], ("self-test", "", "")),
+        ("--quiet-test（静默行为自测）", ["--quiet-test"], ("quiet-test", "", "")),
+        (
+            "--quiet-test 优先于实机探测",
+            ["--quiet-test", "--target", "x"],
+            ("quiet-test", "", ""),
+        ),
         ("不带参数时关联名留空 = 由 _live 自己挑默认那条", ["bingo"], ("live", "bingo", "")),
         # ↓ 这些是本次真正要防的：它们都**不能**变成实机探测
         ("--help 本脚本没有 → 拦下", ["--help"], None),
@@ -1314,6 +1321,11 @@ source_key = "bingo-s2"
         ("--audience 后面没跟关联名 → 拦下", ["--audience"], None),
         ("--audience= 空值 → 拦下", ["--audience="], None),
         ("--list-audience（少个 s 的手滑）→ 拦下", ["--list-audience"], None),
+        # 开关写成 = 值：partition 出来的 flag 仍在 known 里，但后面那些 `in argv`
+        # 判断一个都匹配不上 → **静默退化成全量实机探测**（真连服务器、真发 RCON）。
+        # 这正是上面那几条要防的事，所以 = 形式必须拦下，不能靠「没人会这么写」。
+        ("--self-test=1（开关写成 = 值）→ 拦下", ["--self-test=1"], None),
+        ("--quiet-test=1 → 拦下", ["--quiet-test=1"], None),
     ):
         # 用法错误分支会往 stdout 打提示，自测里屏蔽掉免得刷屏
         buf, sys.stdout = sys.stdout, _io.StringIO()
@@ -3645,6 +3657,134 @@ source_key = "creative"
     return 1 if failed else 0
 
 
+# ---------------------------------------------------------------- 夜间静默行为自测
+
+def _quiet_test() -> int:
+    """跑 `_tick_audience` 的静默分支，证「不发」和「基线照常推进」两件事。
+
+    为什么不并进 `--self-test`：那边**刻意不 init nonebot**（纯解析函数，谁都能跑），
+    而 mc_reporter 在 import 期就要 driver、在包 __init__ 期就要 `nonebot.on_message`
+    那一套。两条路只能分开走。
+
+    要钉死的是**看不见的分支**：静默期间该不发消息，这个看代码就知道；但「基线还要
+    照常推进」错了的后果在当晚完全无声，只在第二天 09:00 炸出来 —— 把一整晚进过服的
+    人当成「刚进服」一次性补报几十条。所以这里连基线一起断言。
+
+    不联网：send_to_groups 被替换成记账函数，「发没发、发了什么」全在内存里。
+    """
+    import nonebot
+
+    try:
+        nonebot.init()
+    except Exception as exc:  # 缺 .env / driver 装不上 —— 说清楚，别甩一段 traceback
+        print(f"== nonebot 初始化失败，跑不了（需要和机器人同一套 .env）: {exc!r} ==")
+        return 2
+
+    from plugins_napcat._shared.mc import McSnapshot
+    from plugins_napcat._shared.mcdelta import StatusEvent
+    from plugins_napcat._shared.mcservers import ServerTarget
+    from plugins_napcat._shared.schedule import parse_quiet_hours
+    from plugins_napcat.mcs import mc_reporter as mr
+
+    failed = 0
+
+    def check(ok: bool, what: str) -> None:
+        nonlocal failed
+        failed += not ok
+        print(f"   {'PASS' if ok else 'FAIL'}  {what}")
+
+    class _Book:
+        def __init__(self, targets):
+            self.targets = tuple(targets)
+            self.targets_primary_first = tuple(targets)
+
+    class _Audience:
+        def __init__(self, name, targets, groups=("1",)):
+            self.name = name
+            self.groups = groups
+            self.book = _Book(targets)
+
+    sent: list[tuple[list[str], str]] = []
+
+    async def _fake_send(groups, text):
+        sent.append((list(groups), text))
+        return len(groups)
+
+    mr.send_to_groups = _fake_send  # 掐掉真发送：只留「发没发、发了什么」
+
+    def _snap(names):
+        return McSnapshot(
+            reachable=True,
+            target_id="t1",
+            count=len(names),
+            names=list(names),
+            names_complete=True,
+            names_source="rcon",
+        )
+
+    target = ServerTarget(
+        id="t1", name="自测服", kind="vanilla", group="", timeout=5.0, rcon_timeout=5.0
+    )
+    audience = _Audience("自测关联", [target])
+    state = mr._AudienceState()
+    mr._audiences.clear()
+    mr._audiences[audience.groups[0]] = state
+    mr._targets.clear()
+
+    print("== 0. 静默窗口取值 ==")
+    raw = os.environ.get("MC_QUIET_HOURS", "0-9")
+    check(
+        mr._QUIET_WINDOW == parse_quiet_hours(raw),
+        f"模块解析出的窗口与 .env 一致（MC_QUIET_HOURS={raw!r} → {mr._QUIET_WINDOW}）",
+    )
+    if not raw.strip():
+        check(mr._QUIET_WINDOW is None, "空值 = 不静默")
+    elif os.environ.get("MC_QUIET_HOURS") is None:
+        check(mr._QUIET_WINDOW == (0, 9), "没写这个键时走代码默认 0-9")
+
+    async def tick(names, status=(), quiet=True):
+        await mr._tick_audience(audience, {"t1": _snap(names)}, list(status), quiet=quiet)
+
+    print("\n== 1. 第一轮建基线：只记基线，不发消息 ==")
+    asyncio.run(tick(["A"]))
+    check(sent == [], "建基线那一轮不发消息")
+    check(state.known.get("t1") == frozenset({"A"}), "基线建起来了")
+
+    print("\n== 2. 静默时段内有人进服：一条都不发，但基线要推进 ==")
+    asyncio.run(tick(["A", "B"]))
+    check(sent == [], "B 进服没有推送（静默生效）")
+    check(
+        state.known.get("t1") == frozenset({"A", "B"}),
+        "B 进了基线 —— 不推进的话 09:00 会把他当「刚进服」补报",
+    )
+    check(state.pending == [], "静默前攒下的事件被丢掉，不会等出静默补发")
+
+    print("\n== 3. 连续两次静默进服也不积压 ==")
+    asyncio.run(tick(["A", "B", "C"]))
+    check(sent == [] and state.pending == [], "两次静默进服都没有积压")
+
+    print("\n== 4. 出静默后恢复：新进服的人照常发 ==")
+    asyncio.run(tick(["A", "B", "C", "D"], quiet=False))
+    check(len(sent) == 1, f"恢复后发了 {len(sent)} 条（期望 1）")
+    if sent:
+        check("D" in sent[-1][1], "发的那条里有新进服的 D")
+        check(
+            "B" not in sent[-1][1] and "C" not in sent[-1][1],
+            "没有把静默期间的 B/C 补发出来",
+        )
+
+    print("\n== 5. 掉线/恢复不受静默管辖 ==")
+    sent.clear()
+    asyncio.run(tick(["A", "B", "C", "D"], [StatusEvent(target_id="t1", down=True, streak=2)]))
+    check(len(sent) == 1, f"静默时段内掉线仍然发了 {len(sent)} 条（期望 1）")
+    if sent:
+        check("自测服" in sent[-1][1], "发的是那台服的掉线提醒")
+
+    print()
+    print(f"== 静默自测结果：{'全部通过' if not failed else f'{failed} 项失败'} ==")
+    return 1 if failed else 0
+
+
 # ---------------------------------------------------------------- 实机探测
 
 def _verdict(target, snap) -> tuple[bool, str]:
@@ -4409,6 +4549,8 @@ def _list_audiences() -> int:
 _USAGE = (
     "可用参数：\n"
     "   --self-test            只跑解析自测，不联网\n"
+    "   --quiet-test           跑夜间静默的行为自测（进服不发、基线照推进、掉线照发），\n"
+    "                          不联网；要 init nonebot，得在有 .env 的机器上跑\n"
     "   --list-targets         打印 mcs_servers.toml 解析出的目标，不联网\n"
     "   --list-audiences       打印 mcs_audiences.toml 的每条群关联，不联网\n"
     "   --target <服名>        只实机探测这一个目标；配 --whitelist 时收窄到那一台\n"
@@ -4425,7 +4567,7 @@ _USAGE = (
 def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
     """把命令行解析成 `(动作, 服名, 关联名)`；返回 None 表示用法错误（提示已打印）。
 
-    动作 ∈ self-test / list-targets / list-audiences / whitelist / api / live。
+    动作 ∈ self-test / quiet-test / list-targets / list-audiences / whitelist / api / live。
     抽成纯函数是为了能自测：「认不出的参数不许退化成实机探测」这条不能只靠读代码保证。
     """
     # 认不出的参数必须拦下。否则 `--help`（本脚本没有这个参数）或 `--targets`
@@ -4434,19 +4576,25 @@ def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
     #
     # 新增参数时**必须同时加进这个集合**：漏了不会自测失败，只会在真跑命令行时
     # 被当成不认识的参数拦下（退出码 2），而自测调的是纯函数，看不出这件事。
-    known = {
+    # 只认值的那两个参数用 `--flag=值` 是允许的（见 _value），其余都是开关。
+    switches = {
         "--self-test",
+        "--quiet-test",
         "--list-targets",
         "--list-audiences",
         "--whitelist",
         "--api",
-        "--target",
-        "--audience",
     }
+    known = switches | {"--target", "--audience"}
     for arg in argv:
-        flag = arg.partition("=")[0]
+        flag, eq, _ = arg.partition("=")
         if flag.startswith("--") and flag not in known:
             print(f"== 不认识的参数 {arg!r} ==\n{_USAGE}")
+            return None
+        if eq and flag in switches:
+            # 开关写成 `--self-test=1` 时 flag 仍在 known 里，但下面那些 `in argv`
+            # 判断一个都匹配不上 → 静默退化成全量实机探测。与上一条是同一个坑。
+            print(f"== {flag} 是个开关，后面不接 = 值 ==\n{_USAGE}")
             return None
 
     def _value(flag: str) -> str:
@@ -4468,6 +4616,8 @@ def _parse_argv(argv: list[str]) -> tuple[str, str, str] | None:
 
     if "--self-test" in argv:
         return "self-test", "", ""
+    if "--quiet-test" in argv:
+        return "quiet-test", "", ""
     if "--list-targets" in argv:
         return "list-targets", "", ""
     if "--list-audiences" in argv:
@@ -4504,6 +4654,8 @@ def main() -> int:
     action, query, audience = parsed
     if action == "self-test":
         return _self_test()
+    if action == "quiet-test":
+        return _quiet_test()
     if action == "list-targets":
         return _list_targets()
     if action == "list-audiences":

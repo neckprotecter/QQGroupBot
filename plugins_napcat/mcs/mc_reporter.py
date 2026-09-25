@@ -58,7 +58,7 @@ _NOTIFY_SERVER_STATE = os.environ.get("MC_NOTIFY_SERVER_STATE", "").strip().lowe
 }
 _REPORT_INTERVAL_MIN = int(os.environ.get("MC_REPORT_INTERVAL_MIN", "60"))
 
-# 夜间静默：这段时间里**不推进服提醒、不做定时播报**（用户 2026-09-26 要求）。
+# 夜间静默：这段时间里**不发进服/换服提醒、不做定时播报**（用户 2026-09-26 要求）。
 # 默认 0-9 是刻意的 —— 需求本身就是「半夜别响」，默认关掉等于没做；
 # 不要静默就显式写 MC_QUIET_HOURS=（空值）。
 #
@@ -75,7 +75,7 @@ except ValueError as exc:
     logger.error("MC_QUIET_HOURS 配置有误，夜间静默已关闭：{}", exc)
 else:
     if _QUIET_WINDOW is not None:
-        logger.info("MC 夜间静默时段：{}-{} 点（该时段不推进服提醒、不做定时播报）",
+        logger.info("MC 夜间静默时段：{}-{} 点（该时段不发进服/换服提醒、不做定时播报）",
                     _QUIET_WINDOW[0], _QUIET_WINDOW[1])
 
 # 静默状态的跃迁只打一条日志（见 _note_quiet_transition）。两个循环共用一个状态：
@@ -93,7 +93,7 @@ def _note_quiet_transition(quiet: bool) -> None:
     _quiet_state = quiet
     if quiet:
         logger.info(
-            "进入 MC 夜间静默（{}-{} 点）：不推进服提醒、不做定时播报；"
+            "进入 MC 夜间静默（{}-{} 点）：不发进服/换服提醒、不做定时播报；"
             "服务器掉线/恢复提醒不受影响",
             _QUIET_WINDOW[0],
             _QUIET_WINDOW[1],

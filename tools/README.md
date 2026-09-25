@@ -3,12 +3,13 @@
 这里放**三个独立脚本**。它们不属于机器人本体（`bot.py` / `bot_napcat.py` 都不会
 import 它们，`plugins*` 也不引用），是**人手动跑**的。
 
-> ⚠️ **它们不是「只有测试的时候才用」**。只有 `mc_check.py --self-test` 那一个是测试；
+> ⚠️ **它们不是「只有测试的时候才用」**。只有 `mc_check.py` 的 `--self-test` /
+> `--quiet-test` 两个是测试；
 > 另外两个的日常用途是**排查线上问题**和**拿凭据**。三者分工：
 
 | 脚本 | 类别 | 联网 | 会不会改动东西 |
 |---|---|---|---|
-| `mc_check.py` | MC 取数链路诊断（+ 离线自测） | 看参数 | **只读**，任何时候都不写 |
+| `mc_check.py` | MC 取数链路诊断（+ 离线自测 / 静默行为自测） | 看参数 | **只读**，任何时候都不写 |
 | `oopz_check.py` | oopz 凭据与查询链路诊断 | 是 | 只读 |
 | `oopz_login.py` | 一次性凭据生成（手机号+密码 → `.env`） | 是 | **会写 `.env`**（只写 OOPZ_* 四项） |
 
@@ -40,7 +41,8 @@ import 它们，`plugins*` 也不引用），是**人手动跑**的。
 > 群组接口的**原始响应**和每一条判定理由，而机器人日志里只有结论。
 
 ```bash
-<python> tools/mc_check.py --self-test        # 离线自测：403 条断言，不联网
+<python> tools/mc_check.py --self-test        # 离线自测：447 条断言，不联网
+<python> tools/mc_check.py --quiet-test       # 夜间静默的行为自测，不联网（要 init nonebot）
 <python> tools/mc_check.py --list-targets     # 只读：服务器清单解析成什么，不联网
 <python> tools/mc_check.py --list-audiences   # 只读：每条群关联覆盖哪些群、哪几台服
 <python> tools/mc_check.py --whitelist        # 只读：看一眼服务端白名单
@@ -73,10 +75,17 @@ import 它们，`plugins*` 也不引用），是**人手动跑**的。
 - 退出码：`0` 全部正常 / `1` 有目标不正常（或 `--whitelist` 撞上「名单在、拦截关」）/
   `2` 用法错误。
 
-**关于 `--self-test`**：这是本项目**唯一的测试**，403 条断言，全部离线。没有 pytest、
+**关于 `--self-test`**：这是本项目**唯一的解析/文案测试**，447 条断言，全部离线。没有 pytest、
 没有 `tests/` 目录 —— 不引依赖，且这些断言钉的是**解析与文案**（RCON 返回值怎么拆名字、
 进服对账的各种边界、QQ 文案里不许出现 markdown 星号……），它们依赖的是真实响应原文，
 离线钉住比联网更适合天天跑。改 `_shared/` 里任何解析或文案，先跑它。
+
+**关于 `--quiet-test`**：`--self-test` 刻意**不 init nonebot**（它跑的是 `_shared/`
+里的纯函数，所以在任何机器上都能跑）。而夜间静默的分支长在 `mcs/mc_reporter.py` 里
+——那个模块 import 期就要 driver，所以那一路只能单独走：`--quiet-test` 会
+`nonebot.init()`，再把 `send_to_groups` 换成记账函数，然后真的调 `_tick_audience`。
+它钉的是**当晚完全看不见、第二天早上才炸**的一条：静默期间既不发消息，**基线也要
+照常推进** —— 不推进的话 09:00 会把一整晚进过服的人当成「刚进服」一次性补报。
 
 ---
 
