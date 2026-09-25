@@ -171,15 +171,17 @@ def _log_state_transition(snap: McSnapshot, target: ServerTarget) -> None:
         return
     state.last_state = key
     if key[0] == "ok":
-        if snap.names_source == "n/a":
-            # 代理的正常态。别说「名单来源 n/a（完整）」那种话 —— 它本来就不出分服
-            # 名单，名册在它的子服那几台上，所以这一句只报人数、并点明名义。
-            logger.info("MC {} 正常（{} 人在线；这台不出分服名单，名册在它的子服上）",
-                        target.name, snap.count)
-        else:
+        if target.serves_names:
             logger.info(
                 "MC {} 名单来源 {}（完整，{} 人在线）", target.name, snap.names_source, snap.count
             )
+        else:
+            # 代理的正常态。**别看 snap.names_source** —— 它对代理恒为 "none"，
+            # 而上面那句「名单来源 none（完整，N 人在线）」正是要避免的：名单的
+            # 有无与「完整」与否对它都不适用（names_complete 恒 False），名册在
+            # 它的子服那几台上。判据只认 serves_names 这一处。
+            logger.info("MC {} 正常（{} 人在线；这台不出分服名单，名册在它的子服上）",
+                        target.name, snap.count)
     elif key[0] == "partial":
         logger.warning(
             "MC {} 名单不完整，它的进服提醒已暂停：{}", target.name, snap.error or "原因未知"
