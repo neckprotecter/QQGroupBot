@@ -89,7 +89,31 @@ docker compose up -d napcat
 docker compose logs -f napcat                     # 首次会打印二维码（WebUI 里也能看）
 ```
 
-用机器人那个 QQ **扫码登录**（手机 QQ → 扫一扫）。登录成功后：
+用机器人那个 QQ **扫码登录**（手机 QQ → 扫一扫）。
+
+**但只有第一次要扫 —— 之后必须靠「快速登录」，而且要显式开。** 镜像里
+`entrypoint.sh` 的登录分支是：
+
+```bash
+if [ -n "${ACCOUNT}" ]; then gosu napcat /opt/QQ/qq --no-sandbox -q $ACCOUNT
+else                          gosu napcat /opt/QQ/qq --no-sandbox
+fi
+```
+
+它**不转发 `command: [...]` 里的参数**（写 `command: ["-q", "123456"]` 完全无效），
+只能靠环境变量 `ACCOUNT` 传。compose 里已经接好了：`ACCOUNT=${NAPCAT_QQ:-}`，
+所以只要在同目录 `.env` 里加一行就够了（号码是真实标识，别写进公开仓库）：
+
+```
+NAPCAT_QQ=你的机器人QQ号
+```
+
+> ⚠️ **不填的后果很难查**：会话其实好好存在 `./napcat-data/QQ` 里，容器也 `Up` 得漂漂亮亮，
+> 但 NapCat 每次启动都**停在登录界面等扫码**，于是 3001 那个正向 WS 服务端根本没起来，
+> 机器人的症状是刷屏 `ClientConnectorError: Cannot connect to host napcat:3001`。
+> 日志里的原话是「没有 -q 指令指定快速登录，将使用二维码登录方式」。
+
+登录成功后：
 
 **开一个正向 WebSocket 服务**（机器人连它）：
 
@@ -114,8 +138,9 @@ docker compose logs -f napcat                     # 首次会打印二维码（W
 > **3001 则连回环都不发布**：机器人自己就在同一个 compose 网络里，直接按服务名
 > `napcat:3001` 连它（见第 8 节）。少一个暴露面，也少一次「端口被占」的争执。
 >
-> ⚠️ 两个卷都要挂（compose 里已写好）。**少挂 `napcat-data/QQ` 的话每次重启容器都要
-> 重新扫码**，因为登录会话就在里头。
+> ⚠️ 两个卷都要挂（compose 里已写好）。`napcat-data/QQ` 装的就是登录会话，不挂它必然
+> 每次都要重扫码。**但挂对了也不够** —— 还得照上面配 `NAPCAT_QQ`，否则会话明明在卷里，
+> NapCat 也不会去用它，每次启动照样停在扫码界面。
 
 ---
 
@@ -184,6 +209,15 @@ Linux 上要额外注意的只有两点：
 
 > ⚠️ **别写 `127.0.0.1`**：容器里的 `127.0.0.1` 指的是**它自己**，不是宿主。宿主的回环口
 > 从容器里够不着（要走 `host.docker.internal`，而服务名那条路更干净）。
+
+`.env` 里另外**多一行**（Windows 那份没有）：
+
+```
+NAPCAT_QQ=<机器人QQ号>
+```
+
+它是喂给 napcat 容器的 `ACCOUNT`（免扫码快速登录，见第 2 节），**机器人自己不读它**。
+漏了的症状是每次重建容器都得重新扫码。
 
 ---
 
@@ -334,6 +368,7 @@ docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' <
 |---|---|---|
 | 容器反复重启，日志里 `PermissionError` 或 `logs/...` 相关 | `./logs` 不存在，或 `BOT_UID` 那个 uid 写不进去 —— loguru 的 `add()` 在**导入期**抛错 | `mkdir -p logs`；确认 `export BOT_UID=$(id -u)`（compose 默认值是 1000，可能不是你） |
 | 容器 Up、也不报错，但群里**永远没反应** | 机器人没连上 NapCat。**`.env` 是按 cwd 找的**，cwd 不对时它会拿空 WS 列表正常启动 | 容器里 `docker compose exec bot env \| grep -i onebot` 应能看到 WS 地址；对不上就查 compose 的挂载与 `WORKDIR` |
+| NapCat 容器 `Up`，机器人却刷屏 `Cannot connect to host napcat:3001` | NapCat 停在登录界面没登进去 —— 3001 那个正向 WS 服务端要**登录之后**才起，所以是 `Connection refused` 而不是握手 401 | `docker compose logs napcat \| grep -a 二维码`：还在打二维码就是没登录。`.env` 里补 `NAPCAT_QQ=<QQ号>`，再 `docker compose up -d --force-recreate napcat` |
 | 同上，且环境里配过代理 | 容器里有 `HTTP_PROXY` 之类 —— nonebot 的 aiohttp driver 是 `trust_env=True`，会把代理用上去 | 去掉代理变量后 `docker compose up -d` |
 | 机器人报连不上 NapCat，配置里写的是 `127.0.0.1:3001` | 容器里的 `127.0.0.1` 是**它自己** | 改回 `ws://napcat:3001` |
 | `--list-targets` 之类的工具在宿主 shell 里报解析不了主机名 | 服务名只有容器网络的 DNS 认识 | 用 `docker compose exec bot python tools/...` |

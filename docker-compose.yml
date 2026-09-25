@@ -32,6 +32,14 @@ services:
       - NAPCAT_UID=${NAPCAT_UID:-1000}
       - NAPCAT_GID=${NAPCAT_GID:-1000}
       - TZ=Asia/Shanghai
+      # 快速登录。镜像的 entrypoint.sh 末尾是：
+      #     if [ -n "${ACCOUNT}" ]; then gosu napcat /opt/QQ/qq --no-sandbox -q $ACCOUNT
+      #     else                          gosu napcat /opt/QQ/qq --no-sandbox
+      # 它**不转发 command 参数**，所以只能靠这个环境变量传（`command: ["-q", ...]` 没用）。
+      # 不填 = 每次容器重建都要重新扫码；填了 = 用 ./napcat-data/QQ 里存的会话直接登录。
+      # 号码本身**不写在这儿**（本仓库是公开的），放同目录 .env 的 NAPCAT_QQ 里由 compose
+      # 做变量替换 —— 那个键只对 compose 有意义，机器人不会读它。留空则退回扫码，也不报错。
+      - ACCOUNT=${NAPCAT_QQ:-}
     ports:
       # 只留 WebUI 这一条，而且**只绑回环**。6099 能扫码登录、能改这个 QQ 的所有网络配置，
       # 放公网等于把账号交出去。远程要看就 ssh -L：
@@ -56,8 +64,10 @@ services:
     init: true
     # 用宿主的普通账号身份跑：才读得到那三份 600 的配置、才写得进 ./logs。
     # 不设的话容器里是 root，落盘的日志属主也是 root。
-    # 这两个变量由 shell export 提供（compose 会拿同目录的 ./.env 做变量替换，
-    # 但 .env 里没有这两个键 —— 那是给机器人看的，别混）。
+    # BOT_UID/BOT_GID 由 shell export 提供（compose 拿同目录 ./.env 做变量替换，
+    # 那里面没有这两个键）。注意 .env 里**确实有一个** NAPCAT_QQ 是给上面的 napcat
+    # 服务做替换用的；它顺带也会被机器人 load_dotenv() 读成环境变量，无害，但别把它
+    # 当成机器人的配置项。
     user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
     environment:
       - TZ=Asia/Shanghai
