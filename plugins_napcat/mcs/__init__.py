@@ -13,7 +13,7 @@ from nonebot.log import logger
 
 from .._shared import mc
 from .._shared.mcaudiences import default_config
-from .._shared.mcservers import ServerConfigError, round_budget
+from .._shared.mcservers import ServerConfigError, ServerTarget, round_budget
 from . import client, mc_admin, mc_reporter, mc_stats
 
 __all__ = ["client", "mc_admin", "mc_reporter", "mc_stats"]
@@ -67,10 +67,19 @@ async def _log_targets() -> None:
         logger.warning("mcs_servers.toml 里没有任何 [[targets]]，所有 MC 功能不可用")
         return
 
-    described = "、".join(
-        f"{t.name}[{t.id}]{'/' + t.group if t.group else ''}"
+    def marks(t: ServerTarget) -> str:
+        """这台目标的特殊配置，打进括号里。两个都是「写了没生效也看不出来」的键。"""
+        parts: list[str] = []
         # 中转服逐个点名：名字写错时它什么也不会发生，只表现为「人数还是偏大」。
-        f"{'（中转 ' + '、'.join(t.transit) + '，不计入全群组人数）' if t.transit else ''}"
+        if t.transit:
+            parts.append(f"中转 {'、'.join(t.transit)}，不计入全群组人数")
+        # 落地服不推进服：不说的话，「大厅有人进来」这条本来就不该出现，看不出异常。
+        if t.quiet_join:
+            parts.append("落地服，进服不播报")
+        return f"（{'；'.join(parts)}）" if parts else ""
+
+    described = "、".join(
+        f"{t.name}[{t.id}]{'/' + t.group if t.group else ''}{marks(t)}"
         for t in book.targets
     )
     logger.info("MC 目标 {} 个：{}", len(book.targets), described)

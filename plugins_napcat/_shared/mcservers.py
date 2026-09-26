@@ -55,6 +55,7 @@ _TARGET_KEYS = frozenset(
         "source_key",
         "aliases",
         "transit",
+        "quiet_join",
         "timeout",
         "rcon_timeout",
     }
@@ -183,6 +184,21 @@ class ServerTarget:
     # 少一处的症状就是「扣不掉但没人知道」：启动日志、`--list-targets`、
     # 以及唯一能逐个对号的 `--api`。
     transit: tuple[str, ...] = ()
+    # 「进这台服**不推**进服提醒」。群组服的**落地服**（大厅）用这一项：玩家进服先
+    # 落在那儿，紧接着就换到真正想玩的那台 —— 同一轮里两个事件，群里连着两条
+    # （「溜进了大厅」+「从大厅换到生电」），前一条是重复、后一条才有信息量
+    # （2026-09-26 用户要求）。
+    #
+    # 只掐「**落在这台**的进服」这一种事件，别处一律不动：
+    # - 人数照算（总览、播报、@mc 查询照常列出这台上的人）——那几处回答的是
+    #   「现在有几个人可以一起玩」，站在大厅里等的人当然算；
+    # - 掉线/恢复照推 —— 那是「这台服挂了」，与谁在玩无关；
+    # - 换服照推 —— 换服行两端都写在行里，本身不会和谁重复，而且「从 A 换到大厅」
+    #   是这台上唯一会出现在群里的动静（人回大厅 = 他离开 A 了）。
+    #
+    # 代理（kind = "proxy"）写不了这一项：它的名单是全群组口径、不进分服对账
+    # （见 serves_names），压根不产生进服事件，写了是永不生效的哑配置。解析期报错。
+    quiet_join: bool = False
     # `source` 解出来的**那台目标本身**，由 _check_sources 在解析期回填；自己没有
     # source 时是 None。存对象而不是每处都拿着 id 去查表，是为了让取数层能在**任意
     # 子集**里工作：只探测 bingo 一个目标时，也得知道去问 szu 的接口（收数的人可能
@@ -878,6 +894,17 @@ def parse_book(text: str) -> ServerBook:
                 f"（代理只走 SLP 的话，它报的总人数里也含着中转服的人，只是我们分不出来。）"
             )
 
+        quiet_join = _as_bool(raw.get("quiet_join", False), f"{where}.quiet_join")
+        if quiet_join and kind == KIND_PROXY:
+            # 代理那条压根不产生进服事件（名单是全群组口径、不进分服对账），写在它
+            # 身上永远不会生效 —— 而「配置写了没生效」正是本工程最防的那类键。
+            raise ServerConfigError(
+                f"{where} 是 kind = {KIND_PROXY!r}，但配了 quiet_join —— 代理那条不参与"
+                f"进服对账（它的名单是全群组口径，见 serves_names），永远不会产出进服"
+                f"事件，写在它身上是哑配置。落地服（大厅）本来就是挂在它下面的子服，"
+                f"把 quiet_join = true 写到那条上。"
+            )
+
         target = ServerTarget(
             id=target_id,
             name=name,
@@ -893,6 +920,7 @@ def parse_book(text: str) -> ServerBook:
             source_key=source_key,
             aliases=aliases,
             transit=transit,
+            quiet_join=quiet_join,
         )
 
         for key in target.keys:

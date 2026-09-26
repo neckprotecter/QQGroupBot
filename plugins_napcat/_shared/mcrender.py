@@ -497,6 +497,14 @@ def format_events(
     **退服不推**（沿用既有产品决策）：leave 事件在对账层（mcdelta）照常产出，
     在这里被丢掉。哪天要开退服提醒，改的是这里，不是对账层。
 
+    **落地服不推进服**（2026-09-26 用户要求）：`quiet_join` 的目标（群组服的大厅）
+    上「有人进来了」这件事不说 —— 人落在那里是一瞬的事，紧接着那条「从大厅换到 X」
+    才是他要去哪。两个事件同一轮到达时，群里因此只剩换服那一行。
+    它与「退服不推」同一个位置、同一种做法（事件照常产出、只在这里丢），
+    区别是判据来自目标的配置而不是事件类型。
+    **只有进服被掐**：这台服掉线照旧推、换到这台照旧推、人数也照旧算进总览与播报
+    （那几处回答的是「现在有几个人可以一起玩」，站在大厅里的人当然算）。
+
     排版只有一套（2026-09-25 用户要求，之前是「单事件走单条模板 / 多事件走【服名】块」
     两套）：
 
@@ -517,10 +525,20 @@ def format_events(
     回答的是「谁来了 / 谁走了」，进服时那台往往就 1～2 人，写在每条后面是噪音；
     失败轮数只有看日志的人用得上。
     """
-    shown = [
-        e for e in events if not (isinstance(e, PlayerEvent) and e.kind == KIND_LEAVE)
-    ]
+    # 进服不推的目标（群组服的落地服，见 ServerTarget.quiet_join）。按 id 收集，
+    # 因为事件落的就是 id —— 与 _composite 分桶同一个口径。
+    quiet = {t.id for t in targets if t.quiet_join}
+    shown: list[PlayerEvent | StatusEvent] = []
+    for event in events:
+        if isinstance(event, PlayerEvent):
+            if event.kind == KIND_LEAVE:
+                continue
+            if event.kind == KIND_JOIN and event.target_id in quiet:
+                continue
+        shown.append(event)
     if not shown:
+        # 全被掐掉的一轮（比如只有一个人落在大厅）：什么都不发，调用方也不会因此
+        # 占掉限流窗口 —— 紧接着那条「换到 X」还得能立刻发出去（见 mc_reporter）。
         return None, False
 
     name_of = {t.id: t.name for t in targets}

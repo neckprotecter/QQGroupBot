@@ -729,6 +729,19 @@ port = 25565
             'api={url="http://h:1",token="t"}\ntransit="limbo"\n',
             "必须是字符串数组",
         ),
+        # ↓ quiet_join（落地服不推进服）的两条：同样是「配了却没生效」那一类 ——
+        #   写错时表现只是「本该安静的那台也在推」，而配置的作者多半正是不想看见它。
+        (
+            "quiet_join 写在代理上（永不生效的哑配置）",
+            '[[targets]]\nid="p"\nkind="proxy"\nhost="h"\nport=1\n'
+            'api={url="http://h:1",token="t"}\nquiet_join=true\n',
+            "不参与进服对账",
+        ),
+        (
+            "quiet_join 写成字符串（不是布尔）",
+            '[[targets]]\nid="a"\nkind="standalone"\nhost="h"\nport=1\nquiet_join="true"\n',
+            "必须是 true / false",
+        ),
         # ↓ 四条迁移报错：旧键还在全量表里。**按键存在判、不看值** —— 空表
         #   `[whitelist]` 与 `primary = ""` 同样要报，否则「删干净了」只是错觉。
         #   报错必须点出新家（mcs_audiences.toml），只说不认识的键等于没说。
@@ -2898,6 +2911,84 @@ watch   = true
     failed += not ok
     print(f"   {'PASS' if ok else 'FAIL'}  纯退服 → 不发消息（对账层有它，推送层丢它）")
 
+    # ④b–④g 落地服（quiet_join）：群组服的**大厅**。玩家进服先落在那里，紧接着换到
+    #       真正想玩的那台 —— 原来群里会连着收两条（「溜进了大厅」+「从大厅换到生电」），
+    #       前半截是重复。这里逐条钉住「掐哪一条、不掐哪一条」（2026-09-26 用户要求）。
+    _LOBBY = ServerTarget(
+        id="lobby", name="大厅", kind="backend", group="群组服",
+        host="h", port=1, timeout=5.0, rcon_timeout=5.0, quiet_join=True,
+    )
+    _SURV = ServerTarget(
+        id="survival", name="生电", kind="backend", group="群组服",
+        host="h", port=1, timeout=5.0, rcon_timeout=5.0,
+    )
+    _GROUP = [_SURV, _LOBBY]
+
+    # ④b 落在大厅 → 什么都不发。**这就是「重复」的前半截**。
+    text, _ = _fe([_PE(KIND_JOIN, "阿伟", "lobby", count=1)], _GROUP)
+    ok = text is None
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  落地服（大厅）的进服不推（quiet_join）")
+
+    # ④c **同一轮**里「落入大厅 + 换到生电」→ 只剩换服那一行。用户报的那一幕：
+    #    两条变一条，且留下的正是有信息量的那条（虚线也不该有 —— 只剩一个段）。
+    text, _ = _fe(
+        [
+            _PE(KIND_JOIN, "阿伟", "lobby", count=1),
+            _PE(_SW, "阿伟", "survival", origin_id="lobby", count=1),
+        ],
+        _GROUP,
+    )
+    ok = text == "🔄 阿伟 从「大厅」换到「生电」"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  落入大厅 + 换到生电 → 只剩换服那一行：{text!r}")
+    if not ok:
+        print(f"         实际:\n{text}")
+
+    # ④d 跨轮的那一半：大厅那条被丢之后，**下一轮**在生电上出现的进服照推。
+    #    没这一条的话，把「丢事件」写成「丢目标」也能过上面的用例。
+    text, _ = _fe([_PE(KIND_JOIN, "阿伟", "survival", count=1)], _GROUP)
+    ok = text == "🎮 阿伟 加入了「生电」"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  大厅被丢掉之后，下轮落在生电的进服照推：{text!r}")
+
+    # ④e 大厅自己的掉线/恢复**照推** —— 那是「这台服挂了」，与谁在玩无关。
+    text, _ = _fe(
+        [
+            _SE("lobby", down=True, streak=2, why="连不上了"),
+            _PE(KIND_JOIN, "阿伟", "lobby", count=1),
+        ],
+        _GROUP,
+    )
+    ok = text == "⚠️ 大厅 连不上了" and "阿伟" not in text
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  落地服掉线照推（只掐进服，不掐状态）：{text!r}")
+
+    # ④f **换到**大厅照推：换服行两端都写在行里，不会与谁重复；而且人回大厅是他
+    #    离开生电这个动作在群里唯一的痕迹（退服本来就不推）。
+    text, _ = _fe([_PE(_SW, "阿伟", "lobby", origin_id="survival", count=1)], _GROUP)
+    ok = text == "🔄 阿伟 从「生电」换到「大厅」"
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  换到落地服照推（两端服名都在行里）：{text!r}")
+
+    # ④g 人数照算：总览/播报/查询走的是**快照**那条路，与进服事件无关 ——
+    #    大厅里的人必须照旧列出来（用户明确要求「定时播报和查询不变」）。
+    _rows = [
+        _Row(_SURV, McSnapshot(target_id="survival", reachable=True, count=0, names_complete=True)),
+        _Row(
+            _LOBBY,
+            McSnapshot(
+                target_id="lobby", reachable=True, count=1, names=["阿伟"], names_complete=True
+            ),
+        ),
+    ]
+    summ = _rs(_rows, total_names=50, all_targets=_GROUP)
+    ok = "【大厅】在线 1" in summ and "阿伟" in summ
+    failed += not ok
+    print(f"   {'PASS' if ok else 'FAIL'}  落地服的人照旧进总览与播报（quiet_join 不影响人数）")
+    if not ok:
+        print(f"         实际:\n{summ}")
+
     # ⑤ 退服不产生行，也**不改变**其余行的顺序/内容 —— 混进来时不能顺手多带一行。
     #    换服只落在**到达**的那台（mcdelta 的 target_id 定义），来源服那段里没有半行。
     text, _ = _fe(
@@ -4525,6 +4616,10 @@ def _list_targets() -> int:
             print("      （代理：SLP 只给全群组总人数，不出分服名单）")
         elif not t.rcon_enabled:
             print("      （没配 RCON 密码：不出名单，只能靠 SLP 样本，>12 人就不完整）")
+        if t.quiet_join:
+            # 与 transit 同一条理由：**配了没生效**在这台身上几乎看不出来 ——
+            # 它本来就不该出声，「没出声」和「配错了」长得一模一样。
+            print("      （落地服：有人进这台不推进服提醒；人数照算，掉线/换到这台照推）")
     print()
 
     # 白名单**没有全量归属**了 —— 发给哪台、用什么前缀都是按群关联定的（见 mcs_audiences）。
