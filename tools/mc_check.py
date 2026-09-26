@@ -3743,7 +3743,7 @@ def _quiet_test() -> int:
         raw = os.environ.get(key, "0-9")
         check(
             quiet_obj.window == parse_quiet_hours(raw),
-            f"{label} 解析出的窗口与 .env 一致（{key}={raw!r} → {quiet_obj.span} 点）",
+            f"{label} 解析出的窗口与 .env 一致（{key}={raw!r} → {quiet_obj.span}）",
         )
         if not raw.strip():
             check(quiet_obj.window is None, f"{label}：空值 = 不静默")

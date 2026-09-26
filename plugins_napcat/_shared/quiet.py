@@ -42,7 +42,15 @@ class QuietWindow:
         self.what = what
         self.extra = extra
 
-        raw = os.environ.get(self.key, default)
+        raw = os.environ.get(self.key)
+        if raw is None:
+            raw = default
+            # 日志里**必须说清这个值是默认的还是配的**。只写 `MC_QUIET_HOURS=0-9` 会让人
+            # 以为 .env 里有这个键，之后想把静默关掉就去 .env 里找——那儿根本没有，
+            # 删无可删，而代码默认还在，表现是「改了/删了都没用」。
+            source = f".env 没配 {self.key}，用默认 {default}"
+        else:
+            source = f"{self.key}={raw}"
         self.raw = raw
         try:
             self.window = parse_quiet_hours(raw)
@@ -55,16 +63,14 @@ class QuietWindow:
 
         if self.window is not None:
             logger.info(
-                "{} 夜间静默时段：{} 点（{}={}）—— 不发{}{}",
+                "{} 夜间静默时段：{}（{}）—— 不发{}{}",
                 label,
                 self.span,
-                key,
-                raw,
+                source,
                 what,
                 extra,
             )
-        # 跃迁日志的状态（见 note）。None = 还没判断过，避免第一次调用就打一条
-        # 「静默结束」——一个从没开始过的时段「结束」了，纯属误导。
+        # 跃迁日志的状态（见 note）。None = 还没判断过。
         self._quiet: bool | None = None
 
     @property
@@ -74,8 +80,8 @@ class QuietWindow:
 
     @property
     def span(self) -> str:
-        """给日志用的「0-9 点」；没启用时是「未启用」。"""
-        return f"{self.window[0]}-{self.window[1]}" if self.window else "未启用"
+        """给日志用的「0-9 点」（带「点」，调用方直接拼进句子即可）；没启用时是「未启用」。"""
+        return f"{self.window[0]}-{self.window[1]} 点" if self.window else "未启用"
 
     def active(self) -> bool:
         """现在是否处于静默时段，并在**跃迁那一刻**打一行日志。
@@ -94,14 +100,14 @@ class QuietWindow:
         """
         if not self.enabled or quiet == self._quiet:
             return
-        self._quiet = quiet
+        first, self._quiet = self._quiet is None, quiet
         if quiet:
             logger.info(
-                "进入 {} 夜间静默（{} 点）：不发{}{}",
-                self.label,
-                self.span,
-                self.what,
-                self.extra,
+                "进入 {} 夜间静默（{}）：不发{}{}", self.label, self.span, self.what, self.extra
             )
-        else:
+        elif not first:
+            # **第一次判断就是在静默之外时不打**：那不是「静默结束了」，是进程刚起来
+            # 而现在已经出了窗口（白天重启必定命中）。打出来是「静默结束，提醒恢复」，
+            # 读起来像刚才还在静默 —— 一个从没开始过的时段「结束」了，纯属误导。
+            # 窗口内启动则相反：那条「进入静默」是实情，照打。
             logger.info("{} 夜间静默结束，{}恢复", self.label, self.what)
