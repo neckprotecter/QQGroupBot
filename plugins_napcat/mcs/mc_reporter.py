@@ -41,7 +41,8 @@ from .._shared.mcdelta import PlayerEvent, StatusEvent, reconcile
 from .._shared.mcrender import Row, format_events, render_report
 from .._shared.mcservers import ServerConfigError, ServerTarget
 from .._shared.push import send_to_groups
-from .._shared.schedule import in_quiet_hours, parse_quiet_hours, seconds_until_slot
+from .._shared.quiet import QuietWindow
+from .._shared.schedule import seconds_until_slot
 from .client import _MAX_NAMES, get_snapshots
 
 driver = get_driver()
@@ -65,41 +66,15 @@ _REPORT_INTERVAL_MIN = int(os.environ.get("MC_REPORT_INTERVAL_MIN", "60"))
 # **掉线/恢复提醒不受它管**（见 _tick_audience 的 quiet 分支）：那是故障通知，
 # 夜里服务器真挂了，早上才发现比吵一下贵得多。同理，探测本身一轮都不停 ——
 # 静默只掐「发消息」，不掐「取数」，否则夜里掉线会被算成「刚开机时整服的人一起进服」。
-_QUIET_RAW = os.environ.get("MC_QUIET_HOURS", "0-9")
-try:
-    _QUIET_WINDOW = parse_quiet_hours(_QUIET_RAW)
-except ValueError as exc:
-    # 配错了就降级成「不静默」并在启动日志里吼一声。**不能抛**：为了一个手滑的
-    # .env 让整只机器人起不来（连着 MC 查询、白名单一起没）代价太大。
-    _QUIET_WINDOW = None
-    logger.error("MC_QUIET_HOURS 配置有误，夜间静默已关闭：{}", exc)
-else:
-    if _QUIET_WINDOW is not None:
-        logger.info("MC 夜间静默时段：{}-{} 点（该时段不发进服/换服提醒、不做定时播报）",
-                    _QUIET_WINDOW[0], _QUIET_WINDOW[1])
-
-# 静默状态的跃迁只打一条日志（见 _note_quiet_transition）。两个循环共用一个状态：
-# 进服循环每 MC_WATCH_INTERVAL_SEC 秒跑一次，永远比整点才醒的播报循环先看到跃迁，
-# 所以「进入/结束静默」各只有一行，不会两条循环各吼一遍。
-_quiet_state: bool | None = None
-
-
-def _note_quiet_transition(quiet: bool) -> None:
-    global _quiet_state
-    # 没配静默时段时干脆不参与：否则第一次调用会从 None 跃迁到 False，
-    # 打一条「静默结束」——一个从没开始过的时段「结束」了，纯属误导。
-    if _QUIET_WINDOW is None or quiet == _quiet_state:
-        return
-    _quiet_state = quiet
-    if quiet:
-        logger.info(
-            "进入 MC 夜间静默（{}-{} 点）：不发进服/换服提醒、不做定时播报；"
-            "服务器掉线/恢复提醒不受影响",
-            _QUIET_WINDOW[0],
-            _QUIET_WINDOW[1],
-        )
-    else:
-        logger.info("MC 夜间静默结束，进服提醒与定时播报恢复")
+# 读配置、打启动与跃迁日志这套在两个插件（MC / oopz）里是同一份实现，见 _shared/quiet.py。
+# 「不发什么」和那句补充说明由这里给 —— 掉线/恢复提醒不受静默管是 MC 特有的安排
+# （oopz 没有故障通知这一路），所以写在这一侧而不是共享模块里。
+_QUIET = QuietWindow(
+    "MC_QUIET_HOURS",
+    "MC",
+    "进服/换服提醒与定时播报",
+    extra="；服务器掉线/恢复提醒不受影响",
+)
 
 # 连续这么多轮探测失败才宣布服务器离线（单轮网络抖动不报）
 _OFFLINE_THRESHOLD = 2
@@ -432,8 +407,8 @@ async def _tick() -> None:
     status = _tick_health(by_id, wanted)
 
     # 静默判据每一轮重取：跨过 00:00 / 09:00 那一轮就换挡，不用等重启。
-    quiet = in_quiet_hours(_QUIET_WINDOW)
-    _note_quiet_transition(quiet)
+    # active() 顺带在跃迁那一刻打一行日志（两个循环共用一个实例，只会打一次）。
+    quiet = _QUIET.active()
     for audience in watched:
         await _tick_audience(audience, by_id, status, quiet=quiet)
 
@@ -520,14 +495,10 @@ async def _report_loop() -> None:
                 await asyncio.sleep(delay)
             # 静默判据用**醒来后的时刻**（= 槽位时刻）：09:00 那一班要照常发，
             # 而 0-9 是半开区间，hour==9 不算静默。
-            if in_quiet_hours(_QUIET_WINDOW):
+            if _QUIET.active():
                 # 每小时打一行（整晚最多 9 行）。这条不能省成「只在跃迁时打」：
                 # 群里安静了一整晚之后，「为什么 3 点没播报」全靠日志尾巴回答。
-                logger.info(
-                    "MC 定时播报：夜间静默时段（{}-{} 点），本次跳过",
-                    _QUIET_WINDOW[0],
-                    _QUIET_WINDOW[1],
-                )
+                logger.info("MC 定时播报：夜间静默时段（{}），本次跳过", _QUIET.span)
                 continue
             await _report_tick()
         except asyncio.CancelledError:

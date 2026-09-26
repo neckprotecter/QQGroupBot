@@ -140,6 +140,7 @@ copy .env.example .env
 | `NAPCAT_WELCOME_GROUP` | 进频道欢迎推送的 QQ 群号（**逗号分隔多群**，留空=不启用） |
 | `NAPCAT_WELCOME_INTERVAL_SEC` | 进频道检测轮询间隔（秒，默认 15） |
 | `NAPCAT_WELCOME_CHANNELS` | 可选，只欢迎这些频道，逗号分隔；留空=统计范围内全部 |
+| `OOPZ_QUIET_HOURS` | **夜间静默时段**，写成 `起-止`（小时，默认 `0-9`）。这段时间里定时播报与进频道欢迎都不发；`0-9` 是半开区间，**09:00 整那班照常发**。支持跨午夜（`23-7`）。**留空 = 不静默**。`@oopz` 查询不受影响 |
 | `OOPZ_TRIGGER` / `MC_TRIGGER` | @机器人 触发对应查询的关键词（逗号分隔，不区分大小写）；留空用默认值（`oopz` / `mc,我的世界,服务器`） |
 | `MC_ADMIN_QQ` | 能用 `whitelist` 管理命令的 QQ 号（逗号分隔）。**留空 = 该功能对所有人关闭**——与其他「留空 = 不限制」相反，是刻意的 |
 | `MC_ADMIN_TRIGGER` | 触发管理命令的关键词（默认 `whitelist`）。别填 `add`/`remove`/`list`，也别跟 `MC_TRIGGER` 撞词 |

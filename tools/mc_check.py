@@ -3660,15 +3660,16 @@ source_key = "creative"
 # ---------------------------------------------------------------- 夜间静默行为自测
 
 def _quiet_test() -> int:
-    """跑 `_tick_audience` 的静默分支，证「不发」和「基线照常推进」两件事。
+    """跑 MC 与 oopz 两边的静默分支，证「不发」和「基线照常推进」两件事。
 
     为什么不并进 `--self-test`：那边**刻意不 init nonebot**（纯解析函数，谁都能跑），
-    而 mc_reporter 在 import 期就要 driver、在包 __init__ 期就要 `nonebot.on_message`
-    那一套。两条路只能分开走。
+    而 mc_reporter / auto_reporter 在 import 期就要 driver、在包 __init__ 期就要
+    `nonebot.on_message` 那一套。两条路只能分开走。
 
     要钉死的是**看不见的分支**：静默期间该不发消息，这个看代码就知道；但「基线还要
-    照常推进」错了的后果在当晚完全无声，只在第二天 09:00 炸出来 —— 把一整晚进过服的
-    人当成「刚进服」一次性补报几十条。所以这里连基线一起断言。
+    照常推进」错了的后果在当晚完全无声，只在第二天 09:00 炸出来 —— 把一整晚进过服
+    （进过频道）的人当成「刚进服」（「刚进频道」）一次性补报几十条。所以两边的基线
+    都一起断言。MC 与 oopz 是同一套语义的两个实现，任何一边漏了都会在 09:00 刷屏。
 
     不联网：send_to_groups 被替换成记账函数，「发没发、发了什么」全在内存里。
     """
@@ -3683,8 +3684,11 @@ def _quiet_test() -> int:
     from plugins_napcat._shared.mc import McSnapshot
     from plugins_napcat._shared.mcdelta import StatusEvent
     from plugins_napcat._shared.mcservers import ServerTarget
+    from plugins_napcat._shared.quiet import QuietWindow
     from plugins_napcat._shared.schedule import parse_quiet_hours
     from plugins_napcat.mcs import mc_reporter as mr
+    from plugins_napcat.oopz import auto_reporter as ar
+    from types import SimpleNamespace
 
     failed = 0
 
@@ -3732,15 +3736,19 @@ def _quiet_test() -> int:
     mr._targets.clear()
 
     print("== 0. 静默窗口取值 ==")
-    raw = os.environ.get("MC_QUIET_HOURS", "0-9")
-    check(
-        mr._QUIET_WINDOW == parse_quiet_hours(raw),
-        f"模块解析出的窗口与 .env 一致（MC_QUIET_HOURS={raw!r} → {mr._QUIET_WINDOW}）",
-    )
-    if not raw.strip():
-        check(mr._QUIET_WINDOW is None, "空值 = 不静默")
-    elif os.environ.get("MC_QUIET_HOURS") is None:
-        check(mr._QUIET_WINDOW == (0, 9), "没写这个键时走代码默认 0-9")
+    for quiet_obj, key, label in (
+        (mr._QUIET, "MC_QUIET_HOURS", "MC"),
+        (ar._QUIET, "OOPZ_QUIET_HOURS", "oopz"),
+    ):
+        raw = os.environ.get(key, "0-9")
+        check(
+            quiet_obj.window == parse_quiet_hours(raw),
+            f"{label} 解析出的窗口与 .env 一致（{key}={raw!r} → {quiet_obj.span} 点）",
+        )
+        if not raw.strip():
+            check(quiet_obj.window is None, f"{label}：空值 = 不静默")
+        elif os.environ.get(key) is None:
+            check(quiet_obj.window == (0, 9), f"{label}：没写这个键时走代码默认 0-9")
 
     async def tick(names, status=(), quiet=True):
         await mr._tick_audience(audience, {"t1": _snap(names)}, list(status), quiet=quiet)
@@ -3779,6 +3787,124 @@ def _quiet_test() -> int:
     check(len(sent) == 1, f"静默时段内掉线仍然发了 {len(sent)} 条（期望 1）")
     if sent:
         check("自测服" in sent[-1][1], "发的是那台服的掉线提醒")
+
+    # ---------------- oopz：进频道欢迎 ----------------
+    # MC 那边是「有人进服」，oopz 这边是「有人进语音频道」，同一个坑：静默期间不欢迎
+    # 没问题，但**基线不能不更新** —— 否则 09:00 会把整晚进过频道的人一次性全欢迎一遍。
+    print("\n== 6. oopz：静默期间进频道，不欢迎但进基线 ==")
+
+    class _M:
+        def __init__(self, uid):
+            self.uid, self.is_bot = uid, False
+
+    class _Chan:
+        def __init__(self, cid, name):
+            self.channel_id, self.name = cid, name
+
+    class _Grp:
+        def __init__(self, chans):
+            self.channels = chans
+
+    class _Area:
+        area_id, name = "a1", "自测域"
+
+    class _Res:
+        def __init__(self, channel_members):
+            self.channel_members = channel_members
+
+    class _User:
+        def __init__(self, uid):
+            self.uid, self.name = uid, f"名字{uid}"
+
+    class _FakeBot:
+        """假 oopz 客户端：只实现 `_check_joins` 走的那些方法。
+
+        方法必须挂在 `.areas` / `.channels` / `.person` 三个命名空间下，跟真 SDK 一样
+        —— 直接挂在 bot 上会 AttributeError，而那个异常会被 `_check_joins` 自己的
+        except 吞成一行 warning `continue`，表现是「一轮下来什么也没发生」：
+        「静默期间没欢迎」这种断言会**因为错的原因通过**。
+        """
+
+        def __init__(self):
+            self.members = ["u1"]  # 当前在频道里的 uid
+            self.areas = SimpleNamespace(
+                get_joined_areas=self._joined, get_area_channels=self._chans
+            )
+            self.channels = SimpleNamespace(get_voice_channel_members=self._members_of)
+            self.person = SimpleNamespace(get_person_infos_batch=self._infos)
+
+        async def _joined(self):
+            return [_Area()]
+
+        async def _chans(self, area_id):
+            return [_Grp([_Chan("ch1", "游戏开黑")])]
+
+        async def _members_of(self, area):
+            return _Res({"ch1": [_M(u) for u in self.members]})
+
+        async def _infos(self, uids):
+            return [_User(u) for u in uids]
+
+    fake = _FakeBot()
+
+    async def _fake_get_client():
+        return fake
+
+    ar.send_to_groups = _fake_send  # 同一本账：sent
+    ar._get_client = _fake_get_client
+    ar._filter_areas = lambda joined: list(joined)  # 不受本机 OOPZ_TARGET_AREAS 影响
+    ar._known, ar._initialized = {}, False
+    sent.clear()
+
+    async def oopz_round(uids, quiet):
+        # 时钟不可控，所以直接改窗口而不是改 datetime：now 一定落在 (h, h+1) 里，
+        # 取补集 (h+1, h+2) 则一定不在 —— 两个方向都确定，跟跑测试的时刻无关。
+        hour = datetime.now().hour
+        span = (hour, (hour + 1) % 24) if quiet else ((hour + 1) % 24, (hour + 2) % 24)
+        ar._QUIET.window, ar._QUIET._quiet = span, None
+        fake.members = list(uids)
+        await ar._check_joins()
+
+    asyncio.run(oopz_round(["u1"], quiet=True))
+    check(sent == [], "第一轮只建基线，不欢迎（和机器人刚启动时一样）")
+    check(ar._known.get(("a1", "ch1")) == {"u1"}, "oopz 基线建起来了")
+
+    asyncio.run(oopz_round(["u1", "u2"], quiet=False))
+    check(len(sent) == 1, f"非静默时 u2 进频道 → 欢迎了 {len(sent)} 条（期望 1）")
+    if sent:
+        check("名字u2" in sent[-1][1], "欢迎的是 u2")
+
+    sent.clear()
+    asyncio.run(oopz_round(["u1", "u2", "u3"], quiet=True))
+    check(sent == [], "静默时段内 u3 进频道没有欢迎（静默生效）")
+    check(
+        ar._known.get(("a1", "ch1")) == {"u1", "u2", "u3"},
+        "u3 进了基线 —— 不推进的话 09:00 会把他当「刚进频道」补欢迎",
+    )
+
+    asyncio.run(oopz_round(["u1", "u2", "u3"], quiet=False))
+    check(sent == [], "出静默后没有把静默期间的 u3 补欢迎出来")
+
+    print("\n== 7. 静默窗口配置项的处理 ==")
+    # 没配 / 留空 / 配错三种，行为各不同；这里只钉「配错不许抛」这一条 ——
+    # 抛了就是整只机器人起不来，而它本来只是个可选功能。
+    bad = QuietWindow("__MC_CHECK_不存在的键__", "自测", "任何东西")
+    check(bad.window == (0, 9) and bad.enabled, "没配这个键 → 走代码默认 0-9")
+    os.environ["__MC_CHECK_坏值__"] = "0-9-5"
+    try:
+        broken = QuietWindow("__MC_CHECK_坏值__", "自测", "任何东西")
+    except Exception as exc:  # noqa: BLE001 — 抛了就是 FAIL，这里就是要抓住它
+        check(False, f"配错时不该抛异常，却抛了 {exc!r}")
+    else:
+        check(broken.window is None and not broken.enabled, "配错 → 降级成不静默，不抛")
+    finally:
+        os.environ.pop("__MC_CHECK_坏值__", None)
+    os.environ["__MC_CHECK_空值__"] = ""
+    try:
+        blank = QuietWindow("__MC_CHECK_空值__", "自测", "任何东西")
+        check(blank.window is None and not blank.enabled, "留空 → 不静默")
+    finally:
+        os.environ.pop("__MC_CHECK_空值__", None)
 
     print()
     print(f"== 静默自测结果：{'全部通过' if not failed else f'{failed} 项失败'} ==")

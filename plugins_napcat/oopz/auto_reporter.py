@@ -9,6 +9,10 @@ oopz 客户端单例与共享工具在 oopz/client.py，本文件只负责播报
   NAPCAT_WELCOME_GROUP=<群号>         欢迎消息目标群（逗号分隔多群，留空 = 不启用）
   NAPCAT_WELCOME_INTERVAL_SEC=15      进频道轮询间隔（秒）
   NAPCAT_WELCOME_CHANNELS=频道名,...   可选：只欢迎这些频道（逗号分隔），留空 = 统计范围内全部
+  OOPZ_QUIET_HOURS=0-9                夜间静默时段（默认 0-9 = 00:00–08:59 不发**任何**
+                                      自动消息）；留空 = 不静默，支持跨午夜（23-7）
+                                      **只管自动推送**（定时播报 / 进频道欢迎），
+                                      @oopz 查询不受影响 —— 那是人主动问的
 """
 import asyncio
 import os
@@ -19,6 +23,7 @@ from nonebot import get_driver
 from nonebot.log import logger
 
 from .._shared.push import send_to_groups, truncate
+from .._shared.quiet import QuietWindow
 from .._shared.schedule import seconds_until_slot
 from .client import (
     _QUERY_TIMEOUT,
@@ -59,6 +64,11 @@ _WELCOME_TEMPLATES = [
     "🎧 {name} 戴上耳机钻进了 oopz「{channel}」。",
     "🚀 {name} 空降到 oopz「{channel}」频道。",
 ]
+
+# 夜间静默：两个自动推送（上面的定时播报、下面的进频道欢迎）在静默时段都不发。
+# 与 MC 那套同一份实现、同一套语义（见 _shared/quiet.py），只是键与文案不同：
+# **@oopz 查询不在此列** —— 那是人主动问的，跟「半夜别吵人」是两件事。
+_QUIET = QuietWindow("OOPZ_QUIET_HOURS", "oopz", "进频道欢迎与定时播报")
 
 
 # ---------------------------------------------------------------- 定时播报
@@ -139,6 +149,12 @@ async def _report_loop() -> None:
             delay = seconds_until_slot(_REPORT_INTERVAL_MIN)
             if delay:
                 await asyncio.sleep(delay)
+            # 静默判据用**醒来后的时刻**（= 槽位时刻）：09:00 那一班要照常发，
+            # 而 0-9 是半开区间，hour==9 不算静默。判在取数之前 —— 静默时段连
+            # 这次查询都不必发（它的结果除了这条消息没有别的用处）。
+            if _QUIET.active():
+                logger.info("oopz 定时播报：夜间静默时段（{}），本次跳过", _QUIET.span)
+                continue
             msg = await _build_broadcast_message()
             if msg is None:
                 logger.info("定时播报：当前 oopz 无人在线，本次跳过")
@@ -217,6 +233,17 @@ async def _check_joins() -> None:
     _initialized = True
 
     if not new_entries:
+        return
+
+    if _QUIET.active():
+        # 静默：这几个人**照常进基线**（上面那两行已经做了），只是不欢迎。
+        # 必须放在基线之后 —— 挪到前面 return，等于静默期间一轮都不更新基线，
+        # 09:00 会把整晚进过频道的人一次性全欢迎一遍，正是静默要避免的刷屏。
+        logger.info(
+            "oopz 进频道欢迎：夜间静默时段（{}），{} 人的欢迎本次跳过",
+            _QUIET.span,
+            len(new_entries),
+        )
         return
 
     # 批量解析昵称

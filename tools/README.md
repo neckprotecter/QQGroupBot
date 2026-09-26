@@ -81,11 +81,13 @@ import 它们，`plugins*` 也不引用），是**人手动跑**的。
 离线钉住比联网更适合天天跑。改 `_shared/` 里任何解析或文案，先跑它。
 
 **关于 `--quiet-test`**：`--self-test` 刻意**不 init nonebot**（它跑的是 `_shared/`
-里的纯函数，所以在任何机器上都能跑）。而夜间静默的分支长在 `mcs/mc_reporter.py` 里
-——那个模块 import 期就要 driver，所以那一路只能单独走：`--quiet-test` 会
-`nonebot.init()`，再把 `send_to_groups` 换成记账函数，然后真的调 `_tick_audience`。
+里的纯函数，所以在任何机器上都能跑）。而夜间静默的分支长在 `mcs/mc_reporter.py` 与
+`oopz/auto_reporter.py` 里 —— 那两个模块 import 期就要 driver，所以那一路只能单独走：
+`--quiet-test` 会 `nonebot.init()`，再把 `send_to_groups` 换成记账函数，然后真的调
+`_tick_audience`（MC）与 `_check_joins`（oopz）。
 它钉的是**当晚完全看不见、第二天早上才炸**的一条：静默期间既不发消息，**基线也要
-照常推进** —— 不推进的话 09:00 会把一整晚进过服的人当成「刚进服」一次性补报。
+照常推进** —— 不推进的话 09:00 会把一整晚进过服（进过频道）的人当成「刚进服」
+（「刚进频道」）一次性补报。两边都要钉：它们是同一套语义的两个实现，任一边漏了都会刷屏。
 
 ---
 
