@@ -54,3 +54,22 @@ async def send_to_groups(group_ids: list[str], text: str) -> int:
         if await send_group(group_id, text):
             sent += 1
     return sent
+
+
+async def send_private(user_id: str, text: str) -> bool:
+    """向指定 QQ 私聊推送文本。bot 未连接或发送失败返回 False（不抛异常）。
+
+    **收件人必须是机器人账号的好友**（OneBot 的 send_private_msg 只能发好友）：
+    不是好友时 NapCat 会返回错误，这里只会记一条 error 日志、不会抛。
+    所以给非好友配提醒等于静默失效 —— 新加收件人时先发一条测试消息确认送达。
+    """
+    bots = get_bots()
+    if not bots or not user_id:
+        return False
+    bot = next(iter(bots.values()))
+    try:
+        await bot.send_private_msg(user_id=int(user_id), message=text_message(text))
+        return True
+    except Exception as exc:
+        logger.error("私聊 {} 推送失败: {}", user_id, exc)
+        return False
